@@ -1,0 +1,28 @@
+{% extends "base.html" %}{% block body %}
+<h1>Settings</h1>
+<div class="grid2"><div class="card"><h2>Buy Boxes <span class="small muted">(drive the verdict PASS/FAIL on every property)</span></h2>
+{% for b in boxes %}<p style="margin:7px 0"><b>{{ b.name }}</b> — {{ 'active' if b.active else 'off' }}<br>
+<span class="small muted">Cities: {{ b.cities or 'any' }} · max price {{ b.max_price|money }} · min beds {{ b.min_beds|num }} · min sqft {{ b.min_sqft|num }} · strategies: {{ b.strategies or 'any' }}</span>
+<form method="post" action="{{ url_for('bb_toggle', bid=b.id) }}" style="display:inline"><button class="btn sm sec">{{ 'Deactivate' if b.active else 'Activate' }}</button></form></p>
+{% else %}<p class="muted">No buy boxes yet — add your first one.</p>{% endfor %}
+<h3>Add a buy box</h3><form method="post">
+<label>Name</label><input name="bb_name" placeholder="HouseAble — Tampa cash" required>
+<div class="rowflex"><div><label>Cities (comma list)</label><input name="bb_cities" placeholder="Tampa, Kissimmee"></div>
+<div><label>Max price $</label><input name="bb_max_price" value="450000"></div></div>
+<div class="rowflex"><div><label>Min beds</label><input name="bb_min_beds" value="3"></div>
+<div><label>Min sqft</label><input name="bb_min_sqft" value="1000"></div>
+<div><label>Strategies (comma list)</label><input name="bb_strategies" placeholder="Cash, Subject To"></div>
+<div><label>Min ARV spread %</label><input name="bb_spread" value="15"></div></div>
+<p><button class="btn">Add buy box</button></p></form></div>
+<div><div class="card"><h2>API keys <span class="small muted">(optional, free tiers — stored server-side only)</span></h2>
+<form method="post"><label>US Census API key (keyless works too; key raises limits)</label><input name="census_key" value="{{ census_key }}">
+<label>RentCast API key (free 50/mo — backup estimates only)</label><input name="rentcast_key" value="{{ rentcast_key }}">
+<label>apillow API key (free 50/mo — backup)</label><input name="apillow_key" value="{{ apillow_key }}">
+<p><button class="btn">Save keys</button></p></form></div>
+<div class="card"><h2>Export / Import <span class="small muted">(the migration path to the hosted + PC versions)</span></h2>
+<p><a class="btn sec" href="{{ url_for('export_json') }}">Export full JSON</a> <a class="btn sec" href="{{ url_for('export_csv') }}">Export CSV</a></p>
+<form method="post" enctype="multipart/form-data" action="{{ url_for('import_json') }}">
+<label>Import a JSON export</label><input type="file" name="file" accept=".json">
+<p><button class="btn">Import</button></p></form>
+<p class="small muted">One data model: properties, comps, scenarios, documents, contractors, buy boxes, monitors — nothing is trapped in this copy.</p></div></div></div>
+{% endblock %}

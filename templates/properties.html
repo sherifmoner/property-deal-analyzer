@@ -1,0 +1,17 @@
+{% extends "base.html" %}{% block body %}
+<h1>Properties</h1>
+<form method="get" class="rowflex" style="margin-bottom:14px">
+<div><label>Status</label><select name="status"><option value="">All</option>{% for s in ['Draft','Shared','Published'] %}<option {% if request.args.get('status')==s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></div>
+<div><label>Deal type</label><select name="method"><option value="">All</option>{% for s in ['Cash','Subject To','Hybrid','Seller Finance','Stack'] %}<option {% if request.args.get('method')==s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></div>
+<div><label>View</label><select name="view"><option value="list">List</option><option value="grid" {% if view=='grid' %}selected{% endif %}>Grid</option></select></div>
+<div style="flex:0"><button class="btn sec">Filter</button> <a class="btn" href="{{ url_for('add_property') }}">+ Add</a></div></form>
+{% if view=='grid' %}<div class="propgrid">{% for p in props %}<div class="pc">
+{% if p.photo_url %}<img src="{{ p.photo_url }}" alt="">{% else %}<img alt="">{% endif %}
+<div class="pb"><a href="{{ url_for('property_page', pid=p.id) }}"><b>{{ p.address }}</b></a><br>
+<span class="badge {% if p.deal_method=='Cash' %}cash{% elif p.deal_method=='Subject To' %}subto{% endif %}">{{ p.deal_method }}</span>
+<span class="badge">{{ p.status }}</span><br><span class="small muted">{{ p.beds|num }} bd · {{ p.baths|num }} ba · {{ p.sqft|num }} sqft · {{ p.list_price|money }}</span></div></div>{% endfor %}</div>
+{% else %}<div class="card" style="padding:6px 14px"><table><tr><th>Address</th><th>Method</th><th>Status</th><th>Beds</th><th>Baths</th><th>Sqft</th><th>List price</th><th>Flood</th><th>Added</th></tr>
+{% for p in props %}<tr><td><a href="{{ url_for('property_page', pid=p.id) }}">{{ p.address }}</a></td><td>{{ p.deal_method }}</td><td>{{ p.status }}</td>
+<td>{{ p.beds|num }}</td><td>{{ p.baths|num }}</td><td>{{ p.sqft|num }}</td><td>{{ p.list_price|money }}</td><td>{{ p.flood_zone or 'Not found' }}</td><td class="small">{{ (p.created_at or '')[:10] }}</td></tr>
+{% else %}<tr><td colspan="9" class="muted">No properties match.</td></tr>{% endfor %}</table></div>{% endif %}
+{% endblock %}

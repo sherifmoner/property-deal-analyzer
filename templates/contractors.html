@@ -1,0 +1,15 @@
+{% extends "base.html" %}{% block body %}
+<h1>Contractors</h1><p class="muted">Your HouseAble contractor database — add them once here, assign per trade on any property. {{ rows|length }} contractor(s) in the database.</p>
+<div class="card"><h2>HouseAble recruiting database</h2>
+<p class="muted small">Pre-load Sherif's recruited prospects from <code>contractor-prospects.json</code> (business, trade, service area, phone, score + notes). Idempotent — dedupes by name + phone, safe to re-run.</p>
+<form method="post" action="{{ url_for('do_import_contractors') }}"><button class="btn sec">Import / refresh from prospect database</button></form></div>
+<div class="card"><h2>Add contractor</h2><form method="post"><div class="rowflex">
+<div><label>Name</label><input name="name" required></div><div><label>Company</label><input name="company"></div>
+<div><label>Trade</label><input name="trade" placeholder="Roofing / GC / Plumbing"></div>
+<div><label>Phone</label><input name="phone"></div><div><label>Email</label><input name="email"></div></div>
+<label>Notes</label><input name="notes"><p><button class="btn">Add contractor</button></p></form></div>
+<div class="card" style="padding:6px 14px"><table><tr><th>Trade</th><th>Name</th><th>Company</th><th>Phone</th><th>Email</th><th>Notes</th><th></th></tr>
+{% for c in rows %}<tr><td>{{ c.trade }}</td><td>{{ c.name }}</td><td>{{ c.company or '' }}</td><td>{{ c.phone or '' }}</td><td>{{ c.email or '' }}</td><td class="small">{{ c.notes or '' }}</td>
+<td><form method="post" action="{{ url_for('del_contractor', cid=c.id) }}"><button class="btn sm danger">✕</button></form></td></tr>
+{% else %}<tr><td colspan="7" class="muted">No contractors yet.</td></tr>{% endfor %}</table></div>
+{% endblock %}

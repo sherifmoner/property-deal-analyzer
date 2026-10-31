@@ -1,0 +1,7 @@
+{% extends "base.html" %}{% block body %}
+<h1>Amortization — {{ p.address }}</h1>
+<p class="muted">Loan {{ principal|money }} at {{ rate }}% · amortized {{ yrs|num }} yrs · term {{ term|num }} yrs · payment <b>{{ res.payment|money }}/mo</b> · balloon at term end: <b>{{ res.balloon|money }}</b></p>
+<div class="card"><table><tr><th>Year</th><th>Interest</th><th>Principal</th><th>Balance</th></tr>
+{% for r in res.rows %}<tr><td>{{ r.year }}</td><td>{{ r.interest|money }}</td><td>{{ r.principal|money }}</td><td>{{ r.balance|money }}</td></tr>{% endfor %}</table></div>
+<p><a class="btn sec" href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">← Back to underwriting</a></p>
+{% endblock %}

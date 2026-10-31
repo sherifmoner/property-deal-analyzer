@@ -1,0 +1,7 @@
+{% extends "base.html" %}{% block body %}
+<h1>Add Property</h1><p class="muted">Address → ArcGIS geocode → FEMA flood check → property page. Then pull comps from the Comparables tab.</p>
+<div class="card"><form method="post"><label>Full address (street, city, state, ZIP)</label>
+<input name="address" placeholder="110 E Garland Ct, Tampa, FL 33613" required>
+<label>Purchase method</label><select name="deal_method"><option>Cash</option><option>Subject To</option><option>Hybrid</option><option>Seller Finance</option><option>Stack</option></select>
+<p><button class="btn">Continue →</button></p></form></div>
+{% endblock %}

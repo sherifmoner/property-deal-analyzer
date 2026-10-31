@@ -1,0 +1,24 @@
+{% extends "base.html" %}{% block body %}
+<h1>Dashboard</h1><p class="muted">Property queue, recent analyses, monitoring alerts. No tokens, ever.</p>
+<div class="grid3">
+<div class="card"><h2>{{ counts.get('Draft',0) }} Drafts</h2><p class="muted">Being analyzed</p></div>
+<div class="card"><h2>{{ counts.get('Shared',0) }} Shared</h2><p class="muted">Shared with the team</p></div>
+<div class="card"><h2>{{ counts.get('Published',0) }} Published</h2><p class="muted">Live on the dispo board</p></div></div>
+<div class="card"><h2>Add &amp; Comp a Property</h2>
+<form method="post" action="{{ url_for('add_property') }}"><div class="rowflex">
+<div style="flex:3"><input name="address" placeholder="110 E Garland Ct, Tampa, FL 33613" required></div>
+<div><select name="deal_method"><option>Cash</option><option>Subject To</option><option>Hybrid</option><option>Seller Finance</option><option>Stack</option></select></div>
+<div style="flex:0"><button class="btn">Add Property →</button></div></div></form>
+<p class="small muted">Geocoded via ArcGIS (primary — Nominatim misses some streets), flood zone via FEMA NFHL.</p></div>
+<div class="grid2"><div class="card"><h2>Recent properties</h2>
+{% for p in props %}<p style="margin:6px 0"><a href="{{ url_for('property_page', pid=p.id) }}"><b>{{ p.address }}</b></a><br>
+<span class="small muted">{{ p.deal_method }} · {{ p.status }} · list {{ p.list_price|money }} · flood {{ p.flood_zone or 'Not found' }}</span></p>
+{% else %}<p class="muted">None yet — add your first property above.</p>{% endfor %}</div>
+<div><div class="card"><h2>Monitoring alerts</h2>
+{% for a in alerts %}<p style="margin:6px 0"><a href="{{ url_for('monitoring_page') }}">{{ a.address }}</a><br><span class="small muted">{{ a.last_checked }} — {{ a.last_note }}</span></p>
+{% else %}<p class="muted">No alerts yet.</p>{% endfor %}</div>
+<div class="card"><h2>Recent underwriting</h2>
+{% for s in recent %}{% set r = s.results|jload %}<p style="margin:6px 0"><a href="{{ url_for('property_page', pid=s.property_id, tab='underwriting') }}">{{ s.address }}</a><br>
+<span class="small muted">{{ s.strategy }} — {{ s.name }} · {% if r.score %}score {{ r.score }} ({{ r.label }}){% elif r.profit is defined %}profit {{ r.profit|money }}{% endif %}</span></p>
+{% else %}<p class="muted">No scenarios yet.</p>{% endfor %}</div></div></div>
+{% endblock %}

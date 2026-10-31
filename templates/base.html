@@ -1,0 +1,25 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Property Deal Analyzer{% endblock %}</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏠</text></svg>">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet.css') }}">
+<script src="{{ url_for('static', filename='vendor/leaflet.js') }}"></script></head>
+<body><div class="layout">
+<nav class="sidenav"><div class="brand">🏠 Deal Analyzer</div>
+<a href="{{ url_for('dashboard') }}">Dashboard</a>
+<a href="{{ url_for('properties') }}">Properties</a>
+<a href="{{ url_for('add_property') }}">+ Add Property</a>
+<a href="{{ url_for('monitoring_page') }}">Lead Monitoring</a>
+<a href="{{ url_for('documents_index') }}">Documents</a>
+<a href="{{ url_for('contractors_page') }}">Contractors</a>
+<a href="{{ url_for('settings_page') }}">Settings</a>
+<div class="sub">Data</div>
+<a href="{{ url_for('export_json') }}">Export JSON</a>
+<a href="{{ url_for('export_csv') }}">Export CSV</a>
+<div class="sub" style="margin-top:14px">Free sources only</div>
+<div style="padding:0 18px;font-size:11.5px;color:#7d99b3">ArcGIS geocode · FEMA flood · HomeHarvest comps · Census ACS demographics · OpenStreetMap amenities</div>
+</nav>
+<main class="main">
+{% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}<div class="flash {{ cat }}">{{ m }}</div>{% endfor %}{% endwith %}
+{% block body %}{% endblock %}
+</main></div></body></html>

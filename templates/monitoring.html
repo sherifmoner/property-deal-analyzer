@@ -1,0 +1,9 @@
+{% extends "base.html" %}{% block body %}
+<h1>Lead Monitoring</h1><p class="muted">Signals: price changes, status changes, DOM. Stop rules: Sold / Off Market / Rented always stop a monitor. No token costs — checks are free.</p>
+<div class="card" style="padding:6px 14px"><table><tr><th>Property</th><th>Frequency</th><th>Active</th><th>Last checked</th><th>Last price</th><th>Status</th><th>Note</th><th></th></tr>
+{% for m in rows %}<tr><td><a href="{{ url_for('property_page', pid=m.property_id) }}">{{ m.address }}</a></td><td>{{ m.frequency }}</td>
+<td>{{ 'yes' if m.active else 'stopped' }}</td><td class="small">{{ m.last_checked or 'never' }}</td><td>{{ m.last_price|money }}</td>
+<td>{{ m.last_status or '—' }}</td><td class="small">{{ m.last_note or '' }}{% set j = mjobs.get(m.property_id) %}{% if j and j.status=='running' %}<br><span class="jobnote">⏳ Check running… (reload in a few seconds)</span>{% elif j and j.status=='error' %}<br><span class="jobnote err">⚠ {{ j.message }}</span>{% endif %}</td>
+<td><form method="post" action="{{ url_for('monitor_check', mid=m.id) }}"><button class="btn sm">Check now</button></form></td></tr>
+{% else %}<tr><td colspan="8" class="muted">No monitors yet — start one from a property page (Overview → Lead Monitoring).</td></tr>{% endfor %}</table></div>
+{% endblock %}

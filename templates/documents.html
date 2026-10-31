@@ -1,0 +1,7 @@
+{% extends "base.html" %}{% block body %}
+<h1>Documents</h1><p class="muted">The 42-slot checklist lives on each property (property page → Documents tab).</p>
+<div class="card" style="padding:6px 14px"><table><tr><th>Property</th><th>Checklist progress</th></tr>
+{% for r in rows %}<tr><td><a href="{{ url_for('property_page', pid=r.id, tab='documents') }}">{{ r.address }}</a></td>
+<td>{{ r.done or 0 }} / {{ r.total or 0 }} slots complete</td></tr>
+{% else %}<tr><td colspan="2" class="muted">No properties yet.</td></tr>{% endfor %}</table></div>
+{% endblock %}
