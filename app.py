@@ -106,6 +106,15 @@ def init_db():
         if col not in cols: d.execute(f"ALTER TABLE properties ADD COLUMN {col} TEXT")
     d.commit(); d.close()
 
+# Schema creation must happen at import time, not only under __main__: production
+# serves via `gunicorn app:app` (module import — see repo Dockerfile / render.yaml),
+# where the __main__ block never runs. v1.5 shipped with init_db() called only in
+# __main__, so the uw_drafts table was never created on the deployed instance and
+# every /uw-autosave POST died with "no such table: uw_drafts" (HTTP 500), while
+# local runs via `python app.py` looked fine. init_db() is idempotent
+# (CREATE TABLE IF NOT EXISTS + PRAGMA-guarded ALTERs), so calling it here is safe.
+init_db()
+
 def get_setting(k, default=""):
     row = db().execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
     return row["value"] if row else default
