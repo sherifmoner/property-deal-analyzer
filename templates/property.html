@@ -1,6 +1,6 @@
 {% extends "base.html" %}{% block title %}{{ p.address }} — Deal Analyzer{% endblock %}{% block body %}
 {% macro compcard(c, mode) %}
-<div class="ccard {{ 'pinned' if c.pinned }}" id="comp-{{ c.id }}">
+<div class="ccard {{ 'pinned' if c.pinned }}" data-cid="{{ c.id }}">
  {% if c.photo_url %}<img class="cphoto" src="{{ c.photo_url }}" alt="Comp photo" loading="lazy">{% else %}<div class="cphoto" style="height:150px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px">No photo available</div>{% endif %}
  <div class="cb">
  <div class="score">{{ c.match_score|num }}<small>MATCH</small></div>
@@ -19,12 +19,31 @@
  {% endif %}
  <details><summary>Score breakdown</summary><div class="small muted">{% for k, val in breakdowns[c.id].items() %}{{ k }}: {{ val }} · {% endfor %}</div></details>
  <div class="small muted">{% if c.source_url %}<a target="_blank" href="{{ c.source_url }}">{{ c.source }}</a>{% else %}{{ c.source }}{% endif %}
- · <a href="#map" onclick="return showOnMap({{ c.id }})">Show on map</a></div>
- <form method="post" action="{{ url_for('comp_action', cid=c.id, action='pin') }}">
- <input type="hidden" name="view" value="{{ cview }}"><input type="hidden" name="window" value="{{ window }}">{% if rmax %}<input type="hidden" name="rmax" value="{{ rmax }}">{% endif %}
- <button class="pinbtn {{ '' if c.pinned else 'off' }}">{{ '📌 Pinned — tap to unpin' if c.pinned else '📌 Pin this comp' }}</button></form>
+ · <a href="#" onclick="return openMapOverlay({{ c.id }})">Show on map</a></div>
+ <button type="button" class="pinbtn {{ '' if c.pinned else 'off' }}" data-pinbtn="{{ c.id }}" onclick="return togglePin(event, {{ c.id }})">{{ '📌 Pinned — tap to unpin' if c.pinned else '📌 Pin this comp' }}</button>
  {% if mode=='sold' %}<form method="post" action="{{ url_for('comp_action', cid=c.id, action='exclude') }}"><input type="hidden" name="view" value="{{ cview }}"><button class="btn sm danger" style="width:100%;margin-top:5px">Exclude comp</button></form>{% endif %}
- </div></div>
+ </div>
+ <div class="minimap" data-cid="{{ c.id }}" data-lat="{{ c.lat if c.lat is not none else '' }}" data-lon="{{ c.lon if c.lon is not none else '' }}"><button type="button" class="mmfull" onclick="return openMapOverlay({{ c.id }})">⛶ Fullscreen</button></div>
+</div>
+{% endmacro %}
+{% macro subjcard(mode) %}
+<div class="ccard subj">
+ {% if photos %}<img class="cphoto" src="{{ photos[0] }}" alt="Subject photo">{% else %}<div class="cphoto" style="height:150px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px">No photo available</div>{% endif %}
+ <div class="cb">
+ <div class="score" style="background:#2563eb">SUBJECT<small>THIS PROPERTY</small></div>
+ <div class="cprice">{{ p.list_price|money }}<span class="small muted"> list</span></div>
+ <div class="small"><b>{{ p.address }}</b></div>
+ <div class="small muted">{{ p.beds|num }} bd · {{ p.baths|num }} ba · {{ p.sqft|num }} sqft · built {{ p.year_built or '—' }} · lot {{ p.lot_sqft|num }} sqft</div>
+ {% if mode=='sold' %}<div class="small">Status {{ p.status }} · {{ p.deal_method }} · Flood zone {{ p.flood_zone or 'Not found' }}</div>
+ {% elif mode=='coliving' %}
+ <div class="small"><b>ZIP {{ p.zip }} stats</b><br>
+ {% if coli %}Avg shared-bath room rent: <b>${{ coli.weekly_per_room }}/wk</b> (from {{ coli.n }} rental comps)<br>{% else %}Room rent: Not found — pull comps<br>{% endif %}
+ Occupancy: Not found (no free PadSplit feed)<br>Active rooms: Not found</div>
+ {% elif mode=='rent' %}<div class="small">Rent benchmark for this ZIP: {% if ltr %}<b>{{ ltr.avg_rent|money }}/mo</b> avg of {{ ltr.basis }} set{% else %}Not found — pull comps{% endif %}</div>
+ {% endif %}
+ </div>
+ <div class="minimap" data-subject="1" data-lat="{{ p.lat if p.lat is not none else '' }}" data-lon="{{ p.lon if p.lon is not none else '' }}"><button type="button" class="mmfull" onclick="return openMapOverlay()">⛶ Fullscreen</button></div>
+</div>
 {% endmacro %}
 {% if photos %}
 <div class="gallery">
@@ -65,25 +84,16 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 </script>{% endif %}
 {% endif %}
 
-<div class="verdict {{ v.color }}">
- <div><div class="lab">Deal score</div><div class="big">{{ v.score if v.score is not none else '—' }}</div><div class="small">{{ v.label }}</div></div>
- <div><div class="lab">Confidence</div><div class="big" style="font-size:20px">{{ v.confidence }}</div><div class="small">comp count + data completeness</div></div>
- <div><div class="lab">Reconciled ARV</div><div class="big" style="font-size:24px">{{ v.arv|money }}</div><div class="small">{{ v.rec.note }}</div></div>
- <div><div class="lab">MAO (70% − repairs)</div><div class="big" style="font-size:24px">{{ v.mao|money }}</div></div>
- <div><div class="lab">Buy box</div><div class="big" style="font-size:24px">{{ v.buybox }}</div><div class="small">{{ v.buybox_name or '' }}</div></div>
- {% if v.reasons %}<div class="small" style="flex-basis:100%">{{ v.reasons|join(' · ') }}</div>{% endif %}
-</div>
-
 {% if not (steps.comps and steps.scenarios) %}
 <div class="steps">
  <div class="step {{ 'done' if steps.comps else 'next' }}"><b>Step 1 — Pull comps</b><br>{% if steps.comps %}✓ {{ sold|length }} sold + {{ rents|length }} rental comps on file{% else %}Get sold + rental comps and listing photos for this property.{% endif %}<br><a href="{{ url_for('property_page', pid=p.id, tab='comps') }}">Go to Comparables →</a></div>
- <div class="step {{ 'done' if steps.comps }}"><b>Step 2 — Review the ARV</b><br>{% if steps.comps %}✓ Reconciled ARV {{ v.arv|money }} (pin comps to adjust it){% else %}Pin the best comps — the ARV above is built from them.{% endif %}<br><a href="{{ url_for('property_page', pid=p.id, tab='comps') }}">Review comps →</a></div>
+ <div class="step {{ 'done' if steps.comps }}"><b>Step 2 — Review the ARV</b><br>{% if steps.comps %}✓ Reconciled ARV {{ v.arv|money }} (pin comps to adjust it){% else %}Pin the best comps — the ARV in Comparables is built from them.{% endif %}<br><a href="{{ url_for('property_page', pid=p.id, tab='comps') }}">Review comps →</a></div>
  <div class="step {{ 'done' if steps.scenarios else ('next' if steps.comps else '') }}"><b>Step 3 — Run underwriting</b><br>{% if steps.scenarios %}✓ {{ scenarios|length }} scenario(s) saved{% else %}Score the deal: Co-Living, Long Term, Flip and more.{% endif %}<br><a href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">Go to Underwriting →</a></div>
 </div>
 {% endif %}
 
 <div class="tabs">
-{% for t,lab in [('overview','Overview'),('comps','Comparables'),('demographics','Demographics'),('underwriting','Underwriting'),('floorplans','Floor Plans'),('contractors','Contractors'),('market','Market Data'),('taxes','Taxes'),('skiptrace','Skiptrace'),('documents','Documents')] %}
+{% for t,lab in [('overview','Overview'),('comps','Comparables'),('demographics','Demographics'),('underwriting','Underwriting'),('floorplans','Floor Plans'),('contractors','Contractors'),('market','Market Data'),('taxes','Taxes'),('documents','Documents')] %}
 <a href="{{ url_for('property_page', pid=p.id, tab=t) }}" class="{% if tab==t %}on{% endif %}">{{ lab }}</a>{% endfor %}
 </div>
 
@@ -202,17 +212,8 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>End-buyer inspection days</label><input name="dispo_inspection_days" value="{{ p.dispo_inspection_days if p.dispo_inspection_days is not none else '' }}"></div>
 <div><label>Offer review</label><input name="offer_review" value="{{ p.offer_review or 'Highest & Best' }}"></div></div>
 <p><button class="btn sec">Save disposition</button></p></form>
-<p class="small muted">Buyer matching: run this property's price/beds/city against your buy boxes on the verdict bar above (Settings → Buy Boxes). Documented buyer-pool matching imports from GHL exports via Settings import.</p></div>
+<p class="small muted">Buyer matching: run this property's price/beds/city against your buy boxes (Settings → Buy Boxes). Documented buyer-pool matching imports from GHL exports via Settings import.</p></div>
 
-<div class="card"><h2>Lead Monitoring</h2>
-<form method="post" action="{{ url_for('add_monitor', pid=p.id) }}"><div class="rowflex">
-<div><label>Frequency</label><select name="frequency"><option>Daily</option><option selected>Weekly</option><option>Bi-weekly</option><option>Monthly</option></select></div>
-<div><label>Price threshold $ (alert below)</label><input name="price_threshold"></div>
-<div><label>DOM threshold</label><input name="dom_threshold"></div>
-<div><label>Stop on Sold / Off Market / Rented</label><input type="checkbox" name="stop_on_status" checked></div>
-<div style="flex:0"><button class="btn sec">Start monitoring</button></div></div></form>
-{% for m in monitors %}<p class="small">{{ m.frequency }} · active: {{ 'yes' if m.active else 'no (stopped)' }} · last check: {{ m.last_checked or 'never' }} — {{ m.last_note or '' }}</p>{% endfor %}
-</div>
 {% endif %}
 
 {% if tab=='comps' %}
@@ -223,57 +224,37 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>Sold within</label><select name="window_days">{% for dval,lab in [(30,'Last 30 days'),(90,'Last 90 days'),(180,'Last 6 months'),(365,'Last year')] %}<option value="{{ dval }}" {% if dval==365 %}selected{% endif %}>{{ lab }}</option>{% endfor %}</select></div>
 <div style="flex:0"><button class="btn big">🔍 Pull Comps</button></div></div></form>
 <p class="small muted">Pulls sold comps + rental comps + this property's own listing photos in the background (about a minute). The banner at the top of this page shows progress and the final counts — nothing happens silently. Match score weights: distance 40% · sqft 20% · beds 13% · baths 13% · year built 13%. On file now: <b>{{ sold|length }} sold</b>, <b>{{ rents|length }} rentals</b>.</p>
-<form method="get" action="{{ url_for('property_page', pid=p.id) }}"><input type="hidden" name="tab" value="comps"><input type="hidden" name="view" value="{{ cview }}">
+<form method="get" action="{{ url_for('property_page', pid=p.id) }}"><input type="hidden" name="tab" value="comps"><input type="hidden" name="view" value="{{ cview }}" id="filter-view">
 <div class="rowflex"><div><label>Show sold from</label><select name="window">{% for dval,lab in [(30,'Last 30 days'),(90,'Last 90 days'),(180,'Last 6 months'),(365,'Last year')] %}<option value="{{ dval }}" {% if window==dval %}selected{% endif %}>{{ lab }}</option>{% endfor %}</select></div>
 <div><label>Show within radius</label><select name="rmax"><option value="" {% if not rmax %}selected{% endif %}>All pulled</option>{% for r in [0.25,0.5,1,1.25,1.5,2,2.5,5,10] %}<option value="{{ r }}" {% if rmax==r %}selected{% endif %}>{{ r }} mi</option>{% endfor %}</select></div>
 <div style="flex:0"><button class="btn sec">Apply filters</button></div></div></form></div>
 
-<div class="viewtabs">
-<a href="{{ url_for('property_page', pid=p.id, tab='comps', view='sold', window=window, rmax=rmax) }}" class="{{ 'on' if cview=='sold' }}">🏠 Sold Comps ({{ sold_view|length }})</a>
-<a href="{{ url_for('property_page', pid=p.id, tab='comps', view='coliving', window=window, rmax=rmax) }}" class="{{ 'on' if cview=='coliving' }}">🛏 Co-Living</a>
-<a href="{{ url_for('property_page', pid=p.id, tab='comps', view='ltr', window=window, rmax=rmax) }}" class="{{ 'on' if cview=='ltr' }}">🔑 Long Term Rental ({{ rents_view|length }})</a>
-<a href="{{ url_for('property_page', pid=p.id, tab='comps', view='str', window=window, rmax=rmax) }}" class="{{ 'on' if cview=='str' }}">🌙 Short Term Rental</a>
-<a href="{{ url_for('property_page', pid=p.id, tab='comps', view='affordable', window=window, rmax=rmax) }}" class="{{ 'on' if cview=='affordable' }}">💲 Affordable Housing ({{ afford_view|length }})</a>
+<div class="viewtabs" id="viewpills">
+{% for vname, vlab in [('maps','🗺 Maps'),('sold','🏠 Sold Comps (' ~ sold_view|length ~ ')'),('coliving','🛏 Co-Living'),('str','🌙 Short Term Rental'),('mtr','📅 Mid Term Rental'),('ltr','🔑 Long Term Rental (' ~ rents_view|length ~ ')'),('affordable','💲 Affordable Housing (' ~ afford_view|length ~ ')')] %}
+<button type="button" class="vpill {{ 'on' if cview==vname }}" data-view="{{ vname }}" onclick="return activateView('{{ vname }}')">{{ vlab }}</button>{% endfor %}
 </div>
 
-<div class="card"><h2>Map — click a pin to jump to its card</h2><div id="map"></div><p class="small muted">Blue = subject · gold = pinned · green = sold · purple = rental. Pinned comps drive the averages and the ARV.</p></div>
+<div class="viewpane {{ 'on' if cview=='maps' }}" data-pane="maps">
+<div class="grid2" style="grid-template-columns:300px 1fr;align-items:start">
+<div>{{ subjcard('maps') }}</div>
+<div class="card"><h2>Map — all comps</h2><div id="map"></div><p class="small muted">Blue = subject · gold = pinned · green = sold · purple = rental. Pinned comps drive the averages and the ARV. Click a pin to jump to its card.</p></div>
+</div>
+</div>
 
-{% if cview=='sold' %}
+<div class="viewpane {{ 'on' if cview=='sold' }}" data-pane="sold">
 {% if sold_stats %}<div class="statbar">
-<div><div class="lab">{{ 'Averages of your ' ~ sold_stats.n ~ ' pinned comps' if sold_stats.basis=='pinned' else 'Averages of top 3 by score — pin comps to choose your own' }}</div><div class="val">{{ sold_stats.avg_price|money }}</div><div class="lab">avg sale price</div></div>
-<div><div class="lab">Avg $/sqft</div><div class="val">{{ ('$' ~ sold_stats.avg_ppsf) if sold_stats.avg_ppsf else '—' }}</div><div class="lab">&nbsp;</div></div>
-<div><div class="lab">Avg days on market</div><div class="val">{{ sold_stats.avg_dom if sold_stats.avg_dom is not none else '—' }}</div><div class="lab">&nbsp;</div></div>
-<div><div class="lab">Reconciled ARV (from these comps)</div><div class="val">{{ v.rec.arv|money }}</div><div class="lab">MAO {{ v.mao|money }}</div></div>
-</div>{% endif %}
-{% if sold_view %}<div class="compcards">{% for c in sold_view %}{{ compcard(c, 'sold') }}{% endfor %}</div>
+<div><div class="lab" data-stat="sold_basis">{{ 'Averages of your ' ~ sold_stats.n ~ ' pinned comps' if sold_stats.basis=='pinned' else 'Averages of top 3 by score — pin comps to choose your own' }}</div><div class="val" data-stat="sold_avg">{{ sold_stats.avg_price|money }}</div><div class="lab">avg sale price</div></div>
+<div><div class="lab">Avg $/sqft</div><div class="val" data-stat="sold_ppsf">{{ ('$' ~ sold_stats.avg_ppsf) if sold_stats.avg_ppsf else '—' }}</div><div class="lab">&nbsp;</div></div>
+<div><div class="lab">Avg days on market</div><div class="val" data-stat="sold_dom">{{ sold_stats.avg_dom if sold_stats.avg_dom is not none else '—' }}</div><div class="lab">&nbsp;</div></div>
+<div><div class="lab">Reconciled ARV (from these comps)</div><div class="val" data-stat="arv">{{ v.rec.arv|money }}</div><div class="lab">MAO <span data-stat="mao">{{ v.mao|money }}</span></div></div>
+</div>
+<p class="small muted" data-stat="arv_note" style="margin-top:-6px">{{ v.rec.note }}</p>{% endif %}
+{% if sold_view %}<div class="compcards">{{ subjcard('sold') }}{% for c in sold_view %}{{ compcard(c, 'sold') }}{% endfor %}</div>
 {% else %}<div class="card"><p class="muted">No sold comps in this filter window yet — widen the radius/date filters above, or pull comps.</p></div>{% endif %}
-<div class="card" style="margin-top:16px"><h2>Adjustment worksheet <span class="small muted">(fine-tune the pinned comps — adjustments feed the ARV)</span></h2>
-<table id="comptable"><thead><tr><th>★</th><th>Address</th><th>Sold $</th><th>$/sqft</th><th>Bd</th><th>Ba</th><th>Sqft</th><th>Yr</th><th>Sold date</th><th>DOM</th><th>Dist</th><th>Match</th><th>Adj $ (cond+size+other)</th><th>Adj. price</th><th>Source</th><th></th></tr></thead>
-<tbody>{% for c in sold_view %}<tr>
-<td><form method="post" action="{{ url_for('comp_action', cid=c.id, action='pin') }}"><input type="hidden" name="view" value="sold"><input type="hidden" name="window" value="{{ window }}"><button class="btn sm sec" title="Pin for ARV">{{ '★' if c.pinned else '☆' }}</button></form></td>
-<td>{{ c.address }}, {{ c.city }} {{ c.zip }}</td><td>{{ c.price|money }}</td><td>{{ ('$' ~ c.ppsf|round(0)) if c.ppsf else '—' }}</td>
-<td>{{ c.beds|num }}</td><td>{{ c.baths|num }}</td><td>{{ c.sqft|num }}</td><td>{{ c.year_built or '—' }}</td>
-<td class="small">{{ c.event_date or '—' }}</td><td>{{ c.dom|num }}</td><td>{{ c.distance_mi|num(2) }} mi</td>
-<td><b>{{ c.match_score|num }}</b></td>
-<td><form method="post" action="{{ url_for('comp_action', cid=c.id, action='adjust') }}" style="display:flex;gap:3px">
-<input name="adj_condition" value="{{ c.adj_condition or 0 }}" style="width:64px" title="Condition adj $">
-<input name="adj_size" value="{{ c.adj_size or 0 }}" style="width:64px" title="Size adj $">
-<input name="adj_other" value="{{ c.adj_other or 0 }}" style="width:64px" title="Other adj $"><button class="btn sm sec">Set</button></form></td>
-<td>{{ ((c.price or 0) + (c.adj_condition or 0) + (c.adj_size or 0) + (c.adj_other or 0))|money }}</td>
-<td class="small">{% if c.source_url %}<a target="_blank" href="{{ c.source_url }}">{{ c.source }}</a>{% else %}{{ c.source }}{% endif %}</td>
-<td><form method="post" action="{{ url_for('comp_action', cid=c.id, action='exclude') }}"><input type="hidden" name="view" value="sold"><button class="btn sm danger">Exclude</button></form></td></tr>
-{% else %}<tr><td colspan="16" class="muted">No sold comps in this filter window.</td></tr>{% endfor %}</tbody></table>
-{% set exc = comps|selectattr('excluded')|list %}{% if exc %}<p class="small muted">Excluded: {% for c in exc %}{{ c.address }} <form method="post" style="display:inline" action="{{ url_for('comp_action', cid=c.id, action='exclude') }}"><button class="btn sm sec">restore</button></form> {% endfor %}</p>{% endif %}
-<h3>ARV reconciliation</h3><p>{{ v.rec.note }}</p>
-<p><b>Reconciled ARV: {{ v.rec.arv|money }}</b> · MAO (70% − repairs): {{ v.mao|money }}</p></div>
-{% elif cview=='ltr' %}
-{% if ltr %}<div class="statbar">
-<div><div class="lab">{{ 'Average rent of your ' ~ ltr.basis_n ~ ' pinned rental comps' if ltr.basis=='pinned' else 'Average rent — top 3 by score (pin rentals to choose your own)' }}</div><div class="val">{{ ltr.avg_rent|money }}/mo</div><div class="lab">feeds Long Term underwriting</div></div>
-<div><div class="lab">Median asking rent (all {{ ltr.count }})</div><div class="val">{{ ltr.median_rent|money }}/mo</div><div class="lab">&nbsp;</div></div>
-</div>{% endif %}
-{% if rents_view %}<div class="compcards">{% for c in rents_view %}{{ compcard(c, 'rent') }}{% endfor %}</div>
-{% else %}<div class="card"><p class="muted">No rental comps yet — pull comps above.</p></div>{% endif %}
-{% elif cview=='coliving' %}
+{% set exc = comps|selectattr('excluded')|list %}{% if exc %}<p class="small muted" style="margin-top:10px">Excluded: {% for c in exc %}{{ c.address }} <form method="post" style="display:inline" action="{{ url_for('comp_action', cid=c.id, action='exclude') }}"><button class="btn sm sec">restore</button></form> {% endfor %}</p>{% endif %}
+</div>
+
+<div class="viewpane {{ 'on' if cview=='coliving' }}" data-pane="coliving">
 <div class="card"><h2>Co-Living benchmark — ZIP {{ p.zip }}</h2>
 {% if coli %}<div class="kv">
 <div><span>Estimated room rent (shared bath)</span><b>${{ coli.weekly_per_room }}/wk · ${{ coli.monthly_per_room }}/mo</b></div>
@@ -282,37 +263,154 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><span>Source</span><b style="font-size:12px">{{ coli.source }} · {{ coli.date }}</b></div></div>
 <p class="small muted">This benchmark pre-fills the Co-Living underwriting rent per room — ReiSearch does the same from PadSplit ZIP stats. It is an estimate from whole-house rents, not live PadSplit listings (no free PadSplit feed exists).</p>
 {% else %}<p class="muted">Not found — not enough rental comps with bedroom counts to estimate a per-room rent yet. Pull comps (with a wider radius if needed) and this benchmark will appear.</p>{% endif %}</div>
-{% if rents_view %}<div class="compcards">{% for c in rents_view %}{{ compcard(c, 'coliving') }}{% endfor %}</div>
+{% if rents_view %}<div class="compcards">{{ subjcard('coliving') }}{% for c in rents_view %}{{ compcard(c, 'coliving') }}{% endfor %}</div>
 {% else %}<div class="card"><p class="muted">No rental comps yet — pull comps above.</p></div>{% endif %}
-{% elif cview=='str' %}
+</div>
+
+<div class="viewpane {{ 'on' if cview=='str' }}" data-pane="str">
 <div class="card"><h2>Short Term Rental comps</h2>
 <p class="muted">No free data source for short-term (Airbnb-style) comps exists yet — and we won't fake it. ReiSearch itself showed <b>0 STR comps</b> for this ZIP. Enter your nightly rate, occupancy and cleaning fee manually in <a href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">Underwriting → Short Term</a> — the math there is fully wired.</p></div>
-{% elif cview=='affordable' %}
+</div>
+
+{% macro ltrstatbar() %}
+{% if ltr %}<div class="statbar">
+<div><div class="lab" data-stat="ltr_basis">{{ 'Average rent of your ' ~ ltr.basis_n ~ ' pinned rental comps' if ltr.basis=='pinned' else 'Average rent — top 3 by score (pin rentals to choose your own)' }}</div><div class="val"><span data-stat="ltr_avg">{{ ltr.avg_rent|money }}</span>/mo</div><div class="lab">feeds Long Term underwriting</div></div>
+<div><div class="lab">Median asking rent (all {{ ltr.count }})</div><div class="val"><span data-stat="ltr_median">{{ ltr.median_rent|money }}</span>/mo</div><div class="lab">&nbsp;</div></div>
+</div>{% endif %}
+{% endmacro %}
+
+<div class="viewpane {{ 'on' if cview=='mtr' }}" data-pane="mtr">
+{{ ltrstatbar() }}
+<p class="small muted">Mid Term view — ReiSearch disables this view; ours reads the same pulled rental comps as Long Term (30+ day stays are listed in the same feeds).</p>
+{% if rents_view %}<div class="compcards">{{ subjcard('rent') }}{% for c in rents_view %}{{ compcard(c, 'rent') }}{% endfor %}</div>
+{% else %}<div class="card"><p class="muted">No rental comps yet — pull comps above.</p></div>{% endif %}
+</div>
+
+<div class="viewpane {{ 'on' if cview=='ltr' }}" data-pane="ltr">
+{{ ltrstatbar() }}
+{% if rents_view %}<div class="compcards">{{ subjcard('rent') }}{% for c in rents_view %}{{ compcard(c, 'rent') }}{% endfor %}</div>
+{% else %}<div class="card"><p class="muted">No rental comps yet — pull comps above.</p></div>{% endif %}
+</div>
+
+<div class="viewpane {{ 'on' if cview=='affordable' }}" data-pane="affordable">
 <div class="card"><h2>Affordable Housing view</h2>
 <p class="small muted">Method: rental comps asking <b>below the ZIP median rent ({{ med_rent|money }}/mo)</b> from the pulled set — a plain, labeled proxy. (Exact HUD Small Area FMR matching plugs in here when a SAFMR benchmark is loaded.) Source: {{ ltr.source if ltr }} · {{ ltr.date if ltr }}</p></div>
-{% if afford_view %}<div class="compcards">{% for c in afford_view %}{{ compcard(c, 'rent') }}{% endfor %}</div>
+{% if afford_view %}<div class="compcards">{{ subjcard('rent') }}{% for c in afford_view %}{{ compcard(c, 'rent') }}{% endfor %}</div>
 {% else %}<div class="card"><p class="muted">No below-median rental comps in the pulled set — pull comps above.</p></div>{% endif %}
-{% endif %}
+</div>
+
+<div class="mapoverlay" id="mapoverlay"><button class="x" onclick="return closeMapOverlay()">✕ Close</button><div id="overlaymap"></div></div>
+
 <script>
-function highlightComp(id){var el=document.getElementById('comp-'+id);if(el){el.scrollIntoView({behavior:'smooth',block:'center'});el.classList.add('hl');setTimeout(function(){el.classList.remove('hl')},2600);}return false;}
-var _markers={};
-function showOnMap(id){var m=_markers[id];if(m){m.openPopup();window.scrollTo({top:0,behavior:'smooth'});}return false;}
-(function(){
- if(typeof L==='undefined')return;
- var map=L.map('map').setView([{{ p.lat }}, {{ p.lon }}],13);
- L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);
- L.marker([{{ p.lat }}, {{ p.lon }}]).addTo(map).bindPopup('<b>Subject</b><br>{{ p.address }}');
- {% for c in sold_view + rents_view %}{% if c.lat %}
- _markers[{{ c.id }}]=L.circleMarker([{{ c.lat }}, {{ c.lon }}],{radius:{{ 10 if c.pinned else 7 }},color:'{{ "#f59e0b" if c.pinned else ("#16a34a" if c.kind=="sold" else "#7c3aed") }}',weight:{{ 3 if c.pinned else 2 }},fillOpacity:.55}).addTo(map)
- .bindPopup('<b>{{ c.address }}</b><br>{{ c.kind }} {{ c.price|money }}{{ "/mo" if c.kind=="rent" }}<br>Match {{ c.match_score|num }} · {{ c.distance_mi|num(2) }} mi{% if c.pinned %}<br>📌 Pinned{% endif %}<br><a href="#comp-{{ c.id }}" onclick="return highlightComp({{ c.id }})">View card ↓</a>');{% endif %}{% endfor %}
- var st=document.querySelector('#comptable');
- if(st){document.querySelectorAll('#comptable th').forEach(function(th,i){th.addEventListener('click',function(){
-  var tb=st.querySelector('tbody'),rows=Array.from(tb.rows);var dir=th.dataset.dir=th.dataset.dir=='asc'?'desc':'asc';
-  rows.sort(function(a,b){var x=a.cells[i].innerText.replace(/[^0-9.\-]/g,''),y=b.cells[i].innerText.replace(/[^0-9.\-]/g,'');
-   if(x!==''&&y!==''&&!isNaN(x)&&!isNaN(y))return dir=='asc'?x-y:y-x;
-   return dir=='asc'?a.cells[i].innerText.localeCompare(b.cells[i].innerText):b.cells[i].innerText.localeCompare(a.cells[i].innerText);});
-  rows.forEach(function(r){tb.appendChild(r);});});});}
-})();
+var SUBJECT = {lat: {{ p.lat or 0 }}, lon: {{ p.lon or 0 }}, address: {{ p.address|tojson }}};
+var COMPS = [{% for c in sold_view + rents_view %}{% if c.lat %}{"id": {{ c.id }}, "lat": {{ c.lat }}, "lon": {{ c.lon }}, "kind": "{{ c.kind }}", "pinned": {{ 1 if c.pinned else 0 }}, "addr": {{ c.address|tojson }}, "price": {{ c.price or 0 }}},{% endif %}{% endfor %}];
+var CURVIEW = "{{ cview }}";
+var MAPMARKERS = {}, MINIMAPS = {}, BIGMAP = null, OVERMAP = null;
+function pinColor(c){ return c.pinned ? '#f59e0b' : (c.kind === 'sold' ? '#16a34a' : '#7c3aed'); }
+function compById(id){ for (var i = 0; i < COMPS.length; i++) if (COMPS[i].id === id) return COMPS[i]; return null; }
+function money(x){ return (x === null || x === undefined) ? 'Not found' : '$' + Math.round(x).toLocaleString('en-US'); }
+function setStat(name, txt){ document.querySelectorAll('[data-stat="' + name + '"]').forEach(function(e){ e.textContent = txt; }); }
+
+function highlightComp(id){
+  var c = compById(id);
+  if (c) activateView(c.kind === 'sold' ? 'sold' : 'ltr');
+  var el = document.querySelector('.ccard[data-cid="' + id + '"]');
+  if (el){ el.scrollIntoView({behavior: 'smooth', block: 'center'}); el.classList.add('hl'); setTimeout(function(){ el.classList.remove('hl'); }, 2600); }
+  return false;
+}
+function buildMap(elid){
+  var map = L.map(elid).setView([SUBJECT.lat, SUBJECT.lon], 13);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '© OpenStreetMap'}).addTo(map);
+  L.marker([SUBJECT.lat, SUBJECT.lon]).addTo(map).bindPopup('<b>Subject</b><br>' + SUBJECT.address);
+  COMPS.forEach(function(c){
+    var m = L.circleMarker([c.lat, c.lon], {radius: c.pinned ? 10 : 7, color: pinColor(c), weight: c.pinned ? 3 : 2, fillOpacity: .55}).addTo(map)
+      .bindPopup('<b>' + c.addr + '</b><br>' + c.kind + ' ' + money(c.price) + (c.kind === 'rent' ? '/mo' : '') + (c.pinned ? '<br>📌 Pinned' : '') + '<br><a href="#" onclick="return highlightComp(' + c.id + ')">View card ↓</a>');
+    (MAPMARKERS[c.id] = MAPMARKERS[c.id] || []).push(m);
+  });
+  return map;
+}
+function openMapOverlay(id){
+  var ov = document.getElementById('mapoverlay');
+  ov.classList.add('open');
+  if (typeof L !== 'undefined' && !OVERMAP){ OVERMAP = buildMap('overlaymap'); }
+  if (OVERMAP){ setTimeout(function(){ OVERMAP.invalidateSize(); if (id){ var c = compById(id); if (c) OVERMAP.setView([c.lat, c.lon], 14); } }, 60); }
+  return false;
+}
+function closeMapOverlay(){ document.getElementById('mapoverlay').classList.remove('open'); return false; }
+function showOnMap(id){ return openMapOverlay(id); }
+
+var mmObserver = null;
+function initMinimaps(root){
+  if (typeof L === 'undefined') return;
+  if (!mmObserver){
+    mmObserver = new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if (!en.isIntersecting) return;
+        var el = en.target; mmObserver.unobserve(el);
+        if (el.dataset.done) return; el.dataset.done = '1';
+        var lat = parseFloat(el.dataset.lat), lon = parseFloat(el.dataset.lon);
+        if (isNaN(lat) || isNaN(lon)) { el.innerHTML = '<div class="mmnone">No coordinates for this comp</div>'; return; }
+        var mm = L.map(el, {scrollWheelZoom: false, attributionControl: false}).setView([lat, lon], 13);
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19}).addTo(mm);
+        L.marker([SUBJECT.lat, SUBJECT.lon]).addTo(mm);
+        if (!el.dataset.subject){
+          var c = compById(parseInt(el.dataset.cid, 10));
+          var cm = L.circleMarker([lat, lon], {radius: 8, color: c ? pinColor(c) : '#16a34a', weight: 2, fillOpacity: .6}).addTo(mm);
+          if (c) MINIMAPS[c.id] = cm;
+          mm.fitBounds([[SUBJECT.lat, SUBJECT.lon], [lat, lon]], {padding: [12, 12]});
+        }
+      });
+    }, {rootMargin: '240px'});
+  }
+  (root || document).querySelectorAll('.minimap:not([data-done])').forEach(function(el){ mmObserver.observe(el); });
+}
+
+function activateView(name){
+  CURVIEW = name;
+  document.querySelectorAll('.viewpane').forEach(function(pn){ pn.classList.toggle('on', pn.dataset.pane === name); });
+  document.querySelectorAll('#viewpills .vpill').forEach(function(b){ b.classList.toggle('on', b.dataset.view === name); });
+  var fv = document.getElementById('filter-view'); if (fv) fv.value = name;
+  if (name === 'maps' && typeof L !== 'undefined' && !BIGMAP){ BIGMAP = buildMap('map'); }
+  if (BIGMAP && name === 'maps'){ setTimeout(function(){ BIGMAP.invalidateSize(); }, 60); }
+  var pane = document.querySelector('.viewpane[data-pane="' + name + '"]');
+  if (pane) initMinimaps(pane);
+  return false;
+}
+
+function applyPin(cid, j){
+  document.querySelectorAll('[data-pinbtn="' + cid + '"]').forEach(function(b){
+    b.classList.toggle('off', !j.pinned);
+    b.textContent = j.pinned ? '📌 Pinned — tap to unpin' : '📌 Pin this comp';
+  });
+  document.querySelectorAll('.ccard[data-cid="' + cid + '"]').forEach(function(cd){ cd.classList.toggle('pinned', !!j.pinned); });
+  var c = compById(cid); if (c) c.pinned = j.pinned;
+  (MAPMARKERS[cid] || []).forEach(function(m){ if (c) m.setStyle({color: pinColor(c), radius: c.pinned ? 10 : 7, weight: c.pinned ? 3 : 2}); });
+  if (MINIMAPS[cid] && c) MINIMAPS[cid].setStyle({color: pinColor(c)});
+  if (j.sold_stats){
+    var s = j.sold_stats;
+    setStat('sold_basis', s.basis === 'pinned' ? ('Averages of your ' + s.n + ' pinned comps') : 'Averages of top 3 by score — pin comps to choose your own');
+    setStat('sold_avg', money(s.avg_price));
+    setStat('sold_ppsf', s.avg_ppsf ? ('$' + s.avg_ppsf) : '—');
+    setStat('sold_dom', (s.avg_dom === null || s.avg_dom === undefined) ? '—' : s.avg_dom);
+  }
+  if (j.ltr){
+    setStat('ltr_basis', j.ltr.basis === 'pinned' ? ('Average rent of your ' + j.ltr.basis_n + ' pinned rental comps') : 'Average rent — top 3 by score (pin rentals to choose your own)');
+    setStat('ltr_avg', money(j.ltr.avg_rent));
+    setStat('ltr_median', money(j.ltr.median_rent));
+  }
+  if (j.arv !== null && j.arv !== undefined){ setStat('arv', money(j.arv)); setStat('mao', money(j.mao)); }
+  if (j.arv_note) setStat('arv_note', j.arv_note);
+}
+function togglePin(ev, cid){
+  if (ev) ev.preventDefault();
+  var fd = new URLSearchParams({ajax: '1', window: '{{ window }}', rmax: '{{ rmax or "" }}'});
+  fetch('/comp/' + cid + '/pin', {method: 'POST', headers: {'X-Requested-With': 'fetch'}, body: fd})
+    .then(function(r){ return r.json(); })
+    .then(function(j){ applyPin(cid, j); })
+    .catch(function(){ /* leave UI as-is on failure */ });
+  return false;
+}
+document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW); });
 </script>
 {% endif %}
 
@@ -353,84 +451,7 @@ function showOnMap(id){var m=_markers[id];if(m){m.openPopup();window.scrollTo({t
 </div>
 {% endif %}
 
-{% if tab=='underwriting' %}
-<div class="card"><h2>Underwriting — 5 strategies, one shell</h2>
-<p class="small muted">Same math as ReiSearch. Revenue defaults come from your pulled comps: Co-Living rent/room from the ZIP room-rent benchmark, Long/Mid Term rent from the rental-comp average. Line items are JSON arrays: rehab/appliances/furnishing/conversion items use {label, qty, material, labor}; funding stack uses {type, amount, rate}. Every strategy gets a Deal Score (ReiSearch only scored Co-Living). Co-Living weights: CF/room 25% · DSCR 20% · CoC 20% · cap 15% · break-even 12% · downside CF 8%, minus realism penalties — $0 taxes/insurance get sanity defaults, never a free "Strong".</p>
-{% for strat in strategies %}
-<details {% if strat=='Co-Living' %}open{% endif %}><summary><b>{{ strat }}</b>{% if strat=='Co-Living' and coli %} — benchmark ${{ coli.weekly_per_room }}/wk per room{% elif strat in ('Long Term','Mid Term') and ltr %} — comp avg rent {{ ltr.avg_rent|money }}/mo{% endif %}</summary>
-<form method="post" action="{{ url_for('underwrite', pid=p.id) }}">
-<input type="hidden" name="strategy" value="{{ strat }}">
-<div class="rowflex">
-<div><label>Purchase price $</label><input name="purchase_price" value="{{ p.purchase_price or p.list_price or '' }}"></div>
-<div><label>ARV $</label><input name="arv" value="{{ p.arv or v.arv or '' }}"></div>
-<div><label>Rehab flat $ (or use lines)</label><input name="rehab_flat" value="{{ p.repairs or '' }}"></div>
-<div><label>Closing costs $</label><input name="closing_costs" value="3000"></div></div>
-<div class="rowflex">
-<div><label>Taxes $/mo (0 = sanity default)</label><input name="taxes_mo" value="0"></div>
-<div><label>Insurance $/mo (0 = sanity default)</label><input name="insurance_mo" value="0"></div>
-<div><label>Utilities $/mo</label><input name="utilities_mo" value="0"></div>
-<div><label>Maintenance $/mo</label><input name="maintenance_mo" value="0"></div>
-<div><label>Management $/mo</label><input name="management_mo" value="0"></div>
-<div><label>Vacancy %</label><input name="vacancy_pct" value="{{ 15 if strat=='Co-Living' else 5 }}"></div></div>
-{% if strat=='Fix & Flip' %}
-<div class="rowflex"><div><label>Holding months</label><input name="holding_months" value="6"></div>
-<div><label>Holding cost $/mo</label><input name="holding_mo" value="450"></div></div>
-<p class="small muted">Exit: ARV − 6% commission − 2% seller closing → net proceeds, profit, ROI, annualized ROI, margin, 70%-rule MAO.</p>
-{% elif strat=='Co-Living' %}
-<div class="rowflex"><div><label>Rooms</label><input name="rooms" value="{{ p.beds or 4 }}"></div>
-<div><label>Rent / room $/mo {% if coli %}<span class="muted">(ZIP benchmark ${{ coli.weekly_per_room }}/wk from {{ coli.n }} rental comps)</span>{% endif %}</label><input name="rent_per_room" value="{{ coli.monthly_per_room if coli else 819 }}"></div>
-<div><label>Booking fee (days of rent per booking, yearly — PadSplit keeps these)</label><input name="booking_fee_days" value="10"></div>
-<div><label>Service fee % (PadSplit-style ongoing)</label><input name="service_fee_pct" value="8"></div></div>
-{% elif strat=='Short Term' %}
-<div class="rowflex"><div><label>Units</label><input name="units" value="1"></div>
-<div><label>Nightly rate $</label><input name="nightly_rate" value="120"></div>
-<div><label>Occupancy %</label><input name="occupancy_pct" value="65"></div>
-<div><label>Avg stay (nights)</label><input name="avg_stay_nights" value="3"></div>
-<div><label>Cleaning fee / stay $</label><input name="cleaning_fee" value="90"></div>
-<div><label>Platform fee %</label><input name="platform_pct" value="15"></div></div>
-{% else %}
-<div class="rowflex"><div><label>Units</label><input name="units" value="1"></div>
-<div><label>Rent / unit $/mo {% if ltr %}<span class="muted">(rental-comp average, {{ ltr.basis }} basis)</span>{% endif %}</label><input name="rent_per_unit" value="{{ ltr.avg_rent if ltr else 1600 }}"></div>
-<div><label>Pet $/mo</label><input name="pet_mo" value="0"></div><div><label>Parking $/mo</label><input name="parking_mo" value="0"></div>
-<div><label>Storage $/mo</label><input name="storage_mo" value="0"></div><div><label>Laundry $/mo</label><input name="laundry_mo" value="0"></div></div>
-{% endif %}
-<label>Rehab line items (JSON)</label><textarea class="code" name="rehab_lines_json" rows="2">[{"label":"Kitchen","qty":1,"material":6000,"labor":4000},{"label":"Bath","qty":2,"material":2500,"labor":2000},{"label":"Paint/floors","qty":1,"material":3500,"labor":2500}]</textarea>
-<label>Appliance line items (JSON)</label><textarea class="code" name="appliance_lines_json" rows="1">[{"label":"Fridge","qty":1,"material":900,"labor":100},{"label":"Range","qty":1,"material":700,"labor":100},{"label":"Washer/Dryer","qty":1,"material":1100,"labor":150}]</textarea>
-{% if strat!='Long Term' %}<label>Furnishing line items (JSON)</label><textarea class="code" name="furnishing_lines_json" rows="1">[{"label":"Per-room package","qty":{{ p.beds or 4 }},"material":1200,"labor":200}]</textarea>{% endif %}
-{% if strat=='Co-Living' %}<label>Conversion line items (JSON)</label><textarea class="code" name="conversion_lines_json" rows="1">[{"label":"Add door/locks per room","qty":{{ p.beds or 4 }},"material":250,"labor":150},{"label":"Fire safety","qty":1,"material":600,"labor":200}]</textarea>{% endif %}
-<label>Funding stack (JSON) — types: Conventional, DSCR, Hard Money, Private, Bridge, HELOC, Seller Finance, SubTo, Cash, Equity</label>
-<textarea class="code" name="funding_stack_json" rows="1">[{"type":"DSCR","amount":250000,"rate":7.5},{"type":"Cash","amount":50000,"rate":0}]</textarea>
-<div class="rowflex"><div><label>Scenario name</label><input name="save_name" placeholder="{{ strat }} — base case"></div>
-<div style="flex:0"><button class="btn big">▶ Run + save {{ strat }} scenario</button></div></div></form></details>
-{% endfor %}
-</div>
-
-<div class="card"><h2>Saved scenarios + cross-strategy best exit</h2>
-<table><tr><th>Strategy</th><th>Name</th><th>Score</th><th>Key result</th><th>Cash in</th><th></th></tr>
-{% set best = namespace(sid=None, score=-1) %}
-{% for s in scenarios %}{% set r = s.results|jload %}{% if r.score and r.score > best.score %}{% set best.sid = s.id %}{% set best.score = r.score %}{% endif %}{% endfor %}
-{% for s in scenarios %}{% set r = s.results|jload %}
-<tr {% if s.id==best.sid %}style="background:#ecfdf5"{% endif %}><td>{{ s.strategy }}{% if s.id==best.sid %} <span class="badge cash">BEST EXIT</span>{% endif %}</td><td>{{ s.name }}</td>
-<td>{% if r.score %}<b>{{ r.score }}</b> ({{ r.label }}){% else %}—{% endif %}</td>
-<td class="small">{% if s.strategy=='Fix & Flip' %}Profit {{ r.profit|money }} · ROI {{ r.roi }}% · margin {{ r.margin_pct }}%{% else %}CF {{ r.cashflow_mo|money }}/mo · CoC {{ r.coc_pct }}% · cap {{ r.cap_rate_pct }}% · DSCR {{ r.dscr }}{% endif %}</td>
-<td>{{ r.cash_in|money }}</td>
-<td><form method="post" action="{{ url_for('del_scenario', sid=s.id) }}"><button class="btn sm danger">✕</button></form></td></tr>
-<tr><td colspan="6" class="small muted">{% if r.score_parts %}Score parts: {% for k,val in r.score_parts.items() %}{{ k }}: {{ val }} · {% endfor %}{% endif %}
-{% if r.penalties %}Penalties: {% for pen in r.penalties %}−{{ pen.points }} ({{ pen.reason }}) · {% endfor %}{% endif %}
-{% if r.scenarios %}Scenarios: {% for k,val in r.scenarios.items() %}{{ k }}: {{ val|money }}/mo · {% endfor %}{% endif %}
-{% if r.flags %}Flags: {{ r.flags|join('; ') }}{% endif %}</td></tr>
-{% else %}<tr><td colspan="6" class="muted">No scenarios yet — run one above.</td></tr>{% endfor %}</table></div>
-
-<div class="card"><h2>Amortization calculator</h2>
-<form method="post" action="{{ url_for('amortize', pid=p.id) }}"><div class="rowflex">
-<div><label>Loan amount $</label><input name="loan_amount" value="{{ p.loan_balance or 300000 }}"></div>
-<div><label>Rate %</label><input name="rate" value="{{ p.loan_rate or 6.5 }}"></div>
-<div><label>Amortization (yrs)</label><input name="amort_years" value="30"></div>
-<div><label>Loan term (yrs, balloon)</label><input name="loan_years" value="30"></div>
-<div><label>Add to funding stack</label><input type="checkbox" name="add_to_stack"></div>
-<div style="flex:0"><button class="btn sec">Calculate</button></div></div></form>
-<p class="small muted">Produces the annual interest/principal/balance table on the next screen; the loan can then be used as a funding-stack line in any strategy run.</p></div>
-{% endif %}
+{% if tab=='underwriting' %}{% include "underwriting.html" %}{% endif %}
 
 {% if tab=='floorplans' %}
 <div class="card"><h2>Floor Plans <span class="small muted">(saved in the app — not "on this device only")</span></h2>
@@ -489,19 +510,6 @@ function showOnMap(id){var m=_markers[id];if(m){m.openPopup();window.scrollTo({t
 <textarea name="sales_history" rows="4" placeholder="Not found">{{ p.sales_history or '' }}</textarea>
 <p><button class="btn">Save tax data</button></p></form>
 <p class="small muted">Source for Hillsborough County: Hillsborough County Property Appraiser (gis.hcpafl.org) + Tax Collector — free public records. Blank = Not found, never invented.</p></div>
-{% endif %}
-
-{% if tab=='skiptrace' %}
-<div class="card"><h2>Skiptrace — identifier-first method</h2>
-<p class="small muted">HouseAble SOP: search by direct identifier first — phone or email before name. Multiple plausible matches = ambiguous, never presented as fact. A traced contact never overwrites a publicly-posted one.</p>
-<form method="post"><label>Status</label>
-<select name="skiptrace_status"><option value="">Not traced</option>
-<option {% if p.skiptrace_status=='Verified' %}selected{% endif %}>Verified</option>
-<option {% if p.skiptrace_status=='Unverified' %}selected{% endif %}>Unverified</option>
-<option {% if p.skiptrace_status=='Ambiguous' %}selected{% endif %}>Ambiguous</option></select>
-<label>Trace notes (owner name, phones, emails, source of each)</label>
-<textarea name="skiptrace_notes" rows="5" placeholder="Not found">{{ p.skiptrace_notes or '' }}</textarea>
-<p><button class="btn">Save skiptrace</button></p></form></div>
 {% endif %}
 
 {% if tab=='documents' %}

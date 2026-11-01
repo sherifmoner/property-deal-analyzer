@@ -25,27 +25,53 @@ python3 -m venv .venv            # first time only (a venv already exists here)
   nothing for some real streets, e.g. Garland Ct) → **FEMA NFHL flood zone** (layer 28,
   hazards.fema.gov/arcgis) → property page with a 42-slot Documents checklist auto-seeded.
 - **Property page** mirrors ReiSearch's layout/order: left nav (Dashboard, Properties,
-  Lead Monitoring, Documents, Contractors, Settings) → photo/price header + deal-method
-  badge → sticky **verdict bar** (deal score + confidence, ONE reconciled ARV with the math
-  shown, MAO, buy-box PASS/FAIL) → Property Details + Market Value estimates → Deal Structure
-  (SubTo Bank Loan block, liens, wholesale, closing) → Disposition → tabs in ReiSearch order:
+  Documents, Contractors, Settings) → photo/price header + deal-method badge → Property
+  Details + Market Value estimates → Deal Structure (SubTo Bank Loan block, liens,
+  wholesale, closing) → Disposition → tabs in ReiSearch order:
   Comparables | Demographics | Underwriting | Floor Plans | Contractors | Market Data |
-  Taxes | Skiptrace (+ Documents).
+  Taxes (+ Documents). (v1.3: the sticky verdict bar, Lead Monitoring, and Skiptrace were
+  removed at Sherif's direction — see the v1.3 section.)
 - **Comps**: HomeHarvest queried **by ZIP + radius with ZIP/coordinate post-filtering**
-  (never raw full-address mode — it mis-resolves). Sold 365d + rentals. Leaflet map pins +
-  sortable table with $/sqft, per-comp $ adjustments, pin/exclude. Match score uses
-  ReiSearch's exact weights — distance 40 / sqft 20 / beds 13 / baths 13 / year 13 — one
-  score used everywhere. ARV = average of adjusted-comp average and $/sqft method, shown.
-- **Underwriting**: 5 strategies (Fix & Flip, Co-Living, Short Term, Mid Term, Long Term)
-  sharing one shell (rehab/appliance/furnishing/conversion line items as JSON, funding-stack
-  builder, holding costs). Co-Living scoring uses the exact weights (CF/room 25, DSCR 20,
-  CoC 20, cap 15, break-even 12, downside CF 8) and every strategy is scored (an improvement
-  over ReiSearch). **Realism penalties**: $0 taxes/insurance get sanity defaults and point
-  deductions — a $0-expense deal cannot score "Strong". Fix & Flip exit: ARV −6% commission
-  −2% closing, profit/ROI/annualized/margin/70% rule. Scenarios (downside/base/upside/fully
-  booked) save server-side per property; the saved-scenarios table flags the **best exit**
-  across strategies. Amortization calculator renders the annual interest/principal/balance
-  table and can feed the funding stack.
+  (never raw full-address mode — it mis-resolves). Sold 365d + rentals. Views switch
+  **in place** (no page reload): pill bar Maps | Sold Comps | Co-Living | Short Term
+  Rental | Mid Term Rental | Long Term Rental | Affordable Housing, every view rendered
+  server-side into the page. Each comp card keeps its photo, price, badges, specs, diffs
+  and pin button, and gains a **mini-map strip** (~130px, subject + that comp) with a
+  Fullscreen button opening a full-viewport overlay map with all pins; the one large
+  map lives in the Maps view. Pin/unpin recomputes the pinned averages + ARV live via
+  fetch and persists. Match score uses ReiSearch's exact weights — distance 40 / sqft 20 /
+  beds 13 / baths 13 / year 13 — one score used everywhere. ARV = average of
+  adjusted-comp average and $/sqft method, shown.
+- **Underwriting (v1.3 rebuild to the live-inspected ReiSearch spec)**: strategy
+  **segmented button bar** (Fix & Flip | Co-Living | Short Term | Mid Term | Long Term)
+  swapping panels in place, left accordion column (~73%) + right sidebar (~25%).
+  Sections in ReiSearch order per strategy: Post Renovation Property Details; Repair &
+  Renovation Costs (room-by-room Material/Labor rows **or** the estimator — Average /
+  Cosmetic $25–$35/sqft, Heavy / Full Gut $40–$50+/sqft × living sqft, "Use midpoint"
+  applies $30/$45 per sqft; header shows CALCULATED TOTAL vs ESTIMATED TOTAL);
+  Appliance Costs; Co-Living Conversion Costs (Co-Living only); Furnishing Costs;
+  Operating Revenue (Co-Living per-room table, rent $/wk, vacancy default 15%, prefilled
+  from the pulled ZIP benchmark; STR nightly model; MTR/LTR monthly, prefilled from the
+  pinned/top-3 rental average); Operating Expenses (incl. PadSplit booking fee —
+  first-days fee once per booking amortized monthly — service fee % of EGI, management
+  fee % gross/net); Funding Structure with preset buttons (Cash, Conventional, DSCR,
+  Hard Money, Private Money, Seller Financing, Subject-To, Custom Stack), a Funding
+  Snapshot card, and **Existing Mortgage Data** nested inside Funding for every strategy
+  except Fix & Flip (Price Details incl. Total Entry Fee + PITI fields, all feeding the
+  math: entry fee → cash needed, PITI payment → debt service); Holding Costs; Sale &
+  Exit (Flip only, ARV from pinned comps with the pinned-comp table). **All math is
+  reactive in the browser** (a JS mirror of the server formulas — no Calculate button);
+  saving a scenario posts the form and the server recomputes authoritatively. Right
+  sidebar: tabbed **Underwriting Summary** (Overview | Visual | Scenarios | Details |
+  Capital) for Co-Living and Fix & Flip; sparse **Deal Analysis Summary** (Cash Outlay,
+  Income, Expenses) for Short/Mid/Long Term. Co-Living also gets the main-column bottom
+  summary (Cash Needed / Net CF / CoC / DSCR cards, MONEY IN / MONEY OUT block, Year 1
+  Returns, Per-Room Economics). Scoring keeps ReiSearch's exact weights (CF/room 25,
+  DSCR 20, CoC 20, cap 15, break-even 12, downside CF 8) and the v1.2 realism behavior
+  only as default values (taxes/insurance prefilled when $0, with the same v1.2 score
+  penalties — nothing new invented). Scenarios save server-side per property; the
+  saved-scenarios table flags the **best exit** across strategies. Amortization
+  calculator renders the annual interest/principal/balance table.
 - **Demographics**: US Census ACS 5-year, keyless, ZIP vs city toggle, source+date stamped.
 - **Nearby amenities (v1.1)**: on the Demographics (Area) tab, a **Nearby** section pulled live
   from **OpenStreetMap Overpass** (free, no key) around the property's stored ArcGIS
@@ -71,14 +97,56 @@ python3 -m venv .venv            # first time only (a venv already exists here)
   ("Import / refresh from prospect database") — it is **idempotent** (dedupes by
   name + phone), so re-running adds nothing twice.
 - **Floor Plans**: upload + notes, saved in the app (not device-only).
-- **Skiptrace**: identifier-first SOP notes with Verified / Unverified / Ambiguous labels.
-- **Lead Monitoring**: per-property monitors (frequency, price/DOM thresholds, stop on
-  Sold/Off Market/Rented) with a manual **Check now** that re-pulls live listings.
-- **Settings**: buy boxes (drive the verdict PASS/FAIL), optional free API keys
+- **Settings**: buy boxes, optional free API keys
   (Census/RentCast/apillow, stored server-side only), and **Export/Import JSON + CSV**
   covering every table — the migration path to the hosted version later.
 
 Every number carries a source + date. Missing data shows "Not found" — nothing is invented.
+
+## v1.3 — Sherif's parity corrections (2026-11-01)
+
+Built from a live, logged-in inspection of ReiSearch's property page (spec:
+`~/workspace/reisearch-clone/research/reisearch-uw-spec.md`), applying Sherif's fix
+list from testing v1.2 live:
+
+**Removed entirely (Sherif: "does not serve me"):** Lead Monitoring (feature, nav,
+dashboard alerts), Skiptrace (tab), the sticky/floating red deal-score panel, and the
+Adjustment Worksheet under the comp cards. Comp cards themselves are unchanged.
+Deal Tracker / presentations / dispo boards are **not wanted** — they are out of
+scope, not gaps.
+
+**Comparables:** views switch in place with JavaScript (no reload, URL and scroll
+kept); the big map moved out of the card views into its own first pill (Maps); every
+comp card gained ReiSearch's mini-map strip with a Fullscreen overlay map; pin/unpin
+still drives averages + ARV live and persists.
+
+**Underwriting:** full rebuild to the spec — see the Underwriting bullet above.
+Rehab estimator uses Sherif's numbers (Cosmetic $25–$35/sqft, Heavy $40–$50+/sqft;
+Garland 1,758 sqft → $43,950–$61,530 / $70,320–$87,900; midpoint apply $52,740 /
+$79,110). Subject-To deals now read clearly: $20K entry fee + $1,700 PITI in Existing
+Mortgage Data flow straight into Cash Needed and monthly debt service. v1.2 saved
+scenarios (incl. Garland's Co-Living base, Co-Living base v2, Flip base) load
+unchanged through a canonical-input compatibility layer.
+
+**Verified by a browser click-through of the shipped zip (2026-11-01, Playwright/Chromium,
+fresh install on port 5053 — 33/33 checks passed, zero uncaught JS errors; screenshots in
+`~/workspace/reisearch-clone/research/v13-shots/`, script `research/gate_v13.py`):**
+Garland comps — Sold → Co-Living → Long Term → back with **no page reload** (URL + JS
+marker survived), 80 mini-map strips on the sold cards, fullscreen overlay opened/closed;
+unpinning a pinned comp moved the average **$378,300 → $369,950** and ARV **$401,109 →
+$381,173**, persisted after reload, and re-pinning restored both exactly. Underwriting —
+all 5 strategies render their sections in spec order; Co-Living revenue prefilled
+(4 rooms × $189/wk from the saved scenario; fresh panels prefill $154/wk from the pulled
+ZIP benchmark), raising utilities by $300/mo dropped Net Cash Flow **$1,510 → $1,210**
+(exactly $300, no button click); Long Term + Subject-To preset + entry fee $20,000 +
+PITI $1,700 moved Cash Needed **$379,300 → $399,300** and debt service **$0 → $1,700/mo**
+exactly; Fix & Flip estimator showed Cosmetic **$43,950 – $61,530** and midpoint apply
+set **$52,740** (Net Profit −$11,891, All-in $385,440, 70%-rule MAO $231,482 with those
+inputs). Monitoring 404s and is absent from nav; no Skiptrace, no sticky verdict panel,
+no Adjustment Worksheet, no JSON textareas anywhere in Underwriting; Garland's three
+v1.2 scenarios still listed and loading. The shipped `analyzer.db` is byte-identical to
+its pre-build backup (md5-verified) — all gate interactions ran against the fresh
+install's own copy.
 
 ## v1.2 — ReiSearch parity pass + reliability (2026-10-31)
 
@@ -120,11 +188,14 @@ rendered. v1.2 fixes all of it:
 | Documents checklist (42 slots) | ✅ Yes |
 | Contractors | ✅ Yes — incl. HouseAble prospect preload |
 | Floor plans (BluPad) | ⚠️ Partial — upload + notes saved in-app; no drawing tool |
-| Lead Monitoring | ✅ Yes — manual "Check now" runs async; no background scheduler yet |
-| Skiptrace | ⚠️ Partial — identifier-first notes + verified labels; no paid trace data |
+| Comp views switch in place (no reload) | ✅ Yes (v1.3) — all views rendered server-side, pills swap visibility |
+| Mini-map strip on every comp card + fullscreen overlay map | ✅ Yes (v1.3), mirroring ReiSearch |
+| Reactive underwriting (no Calculate button) + segmented strategy bar | ✅ Yes (v1.3) — JS mirror of the server formulas, live totals everywhere |
+| Rehab estimator ($/sqft levels with midpoint apply) | ✅ Yes (v1.3) — Cosmetic $25–$35, Heavy $40–$50+ per sqft |
+| Existing Mortgage Data / Subject-To entry fee + PITI in the math | ✅ Yes (v1.3) — nested in Funding Structure, all strategies except Flip |
 | Short Term Rental comps | ❌ No free nationwide STR comp feed exists (ReiSearch showed 0 for Garland too) — nightly rate is manual in Underwriting |
-| Presentations generator / Dispo marketplace board / team logins | ❌ Not yet — hosted-version work |
-| Deal Tracker pipeline board | ❌ Not yet — deal stage is tracked per property only |
+| Lead Monitoring / Skiptrace | 🚫 Removed in v1.3 at Sherif's direction — not wanted |
+| Presentations generator / Dispo board / Deal Tracker / team logins | 🚫 Not wanted (Sherif, 2026-11-01) — out of scope, not gaps |
 
 **Getting started strip:** a property that still needs work shows three big steps —
 1 Pull comps → 2 Review the ARV → 3 Run underwriting — so the next action is always obvious.
@@ -188,7 +259,7 @@ export JSON/CSV intact (1 property, 88 comps, 42 docs, 26 contractors, 3 scenari
   ZIP-mode HomeHarvest pull (never raw full-address mode — it mis-resolves). A property
   with no current/recent listing in that data honestly shows "No photos found"
   (Garland is such a case: it is not in the for-sale or sold feeds).
-- **Monitoring** is manual "Check now" in v1 (no background scheduler yet).
-- Presentations generator, dispo marketplace board, and team logins/multi-user auth are
-  hosted-version work (Supabase migration) — the data model and export/import are already
-  shaped for it: one codebase, clean data layer in `app.py`.
+- Presentations generator, dispo marketplace board, Deal Tracker, and team
+  logins/multi-user auth are **out of scope** — Sherif confirmed 2026-11-01 he does not
+  want them. The data model and export/import remain the migration path to the hosted
+  version: one codebase, clean data layer in `app.py`.

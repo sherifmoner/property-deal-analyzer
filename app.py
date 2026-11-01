@@ -365,9 +365,65 @@ def amortization(principal, annual_rate_pct, amort_years, loan_years=None):
         if bal <= 0: break
     return {"payment": round(pmt, 2), "rows": rows, "balloon": round(max(bal, 0), 2)}
 
-# ---------------------------------------------------------------- underwriting
+# ---------------------------------------------------------------- underwriting (v1.3)
+REHAB_ROOMS = ["Bedrooms", "Bathrooms", "Kitchen", "Living Room", "Dining Room", "Laundry Room",
+               "Fireplace", "Basement", "Attic", "General Updates/Repairs", "Misc"]
+REHAB_FLATS = [("adu", "ADU & Additions"), ("hvac", "HVAC"), ("electrical", "Electrical"),
+               ("plumbing", "Plumbing"), ("exterior", "Exterior & Structural"),
+               ("contingency", "Repairs Contingency"), ("other", "Other (flat)")]
+APPLIANCE_ROWS = ["Refrigerator", "Mini Fridge", "Washer and Dryer", "Water Heater", "Stove",
+                  "Microwave", "Air Fryer", "Toaster"]
+CONVERSION_ROWS = ["Security Cameras", "Smart Locks", "Smart Thermostat", "Door Sensors",
+                   "IT Closet", "Property Pictures", "Compliance Items"]
+FURNISH_GROUPS = [
+    ("Bedrooms", ["Bed frame", "Mattress", "Bedding", "Nightstand", "Lamp", "Desk & Chair",
+                  "Closet/Dresser", "Bedroom Décor"]),
+    ("Bathrooms", ["Towel sets", "Shower curtain", "Bath mat", "Trash can"]),
+    ("Kitchen Furnishing", ["Cookware set", "Dishes & cutlery", "Small appliances", "Utensils & knives"]),
+    ("Common Area Furnishing", ["Sofa", "Coffee table", "TV", "Dining set", "Lamps"]),
+    ("Cleaning Supplies", ["Vacuum", "Mop & broom set", "Cleaning starter kit"]),
+]
+REHAB_LEVELS = {"cosmetic": {"label": "Average / Cosmetic Rehab", "low": 25, "high": 35, "mid": 30},
+                "heavy": {"label": "Heavy / Full Gut Rehab", "low": 40, "high": 50, "mid": 45}}
+FUNDING_TYPES = ["Conventional", "DSCR", "Hard Money", "Private Money", "Bridge", "HELOC",
+                 "Seller Financing", "Subject-To", "Cash", "Equity", "Loan", "Private", "SubTo", "Seller Finance"]
+
 def _lines_total(lines):
     return sum((l.get("qty", 1) or 1) * ((l.get("material", 0) or 0) + (l.get("labor", 0) or 0)) for l in lines or [])
+
+def _loan_payment(amount, rate_pct, term_years):
+    """Monthly payment: amortized when a term is given, interest-only otherwise (v1.2 behavior)."""
+    amt = fnum(amount, 0) or 0
+    if amt <= 0: return 0.0
+    rate = fnum(rate_pct, 0) or 0
+    yrs = fnum(term_years, 0) or 0
+    if yrs > 0:
+        r = rate / 100 / 12; n = int(yrs * 12)
+        if r > 0: return amt * r / (1 - (1 + r) ** -n)
+        return amt / n
+    return amt * rate / 100 / 12
+
+def canon_inputs(strategy, inp, prop):
+    """Translate stored/legacy (v1.2) scenario inputs into the v1.3 canonical field set.
+    The underwrite route stores parsed JSON groups AND the raw *_json strings; drop the strings.
+    Legacy aggregates (rooms + rent_per_room, utilities_mo, ...) are mapped by compute fallbacks;
+    the Co-Living per-room table is materialized here from the legacy rooms/rent fields."""
+    c = {}
+    for k, v in (inp or {}).items():
+        if k.endswith("_json"): continue
+        c[k] = v
+    if c.get("booking_days") in (None, "") and c.get("booking_fee_days") not in (None, ""):
+        c["booking_days"] = c.get("booking_fee_days")
+    if strategy == "Co-Living":
+        rows = c.get("rooms_rows")
+        if not rows:
+            n = int(fnum(c.get("rooms"), (prop["beds"] if prop else None) or 4) or 4)
+            rpm = fnum(c.get("rent_per_room"), 0) or 0
+            wk = round(rpm * 12 / 52, 2) if rpm else 0
+            vac = fnum(c.get("vacancy_pct"), 15)
+            c["rooms_rows"] = [{"bath": "Shared", "rent_wk": wk, "vacancy": 15 if vac is None else vac}
+                               for _ in range(max(n, 0))]
+    return c
 
 def score_rental(m, penalties):
     """Co-Living weights: CF/room 25, DSCR 20, CoC 20, cap 15, break-even 12, downside CF 8."""
@@ -386,24 +442,104 @@ def score_rental(m, penalties):
     label = "Strong" if total >= 75 else ("Workable" if total >= 55 else ("Thin" if total >= 40 else "Weak"))
     return {"score": total, "label": label, "parts": parts, "penalties": penalties}
 
-def compute_underwriting(strategy, inp, prop):
-    """Shared shell: post-reno details, rehab lines, appliances, furnishing, funding stack, mortgage, holding."""
+def _score_label(total):
+    return "Strong" if total >= 75 else ("Workable" if total >= 55 else ("Thin" if total >= 40 else "Weak"))
+
+def compute_underwriting(strategy, raw_inp, prop):
+    """v1.3 ReiSearch-mirrored shell: post-reno details, rehab (calculated rows or sqft estimate),
+    appliances, conversion, furnishing, revenue per strategy, detailed operating expenses,
+    funding stack + existing mortgage, holding. Math mirrors static/uw.js exactly."""
+    inp = canon_inputs(strategy, raw_inp, prop)
     arv = fnum(inp.get("arv"), prop["arv"] if prop else None) or 0
-    price = fnum(inp.get("purchase_price"), prop["purchase_price"] or prop["list_price"] if prop else None) or 0
-    rehab = _lines_total(inp.get("rehab_lines")) + fnum(inp.get("rehab_flat"), 0) or 0
+    price = fnum(inp.get("purchase_price"), (prop["purchase_price"] or prop["list_price"]) if prop else None) or 0
+    rehab_calc = _lines_total(inp.get("rehab_lines")) + (fnum(inp.get("rehab_flat"), 0) or 0)
+    rehab_mode = inp.get("rehab_mode") or "calc"
+    rehab_est = fnum(inp.get("rehab_est_total"), 0) or 0
+    rehab = rehab_est if (rehab_mode == "est" and rehab_est) else rehab_calc
     appliances = _lines_total(inp.get("appliance_lines"))
     furnishing = 0 if strategy == "Long Term" else _lines_total(inp.get("furnishing_lines"))
     conversion = _lines_total(inp.get("conversion_lines")) if strategy == "Co-Living" else 0
-    stack = inp.get("funding_stack") or []
-    funded = sum(fnum(s.get("amount"), 0) or 0 for s in stack)
     total_project = price + rehab + appliances + furnishing + conversion
-    gap = total_project - funded
-    cash_equity = sum(fnum(s.get("amount"), 0) or 0 for s in stack if s.get("type") in ("Cash", "Equity"))
-    # Cash/equity stack lines ARE cash invested; any unfunded gap is also cash. (Counting only the
-    # gap made an all-cash deal show a near-zero denominator and a fantasy cash-on-cash return.)
-    cash_in = cash_equity + max(gap, 0) + (fnum(inp.get("closing_costs"), 0) or 0)
-    debt_service_mo = sum((fnum(s.get("amount"), 0) or 0) * ((fnum(s.get("rate"), 0) or 0) / 100) / 12 for s in stack if s.get("type") not in ("Cash", "Equity"))
-    # sanity defaults + realism penalties (a $0-expense deal must NOT score Strong)
+    # holding
+    h_period = fnum(inp.get("holding_period"), None)
+    if h_period is None:
+        h_period = fnum(inp.get("holding_months"), 6 if strategy == "Fix & Flip" else 0) or 0
+        h_unit = "Months"
+    else:
+        h_unit = inp.get("holding_unit") or "Months"
+    h_months = h_period if h_unit == "Months" else h_period / 30.0
+    holding_mo = fnum(inp.get("holding_mo"), 0) or 0
+    holding_total = holding_mo * h_months
+    # funding stack
+    stack = inp.get("funding_stack") or []
+    funded = cash_equity = debt_amt = debt_rows_service = 0.0
+    paydown_y1 = 0.0
+    for s in stack:
+        amt = fnum(s.get("amount"), 0) or 0
+        funded += amt
+        if s.get("type") in ("Cash", "Equity"):
+            cash_equity += amt
+        else:
+            debt_amt += amt
+            debt_rows_service += _loan_payment(amt, s.get("rate"), s.get("term_years"))
+            yrs = fnum(s.get("term_years"), 0) or 0
+            if yrs > 0 and amt > 0:
+                am = amortization(amt, fnum(s.get("rate"), 0) or 0, yrs, 1)
+                if am["rows"]: paydown_y1 += am["rows"][0]["principal"]
+    # existing mortgage data (all strategies except Fix & Flip)
+    entry_fee = md_payment = 0.0
+    if strategy != "Fix & Flip":
+        entry_fee = fnum(inp.get("md_entry_fee"), 0) or 0
+        md_payment = fnum(inp.get("md_monthly_payment"), 0) or 0
+        paydown_y1 += (fnum(inp.get("md_piti_principal"), 0) or 0) * 12
+    debt_service = debt_rows_service + md_payment
+    closing = fnum(inp.get("closing_costs"), 0) or 0
+    uses = total_project + holding_total
+    gap = uses - funded
+    # Cash/equity stack lines ARE cash invested; any unfunded gap is also cash (v1.2 fix).
+    cash_in = cash_equity + max(gap, 0) + closing + entry_fee
+    out = {"strategy": strategy, "arv": arv, "purchase_price": price, "rehab": round(rehab),
+           "rehab_calc": round(rehab_calc), "rehab_mode": rehab_mode, "appliances": round(appliances),
+           "furnishing": round(furnishing), "conversion": round(conversion),
+           "total_project": round(total_project), "holding_cost": round(holding_total),
+           "holding_months": round(h_months, 2), "uses": round(uses), "funded": round(funded),
+           "gap": round(gap), "cash_in": round(cash_in), "financing_costs": round(closing),
+           "debt_service_mo": round(debt_service), "entry_fee": round(entry_fee)}
+
+    if strategy == "Fix & Flip":
+        sale = fnum(inp.get("sale_price"), 0) or arv
+        comm_pct = fnum(inp.get("commission_pct"), 6) or 0
+        close_pct = fnum(inp.get("closing_pct"), 2) or 0
+        comm_amt = sale * comm_pct / 100; close_amt = sale * close_pct / 100
+        net = sale - comm_amt - close_amt
+        profit = net - total_project - holding_total
+        all_in = total_project + holding_total
+        roi = round(profit / cash_in * 100, 1) if cash_in else None
+        margin = round(profit / sale * 100, 1) if sale else None
+        ann = round(profit / cash_in * 100 * 12 / h_months, 1) if cash_in and h_months else None
+        def _flip(sale2, rehab2, hold2):
+            n2 = sale2 * (1 - comm_pct / 100 - close_pct / 100)
+            return {"sale": round(sale2), "all_in": round(price + rehab2 + appliances + furnishing + hold2),
+                    "net": round(n2 - (price + rehab2 + appliances + furnishing) - hold2)}
+        scen = {"Downside (-10% sale price)": _flip(sale * 0.9, rehab, holding_total),
+                "Base": _flip(sale, rehab, holding_total),
+                "Upside (+10% sale price)": _flip(sale * 1.1, rehab, holding_total),
+                "Overrun (rehab +20%, +3 mo hold)": _flip(sale, rehab * 1.2, holding_mo * (h_months + 3))}
+        # Flip Deal Score: ReiSearch shows one for flips; scale = profit margin (50%, target 30%)
+        # + ROI (50%, target 50%), labeled as our scale in Details.
+        def cs(x, t): return max(0.0, min(100.0, (x / t) * 100)) if t else 0.0
+        parts = {"Profit margin (50%)": round(0.5 * cs((margin or 0) / 100, 0.30), 1),
+                 "ROI on cash (50%)": round(0.5 * cs((roi or 0) / 100, 0.50), 1)}
+        fscore = max(1, min(99, round(sum(parts.values()))))
+        out.update({"sale_price": round(sale), "commission_pct": comm_pct, "closing_pct": close_pct,
+                    "commission_amt": round(comm_amt), "closing_amt": round(close_amt),
+                    "net_proceeds": round(net), "all_in": round(all_in), "profit": round(profit),
+                    "roi": roi, "annualized_roi": ann, "margin_pct": margin,
+                    "rule70_mao": round(arv * 0.70 - rehab), "scenarios": scen,
+                    "score": fscore, "label": _score_label(fscore), "score_parts": parts, "penalties": []})
+        return out
+
+    # ---------------- rental strategies ----------------
     penalties, flags = [], []
     taxes_mo = fnum(inp.get("taxes_mo"), 0) or 0
     ins_mo = fnum(inp.get("insurance_mo"), 0) or 0
@@ -415,73 +551,249 @@ def compute_underwriting(strategy, inp, prop):
         ins_mo = 180
         penalties.append({"points": 6, "reason": "Insurance was $0 — sanity default applied ($180/mo estimate)"})
         flags.append("Insurance estimated")
-    out = {"strategy": strategy, "arv": arv, "purchase_price": price, "rehab": rehab, "appliances": appliances,
-           "furnishing": furnishing, "conversion": conversion, "total_project": round(total_project),
-           "funded": round(funded), "gap": round(gap), "cash_in": round(cash_in), "flags": flags}
-
-    if strategy == "Fix & Flip":
-        net = arv * (1 - 0.06 - 0.02)
-        holding = fnum(inp.get("holding_months"), 6) or 6
-        hold_cost = (fnum(inp.get("holding_mo"), 0) or 0) * holding
-        profit = net - total_project - hold_cost
-        out.update({"net_proceeds": round(net), "holding_cost": round(hold_cost), "profit": round(profit),
-                    "roi": round(profit / cash_in * 100, 1) if cash_in else None,
-                    "annualized_roi": round(profit / cash_in * 100 * 12 / holding, 1) if cash_in and holding else None,
-                    "margin_pct": round(profit / arv * 100, 1) if arv else None,
-                    "rule70_mao": round(arv * 0.70 - rehab),
-                    "score": None, "label": "Exit math only (no deal score — same as ReiSearch Fix & Flip)"})
-        return out
-
-    # rental strategies
-    vacancy = (fnum(inp.get("vacancy_pct"), 5) or 0) / 100
-    other_income = sum(fnum(inp.get(k), 0) or 0 for k in ("pet_mo", "parking_mo", "storage_mo", "laundry_mo", "misc_mo"))
+    # revenue
+    cleaning_income = 0.0
     if strategy == "Co-Living":
-        rooms = fnum(inp.get("rooms"), prop["beds"] if prop else 4) or 4
-        rent_room = fnum(inp.get("rent_per_room"), 0) or 0
-        gross = rooms * rent_room
-        booking = gross * 0.0  # booking fee modeled in days below
-        booking_fee = (rent_room * rooms) * ((fnum(inp.get("booking_fee_days"), 0) or 0) / 30) / 12
-        service = gross * ((fnum(inp.get("service_fee_pct"), 0) or 0) / 100)
-        fees = booking_fee + service
+        rows = inp.get("rooms_rows") or []
+        gross = sum((fnum(r.get("rent_wk"), 0) or 0) * 52 / 12 for r in rows)
+        vac_loss = sum((fnum(r.get("rent_wk"), 0) or 0) * 52 / 12 * ((fnum(r.get("vacancy"), 15) or 0) / 100) for r in rows)
+        rooms_n = len(rows) or int(fnum(inp.get("rooms"), (prop["beds"] if prop else None) or 4) or 4)
+        laundry_amt = fnum(inp.get("laundry_amt"), 0) or 0
+        laundry_mo = laundry_amt * 52 / 12 if (inp.get("laundry_period") or "wk") == "wk" else laundry_amt
+        other = (fnum(inp.get("amenities_mo"), 0) or 0) + (fnum(inp.get("late_fees_mo"), 0) or 0) \
+            + laundry_mo + (fnum(inp.get("misc_income_mo"), 0) or 0)
     elif strategy == "Short Term":
         units = fnum(inp.get("units"), 1) or 1
+        rooms_n = units
         gross = (fnum(inp.get("nightly_rate"), 0) or 0) * 30 * ((fnum(inp.get("occupancy_pct"), 0) or 0) / 100) * units
-        stays = max(1.0, 30 / (fnum(inp.get("avg_stay_nights"), 3) or 3)) * units
-        other_income += stays * (fnum(inp.get("cleaning_fee"), 0) or 0)
-        fees = gross * ((fnum(inp.get("platform_pct"), 0) or 0) / 100)
-        rooms = units
+        stays = (30 / (fnum(inp.get("avg_stay_nights"), 3) or 3)) * units
+        cleaning_income = stays * (fnum(inp.get("cleaning_fee"), 0) or 0)
+        vac_loss = 0.0
+        other = (fnum(inp.get("pet_fees_mo"), 0) or 0) + (fnum(inp.get("parking_mo"), 0) or 0) \
+            + (fnum(inp.get("misc_mo"), 0) or 0) + cleaning_income
     else:  # Mid Term / Long Term
         units = fnum(inp.get("units"), 1) or 1
+        rooms_n = units
         gross = (fnum(inp.get("rent_per_unit"), 0) or 0) * units
-        fees = 0; rooms = units
-    egi = gross * (1 - vacancy) + other_income - fees
-    opex = taxes_mo + ins_mo + (fnum(inp.get("utilities_mo"), 0) or 0) + (fnum(inp.get("maintenance_mo"), 0) or 0) \
-        + (fnum(inp.get("management_mo"), 0) or 0) + (fnum(inp.get("hoa_mo"), (prop["hoa_dues"] if prop and prop["hoa_freq"] == "Monthly" else 0) or 0))
-    noi = egi - opex
-    cf = noi - debt_service_mo
-    value = arv or price
-    metrics = {"cf_per_room": (cf / rooms) if rooms else 0, "dscr": (noi / debt_service_mo) if debt_service_mo else (1.5 if noi > 0 else 0),
-               "coc": (cf * 12 / cash_in) if cash_in else 0, "cap_rate": (noi * 12 / value) if value else 0,
-               "breakeven": ((opex + debt_service_mo) / (gross + other_income)) if (gross + other_income) else 1.3,
-               "downside_cf": (egi * 0.9 - opex - debt_service_mo)}
-    if opex <= taxes_mo + ins_mo and (fnum(inp.get("utilities_mo"), 0) or 0) == 0 and (fnum(inp.get("maintenance_mo"), 0) or 0) == 0:
+        vac_loss = gross * ((fnum(inp.get("vacancy_pct"), 5) or 0) / 100)
+        other = sum(fnum(inp.get(k), 0) or 0 for k in ("pet_mo", "parking_mo", "storage_mo", "laundry_mo", "misc_mo"))
+    egi = gross - vac_loss + other
+    # booking & service fees (PadSplit logic, mirrored for all rental strategies per ReiSearch)
+    days_default = 10 if strategy == "Co-Living" else 0
+    booking_days = fnum(inp.get("booking_days"), days_default) or 0
+    booking_fee = booking_days * (gross / 30) / 12 if gross else 0.0
+    service_fee = egi * ((fnum(inp.get("service_fee_pct"), 0) or 0) / 100)
+    mgmt_basis = inp.get("mgmt_fee_basis") or "gross"
+    mgmt_fee = (gross if mgmt_basis == "gross" else egi) * ((fnum(inp.get("mgmt_fee_pct"), 0) or 0) / 100)
+    platform_fee = gross * ((fnum(inp.get("platform_pct"), 0) or 0) / 100) if strategy == "Short Term" else 0.0
+    fees_cat = booking_fee + service_fee + mgmt_fee + platform_fee
+    # expense categories with legacy fallbacks
+    util_new = sum(fnum(inp.get(k), 0) or 0 for k in ("electric_mo", "water_mo", "gas_mo", "internet_mo"))
+    util = util_new if util_new > 0 else (fnum(inp.get("utilities_mo"), 0) or 0)
+    cleaning = fnum(inp.get("cleaning_mo"), 0) or 0
+    maint_new = sum(fnum(inp.get(k), 0) or 0 for k in ("landscaping_mo", "pest_mo", "handyman_mo"))
+    maint = maint_new if maint_new > 0 else (fnum(inp.get("maintenance_mo"), 0) or 0)
+    mgmt_new = sum(fnum(inp.get(k), 0) or 0 for k in ("property_manager_mo", "turnover_reserve_mo", "additional_insurance_mo"))
+    mgmt_lines = mgmt_new if mgmt_new > 0 else (fnum(inp.get("management_mo"), 0) or 0)
+    hoa = fnum(inp.get("hoa_mo"), (prop["hoa_dues"] if prop and prop["hoa_freq"] == "Monthly" else 0) or 0) or 0
+    opex_cats = {"Booking & Service Fees": round(fees_cat), "Utilities": round(util),
+                 "Cleaning Service": round(cleaning), "Maintenance": round(maint),
+                 "Management": round(mgmt_lines), "Taxes, Insurance & HOA": round(taxes_mo + ins_mo + hoa)}
+    opex = sum(opex_cats.values())
+    if util == 0 and maint == 0:
         penalties.append({"points": 10, "reason": "No utilities/maintenance entered — expenses look unrealistically low"})
-    scen = {}
-    for name, mult in (("Downside (-10% revenue)", 0.9), ("Base", 1.0), ("Upside (+10% revenue)", 1.1), ("Fully booked (0% vacancy)", None)):
-        g2 = gross if mult is not None else gross
-        e2 = (g2 * mult * (1 - vacancy) if mult else g2) + other_income - fees
-        scen[name] = round(e2 - opex - debt_service_mo)
-    sc = score_rental(metrics, penalties) if strategy == "Co-Living" else None
-    if strategy != "Co-Living":
-        sc = score_rental(metrics, penalties)  # improvement over ReiSearch: every strategy scored
-    out.update({"gross_mo": round(gross), "fees_mo": round(fees), "other_income_mo": round(other_income),
-                "egi_mo": round(egi), "opex_mo": round(opex), "taxes_mo": taxes_mo, "insurance_mo": ins_mo,
-                "noi_mo": round(noi), "debt_service_mo": round(debt_service_mo), "cashflow_mo": round(cf),
-                "cf_per_room": round(metrics["cf_per_room"]), "dscr": round(metrics["dscr"], 2),
-                "coc_pct": round(metrics["coc"] * 100, 1), "cap_rate_pct": round(metrics["cap_rate"] * 100, 2),
-                "breakeven_pct": round(metrics["breakeven"] * 100, 1), "scenarios": scen,
-                "score": sc["score"], "label": sc["label"], "score_parts": sc["parts"], "penalties": sc["penalties"]})
+    noi = egi - opex
+    cf = noi - debt_service
+    value = arv or price
+    metrics = {"cf_per_room": (cf / rooms_n) if rooms_n else 0,
+               "dscr": (noi / debt_service) if debt_service else (1.5 if noi > 0 else 0),
+               "coc": (cf * 12 / cash_in) if cash_in else 0,
+               "cap_rate": (noi * 12 / value) if value else 0,
+               "breakeven": ((opex + debt_service) / (gross + other)) if (gross + other) else 1.3,
+               "downside_cf": (egi * 0.9 - opex - debt_service)}
+    def _scen(mult, no_vac=False):
+        e2 = gross + other if no_vac else (gross - vac_loss) * mult + other
+        return {"revenue": round(e2), "expenses": round(opex + debt_service), "net": round(e2 - opex - debt_service)}
+    scen = {"Downside (-10% revenue)": _scen(0.9), "Base": _scen(1.0), "Upside (+10% revenue)": _scen(1.1)}
+    if strategy == "Co-Living":
+        scen["Fully booked (0% vacancy)"] = _scen(1.0, no_vac=True)
+    sc = score_rental(metrics, penalties)
+    refi_gross = round(0.75 * arv) if arv else 0
+    refi_net = max(0, refi_gross - debt_amt)
+    out.update({"gross_mo": round(gross), "vacancy_loss_mo": round(vac_loss),
+                "other_income_mo": round(other), "cleaning_income_mo": round(cleaning_income),
+                "fees_mo": round(fees_cat), "booking_fee_mo": round(booking_fee),
+                "platform_fee_mo": round(platform_fee),
+                "service_fee_mo": round(service_fee), "mgmt_fee_mo": round(mgmt_fee),
+                "egi_mo": round(egi), "opex_mo": round(opex), "opex_cats": opex_cats,
+                "taxes_mo": taxes_mo, "insurance_mo": ins_mo, "noi_mo": round(noi),
+                "cashflow_mo": round(cf), "cf_per_room": round(metrics["cf_per_room"]),
+                "cash_per_room": round(cash_in / rooms_n) if rooms_n else None,
+                "dscr": round(metrics["dscr"], 2), "coc_pct": round(metrics["coc"] * 100, 1),
+                "cap_rate_pct": round(metrics["cap_rate"] * 100, 2),
+                "breakeven_pct": round(metrics["breakeven"] * 100, 1),
+                "payback_yrs": round(1 / metrics["coc"], 1) if metrics["coc"] > 0 else None,
+                "scenarios": scen, "rooms": rooms_n,
+                "refi_proceeds": refi_gross, "remaining_in_deal": round(max(0, cash_in - refi_net)),
+                "paydown_y1": round(paydown_y1), "cashflow_y1": round(cf * 12),
+                "total_return_y1": round(cf * 12 + paydown_y1),
+                "total_roi_y1": round((cf * 12 + paydown_y1) / cash_in * 100, 1) if cash_in else None,
+                "score": sc["score"], "label": sc["label"], "score_parts": sc["parts"],
+                "penalties": sc["penalties"], "flags": flags})
     return out
+
+# ------- form state for the v1.3 underwriting page (server-rendered defaults + scenario load) -------
+def _split_rehab(lines):
+    """Split stored rehab_lines into ordered room rows + flat-row dict (qty folded into $)."""
+    rooms = {name: {"label": name, "material": 0, "labor": 0} for name in REHAB_ROOMS}
+    flats = {k: {"material": 0, "labor": 0} for k, _ in REHAB_FLATS}
+    flat_by_label = {lab.lower(): k for k, lab in REHAB_FLATS}
+    extra = []
+    for l in lines or []:
+        qty = l.get("qty", 1) or 1
+        mat = (l.get("material", 0) or 0) * qty; lab = (l.get("labor", 0) or 0) * qty
+        lab_name = (l.get("label") or "").strip()
+        key = l.get("flat") or flat_by_label.get(lab_name.lower())
+        if key and key in flats:
+            flats[key]["material"] += mat; flats[key]["labor"] += lab; continue
+        hit = None
+        for name in REHAB_ROOMS:
+            nl, ll = name.lower(), lab_name.lower()
+            if ll == nl or nl.startswith(ll) or ll.startswith(nl.split()[0]):
+                hit = name; break
+        if hit:
+            rooms[hit]["material"] += mat; rooms[hit]["labor"] += lab
+        elif lab_name:
+            extra.append({"label": lab_name, "material": mat, "labor": lab})
+    room_rows = [rooms[n] for n in REHAB_ROOMS] + extra
+    return room_rows, flats
+
+def _unit_rows(lines, presets, qty_default=0):
+    """qty x unit-cost rows from stored lines (unit = material + labor per unit)."""
+    found = {}
+    extra = []
+    for l in lines or []:
+        qty = l.get("qty", 1) or 1
+        unit = ((l.get("material", 0) or 0) + (l.get("labor", 0) or 0))
+        lab = (l.get("label") or "").strip()
+        if lab in presets: found[lab] = {"label": lab, "qty": qty, "unit": unit}
+        elif lab: extra.append({"label": lab, "qty": qty, "unit": unit})
+    return [found.get(p, {"label": p, "qty": qty_default, "unit": 0}) for p in presets] + extra
+
+def uw_state(strategy, prop, saved_inp, ctx):
+    """Canonical form state (scalars + row sets) for one strategy panel.
+    saved_inp=None -> fresh defaults with comp prefills (v1.2 behavior)."""
+    inp = canon_inputs(strategy, saved_inp or {}, prop)
+    def g(k, default=""):
+        v = inp.get(k)
+        return default if v in (None, "") else v
+    beds = int(prop["beds"] or 4)
+    st = {"strategy": strategy}
+    st["purchase_price"] = g("purchase_price", prop["purchase_price"] or prop["list_price"] or "")
+    st["arv"] = g("arv", prop["arv"] or ctx.get("rec_arv") or "")
+    st["closing_costs"] = g("closing_costs", 3000)
+    # post-reno details
+    st["postreno_beds"] = g("postreno_beds", prop["beds"] or "")
+    st["postreno_baths"] = g("postreno_baths", prop["baths"] or "")
+    st["postreno_private_baths"] = g("postreno_private_baths", "")
+    st["postreno_shared_baths"] = g("postreno_shared_baths", prop["baths"] or "")
+    st["postreno_sqft"] = g("postreno_sqft", prop["sqft"] or "")
+    # rehab
+    st["rehab_mode"] = g("rehab_mode", "calc")
+    st["rehab_level"] = g("rehab_level", "cosmetic")
+    st["rehab_est_total"] = g("rehab_est_total", "")
+    room_rows, flats = _split_rehab(inp.get("rehab_lines"))
+    if fnum(inp.get("rehab_flat"), 0):
+        flats["other"]["material"] += fnum(inp.get("rehab_flat"), 0)
+    st["rehab_rooms"] = room_rows
+    st["rehab_flats"] = {k: flats[k] for k, _ in REHAB_FLATS}
+    # appliances / conversion / furnishing
+    st["appliances"] = _unit_rows(inp.get("appliance_lines"), APPLIANCE_ROWS)
+    st["conversion"] = _unit_rows(inp.get("conversion_lines"), CONVERSION_ROWS)
+    furn = []
+    seen_groups = set()
+    for l in inp.get("furnishing_lines") or []:
+        qty = l.get("qty", 1) or 1
+        furn.append({"group": l.get("group") or "Bedrooms", "label": (l.get("label") or "").strip(),
+                     "qty": qty, "unit": (l.get("material", 0) or 0) + (l.get("labor", 0) or 0)})
+        seen_groups.add(l.get("group") or "Bedrooms")
+    if not furn:
+        for gname, items in FURNISH_GROUPS:
+            for it in items:
+                furn.append({"group": gname, "label": it,
+                             "qty": beds if gname == "Bedrooms" else 0, "unit": 0})
+    st["furnishing"] = furn
+    # funding
+    st["funding"] = [{"type": s.get("type") or "Conventional", "amount": s.get("amount") or 0,
+                      "rate": s.get("rate") or 0, "term_years": s.get("term_years") or ""}
+                     for s in (inp.get("funding_stack") or [])]
+    # holding
+    if inp.get("holding_period") not in (None, ""):
+        st["holding_period"] = inp.get("holding_period"); st["holding_unit"] = inp.get("holding_unit") or "Months"
+    elif inp.get("holding_months") not in (None, ""):
+        st["holding_period"] = inp.get("holding_months"); st["holding_unit"] = "Months"
+    else:
+        st["holding_period"] = 6 if strategy == "Fix & Flip" else 0; st["holding_unit"] = "Months"
+    st["holding_mo"] = g("holding_mo", 450 if strategy == "Fix & Flip" else 0)
+    # existing mortgage data
+    st["md_avg_price"] = g("md_avg_price", "")
+    st["md_repairs"] = g("md_repairs", prop["repairs"] or "")
+    st["md_arv"] = g("md_arv", st["arv"])
+    st["md_mao"] = g("md_mao", ctx.get("mao") or "")
+    st["md_contract_price"] = g("md_contract_price", st["purchase_price"])
+    st["md_listing_price"] = g("md_listing_price", prop["list_price"] or "")
+    for k in ("md_assignment_fee", "md_cash_to_seller", "md_mls_commission", "md_entry_fee",
+              "md_piti_principal", "md_piti_interest", "md_piti_pmi", "md_piti_escrow"):
+        st[k] = g(k, "")
+    st["md_piti_taxes"] = g("md_piti_taxes", round(prop["tax_amount"] / 12) if prop["tax_amount"] else "")
+    st["md_piti_insurance"] = g("md_piti_insurance", "")
+    st["md_liens"] = g("md_liens", ctx.get("liens_total") or "")
+    st["md_monthly_payment"] = g("md_monthly_payment", prop["loan_piti"] or "")
+    st["md_rate"] = g("md_rate", prop["loan_rate"] or "")
+    # revenue per strategy
+    if strategy == "Co-Living":
+        rows = inp.get("rooms_rows") if saved_inp else None
+        if not rows:
+            wk = (ctx.get("coli") or {}).get("weekly_per_room") or 189
+            rows = [{"bath": "Shared", "rent_wk": wk, "vacancy": 15} for _ in range(beds)]
+        st["rooms_rows"] = rows
+        st["amenities_mo"] = g("amenities_mo", 0); st["late_fees_mo"] = g("late_fees_mo", 0)
+        st["laundry_amt"] = g("laundry_amt", 0); st["laundry_period"] = g("laundry_period", "wk")
+        st["misc_income_mo"] = g("misc_income_mo", 0); st["moving_fee"] = g("moving_fee", 0)
+    elif strategy == "Short Term":
+        st["units"] = g("units", 1); st["nightly_rate"] = g("nightly_rate", 120)
+        st["occupancy_pct"] = g("occupancy_pct", 65); st["avg_stay_nights"] = g("avg_stay_nights", 3)
+        st["cleaning_fee"] = g("cleaning_fee", 90); st["platform_pct"] = g("platform_pct", 15)
+        st["pet_fees_mo"] = g("pet_fees_mo", 0); st["parking_mo"] = g("parking_mo", 0); st["misc_mo"] = g("misc_mo", 0)
+    elif strategy in ("Mid Term", "Long Term"):
+        st["units"] = g("units", 1)
+        st["rent_per_unit"] = g("rent_per_unit", (ctx.get("ltr") or {}).get("avg_rent") or 1600)
+        st["pet_mo"] = g("pet_mo", 0); st["parking_mo"] = g("parking_mo", 0)
+        st["storage_mo"] = g("storage_mo", 0); st["laundry_mo"] = g("laundry_mo", 0); st["misc_mo"] = g("misc_mo", 0)
+    # shared rental fields
+    if strategy != "Fix & Flip":
+        st["vacancy_pct"] = g("vacancy_pct", 15 if strategy == "Co-Living" else 5)
+        st["booking_days"] = g("booking_days", 10 if strategy == "Co-Living" else 0)
+        st["service_fee_pct"] = g("service_fee_pct", 8 if strategy == "Co-Living" else 0)
+        st["mgmt_fee_pct"] = g("mgmt_fee_pct", 0); st["mgmt_fee_basis"] = g("mgmt_fee_basis", "gross")
+        for k in ("electric_mo", "water_mo", "gas_mo", "internet_mo", "cleaning_mo",
+                  "landscaping_mo", "pest_mo", "handyman_mo", "property_manager_mo",
+                  "turnover_reserve_mo", "additional_insurance_mo", "taxes_mo", "insurance_mo", "hoa_mo"):
+            st[k] = g(k, 0)
+        # legacy aggregates surface as fallbacks in compute; show them on the matching first line
+        if not any(fnum(st[k], 0) for k in ("electric_mo", "water_mo", "gas_mo", "internet_mo")) and fnum(inp.get("utilities_mo"), 0):
+            st["electric_mo"] = inp.get("utilities_mo")
+        if not any(fnum(st[k], 0) for k in ("landscaping_mo", "pest_mo", "handyman_mo")) and fnum(inp.get("maintenance_mo"), 0):
+            st["landscaping_mo"] = inp.get("maintenance_mo")
+        if not any(fnum(st[k], 0) for k in ("property_manager_mo", "turnover_reserve_mo", "additional_insurance_mo")) and fnum(inp.get("management_mo"), 0):
+            st["property_manager_mo"] = inp.get("management_mo")
+    # flip sale & exit
+    if strategy == "Fix & Flip":
+        st["sale_price"] = g("sale_price", st["arv"])
+        st["commission_pct"] = g("commission_pct", 6)
+        st["closing_pct"] = g("closing_pct", 2)
+    return st
+
 
 # ---------------------------------------------------------------- comps pull (HomeHarvest)
 def pull_comps(prop, radius_mi=1.0, past_days=365):
@@ -860,11 +1172,6 @@ def job_demographics(pid):
         return f"✓ Demographics loaded for ZIP {p['zip']} (US Census ACS)"
     return start_job(pid, "demographics", fn)
 
-def job_monitor_check(mid, pid):
-    def fn():
-        return _monitor_check_now(mid)
-    return start_job(pid, "monitor", fn)
-
 # ---------------------------------------------------------------- routes
 def get_prop(pid):
     p = db().execute("SELECT * FROM properties WHERE id=?", (pid,)).fetchone()
@@ -888,11 +1195,9 @@ EDITABLE = ["status","stage","deal_method","list_price","property_type","beds","
 def dashboard():
     props = db().execute("SELECT * FROM properties ORDER BY id DESC LIMIT 12").fetchall()
     counts = {r["status"]: r["c"] for r in db().execute("SELECT status, COUNT(*) c FROM properties GROUP BY status")}
-    alerts = db().execute("""SELECT m.*, p.address FROM monitors m JOIN properties p ON p.id=m.property_id
-                             WHERE m.last_note IS NOT NULL ORDER BY m.last_checked DESC LIMIT 8""").fetchall()
     recent = db().execute("""SELECT s.*, p.address FROM scenarios s JOIN properties p ON p.id=s.property_id
                              ORDER BY s.id DESC LIMIT 6""").fetchall()
-    return render_template("dashboard.html", props=props, counts=counts, alerts=alerts, recent=recent)
+    return render_template("dashboard.html", props=props, counts=counts, recent=recent)
 
 @app.route("/properties")
 def properties():
@@ -944,7 +1249,6 @@ def property_page(pid):
     contractors = d.execute("SELECT * FROM contractors ORDER BY trade, name").fetchall()
     scenarios = d.execute("SELECT * FROM scenarios WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
     plans = d.execute("SELECT * FROM floorplans WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
-    monitors = d.execute("SELECT * FROM monitors WHERE property_id=?", (pid,)).fetchall()
     v = verdict(p, comps, all_boxes())
     sold = [c for c in comps if c["kind"] == "sold" and not c["excluded"]]
     rents = [c for c in comps if c["kind"] == "rent"]
@@ -976,9 +1280,9 @@ def property_page(pid):
         try: photos = json.loads(p["photos_json"])
         except Exception: photos = []
     if not photos and p["photo_url"]: photos = [p["photo_url"]]
-    # ---- comparables views (v1.2) ----
+    # ---- comparables views (v1.3: all rendered, switched in place) ----
     cview = request.args.get("view", "sold")
-    if cview not in ("sold", "coliving", "ltr", "str", "affordable"): cview = "sold"
+    if cview not in ("maps", "sold", "coliving", "str", "mtr", "ltr", "affordable"): cview = "sold"
     window = int(fnum(request.args.get("window"), 365) or 365)
     if window not in (30, 90, 180, 365): window = 365
     rmax = fnum(request.args.get("rmax"), None)
@@ -998,14 +1302,40 @@ def property_page(pid):
                                                        "beds": c["beds"], "baths": c["baths"], "year_built": c["year_built"]})
     room_est = {c["id"]: room_estimate_weekly(c) for c in rents_view}
     steps = {"comps": len(sold) > 0, "scenarios": len(scenarios) > 0}
+    # ---- underwriting form states (v1.3): fresh defaults + every saved scenario, canonicalized ----
+    strategies = ["Fix & Flip", "Co-Living", "Short Term", "Mid Term", "Long Term"]
+    uw_ctx = {"coli": coli, "ltr": ltr, "rec_arv": v["rec"]["arv"], "mao": v["mao"],
+              "liens_total": sum((l["amount"] or 0) for l in liens)}
+    uw_fresh, uw_saved, uw_current = {}, {}, {}
+    scen_by_strategy = {}
+    for s in scenarios:
+        try: scen_by_strategy.setdefault(s["strategy"], []).append(s)
+        except Exception: pass
+    for strat in strategies:
+        fresh = uw_state(strat, p, None, uw_ctx)
+        uw_fresh[strat] = fresh
+        latest = None
+        for s in scen_by_strategy.get(strat, []):
+            try: saved_inp = json.loads(s["inputs"] or "{}")
+            except Exception: saved_inp = {}
+            uw_saved[s["id"]] = {"strategy": strat, "name": s["name"],
+                                 "state": uw_state(strat, p, saved_inp, uw_ctx)}
+            if latest is None: latest = uw_saved[s["id"]]["state"]
+        uw_current[strat] = latest if latest is not None else fresh
+    # pinned (or top-3) sold comps for the Flip Sale & Exit table
+    flip_pool = [c for c in sold_view if c["pinned"]] or \
+        sorted(sold_view, key=lambda c: -(c["match_score"] or 0))[:3]
+    flip_prices = [c["price"] for c in flip_pool if c["price"]]
     return render_template("property.html", p=p, comps=comps, sold=sold, rents=rents, liens=liens, docs=docs,
                            assigns=assigns, contractors=contractors, scenarios=scenarios, plans=plans,
-                           monitors=monitors, v=v, market=market, demo=demo, tab=tab, amort=amort, amenities=amenities,
+                           v=v, market=market, demo=demo, tab=tab, amort=amort, amenities=amenities,
                            photos=photos, job=latest_job(pid), steps=steps,
                            cview=cview, window=window, rmax=rmax, sold_view=sold_view, rents_view=rents_view,
                            sold_stats=sold_stats, ltr=ltr, coli=coli, med_rent=med_rent, afford_view=afford_view,
                            breakdowns=breakdowns, room_est=room_est,
-                           strategies=["Fix & Flip", "Co-Living", "Short Term", "Mid Term", "Long Term"])
+                           strategies=strategies, uw_fresh=uw_fresh, uw_saved=uw_saved, uw_current=uw_current,
+                           flip_pool=flip_pool,
+                           flip_range=(min(flip_prices), max(flip_prices)) if flip_prices else None)
 
 @app.route("/property/<int:pid>/amenities/refresh", methods=["POST"])
 def refresh_amenities(pid):
@@ -1045,7 +1375,36 @@ def comp_action(cid, action):
     if not c: abort(404)
     if action == "pin":
         db().execute("UPDATE comps SET pinned=1-pinned WHERE id=?", (cid,))
+        db().commit()
         nc = db().execute("SELECT pinned FROM comps WHERE id=?", (cid,)).fetchone()
+        if request.form.get("ajax") or request.headers.get("X-Requested-With") == "fetch":
+            # v1.3 in-place pinning: return the recomputed stats so the page updates live.
+            # The stats respect the viewer's current filter (sold window + radius),
+            # matching the filtered stat bars rendered on the page.
+            pid = c["property_id"]; p = get_prop(pid)
+            allc = db().execute("SELECT * FROM comps WHERE property_id=? AND excluded=0", (pid,)).fetchall()
+            sold_all = [x for x in allc if x["kind"] == "sold"]
+            rent_all = [x for x in allc if x["kind"] == "rent"]
+            win = request.form.get("win") or request.form.get("window") or ""
+            if win in ("30d", "90d", "6mo", "1yr"):
+                _days = {"30d": 30, "90d": 90, "6mo": 182, "1yr": 365}[win]
+                _cut = (datetime.date.today() - datetime.timedelta(days=_days)).isoformat()
+                sold_all = [x for x in sold_all
+                            if not x["event_date"] or x["event_date"] >= _cut]
+            try:
+                _rmax = float(request.form.get("rmax") or "")
+            except (TypeError, ValueError):
+                _rmax = None
+            if _rmax:
+                sold_all = [x for x in sold_all
+                            if x["distance_mi"] is None or x["distance_mi"] <= _rmax]
+                rent_all = [x for x in rent_all
+                            if x["distance_mi"] is None or x["distance_mi"] <= _rmax]
+            rec = arv_reconciliation(p, allc)
+            return jsonify({"pinned": nc["pinned"], "kind": c["kind"],
+                            "sold_stats": pinned_sold_stats(sold_all), "ltr": ltr_stats(rent_all),
+                            "arv": rec["arv"], "arv_note": rec["note"],
+                            "mao": round(rec["arv"] * 0.70 - (p["repairs"] or 0)) if rec["arv"] else None})
         flash(f"{'📌 Pinned' if nc['pinned'] else 'Unpinned'}: {c['address']} — header averages and ARV now use the pinned set.", "ok")
     elif action == "exclude": db().execute("UPDATE comps SET excluded=1-excluded WHERE id=?", (cid,))
     elif action == "adjust":
@@ -1081,7 +1440,7 @@ def underwrite(pid):
     for k, val in request.form.items():
         if k in ("strategy", "save_name"): continue
         inp[k] = fnum(val, val if val != "" else None)
-    for group in ("rehab_lines", "appliance_lines", "furnishing_lines", "conversion_lines", "funding_stack"):
+    for group in ("rehab_lines", "appliance_lines", "furnishing_lines", "conversion_lines", "funding_stack", "rooms_rows"):
         raw = request.form.get(group + "_json", "").strip()
         if raw:
             try: inp[group] = json.loads(raw)
@@ -1171,52 +1530,6 @@ def floorplan(pid):
     db().execute("INSERT INTO floorplans(property_id,title,filename,notes) VALUES(?,?,?,?)",
                  (pid, request.form.get("title"), fn, request.form.get("notes")))
     db().commit(); return redirect(url_for("property_page", pid=pid, tab="floorplans"))
-
-@app.route("/property/<int:pid>/monitor", methods=["POST"])
-def add_monitor(pid):
-    db().execute("""INSERT INTO monitors(property_id,frequency,price_threshold,dom_threshold,stop_on_status)
-                    VALUES(?,?,?,?,?)""",
-                 (pid, request.form.get("frequency", "Weekly"), fnum(request.form.get("price_threshold")),
-                  fnum(request.form.get("dom_threshold")), 1 if request.form.get("stop_on_status") else 0))
-    db().commit(); return redirect(url_for("monitoring_page"))
-
-@app.route("/monitoring")
-def monitoring_page():
-    rows = db().execute("""SELECT m.*, p.address, p.list_price FROM monitors m JOIN properties p
-                           ON p.id=m.property_id ORDER BY m.id DESC""").fetchall()
-    mjobs = {}
-    for r in db().execute("SELECT * FROM jobs WHERE kind='monitor' ORDER BY id DESC"):
-        mjobs.setdefault(r["property_id"], r)
-        if len(mjobs) >= 50: break
-    return render_template("monitoring.html", rows=rows, mjobs=mjobs)
-
-def _monitor_check_now(mid):
-    """One live monitor check. Returns a plain-English result message (job wrapper surfaces errors)."""
-    m = db().execute("SELECT * FROM monitors WHERE id=?", (mid,)).fetchone()
-    if not m: return "Monitor no longer exists."
-    p = get_prop(m["property_id"]); note = "No live listing found in ZIP pull (may be off market)"
-    new_price, new_status = None, "Not found"
-    from homeharvest import scrape_property
-    df = scrape_property(location=p["zip"], listing_type="for_sale", past_days=365)
-    srow = find_subject_row(df, p)
-    if srow is not None:
-        new_price = fnum(srow.get("list_price")); new_status = _s(srow.get("status")) or "For Sale"
-    if new_price:
-        note = f"Price now ${new_price:,.0f}" + (f" (was ${m['last_price']:,.0f})" if m["last_price"] and m["last_price"] != new_price else "")
-        if m["stop_on_status"] and new_status.lower() in ("sold", "off market", "rented"):
-            db().execute("UPDATE monitors SET active=0 WHERE id=?", (mid,)); note += " — monitor stopped per stop rule"
-    db().execute("UPDATE monitors SET last_checked=?, last_price=?, last_status=?, last_note=? WHERE id=?",
-                 (datetime.datetime.now().isoformat(timespec="seconds"), new_price, new_status, note, mid))
-    db().commit()
-    return f"✓ Check complete for {p['address']}: {note}"
-
-@app.route("/monitor/<int:mid>/check", methods=["POST"])
-def monitor_check(mid):
-    m = db().execute("SELECT * FROM monitors WHERE id=?", (mid,)).fetchone()
-    if not m: abort(404)
-    job_monitor_check(mid, m["property_id"])
-    flash("Monitor check started — the result will appear on this page in a moment.", "info")
-    return redirect(url_for("monitoring_page"))
 
 @app.route("/settings", methods=["GET", "POST"])
 def settings_page():

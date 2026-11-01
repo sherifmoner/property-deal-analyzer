@@ -1,0 +1,436 @@
+<div class="card"><h2>Underwriting — ReiSearch layout</h2>
+<div class="segwrap">
+ <div class="segbar" id="segbar">
+ {% for strat in strategies %}<button type="button" class="seg {{ 'on' if strat=='Co-Living' }}" data-seg="{{ strat }}" onclick="return uwSeg('{{ strat }}')">{{ strat }}</button>{% endfor %}
+ </div>
+ <div class="segtools">
+  <label>Saved underwriting</label>
+  <select id="uw-picker" onchange="uwLoadPicked(this)"><option value="">Load a saved scenario…</option>
+  {% for s in scenarios %}<option value="{{ s.id }}">{{ s.strategy }} — {{ s.name }}</option>{% endfor %}</select>
+  <button type="button" class="btn sec sm" onclick="return uwCreateNew()">Create New</button>
+ </div>
+</div>
+<p class="small muted">Strategy buttons swap in place. Every total recalculates as you type — there is no Calculate button. Section headers show CALCULATED TOTAL (computed from rows) or ESTIMATED TOTAL (your sqft estimate). Revenue defaults come from your pulled comps: Co-Living rent/room from the ZIP room-rent benchmark, Long/Mid Term rent from the rental-comp average. Deal Score (Co-Living): CF/room 25% · DSCR 20% · CoC 20% · cap 15% · break-even 12% · downside CF 8%, minus v1.2 realism penalties — $0 taxes/insurance get sanity defaults, never a free "Strong".</p>
+</div>
+
+{% for strat in strategies %}
+{% set st = uw_current[strat] %}
+<div class="uw-panel" data-strategy="{{ strat }}" {% if strat!='Co-Living' %}style="display:none"{% endif %}>
+<form method="post" action="{{ url_for('underwrite', pid=p.id) }}" class="uw-form">
+<input type="hidden" name="strategy" value="{{ strat }}">
+<input type="hidden" name="rehab_lines_json"><input type="hidden" name="appliance_lines_json">
+<input type="hidden" name="furnishing_lines_json"><input type="hidden" name="conversion_lines_json">
+<input type="hidden" name="funding_stack_json">{% if strat=='Co-Living' %}<input type="hidden" name="rooms_rows_json">{% endif %}
+<div class="uw-head"><h2>{{ strat }} Underwriting Calculator</h2></div>
+<div class="uw-grid">
+<div class="uw-main">
+
+<details class="acc" open><summary><span class="acc-t">Post Renovation Property Details</span></summary><div class="acc-b">
+<div class="rowflex">
+<div><label>Beds (post-reno, min {{ p.beds|num }})</label><input type="number" step="any" name="postreno_beds" min="{{ p.beds or 0 }}" value="{{ st.postreno_beds }}"></div>
+<div><label>Baths (post-reno)</label><input type="number" step="any" name="postreno_baths" value="{{ st.postreno_baths }}"></div>
+<div><label>Private baths</label><input type="number" step="any" name="postreno_private_baths" value="{{ st.postreno_private_baths }}"></div>
+<div><label>Shared baths</label><input type="number" step="any" name="postreno_shared_baths" value="{{ st.postreno_shared_baths }}"></div>
+<div><label>Sqft (post-reno)</label><input type="number" step="any" name="postreno_sqft" value="{{ st.postreno_sqft }}"></div>
+</div>
+<div class="ovcard"><b>Post-Reno Overview:</b> <span data-mirror="postreno_beds">{{ st.postreno_beds }}</span> bd · <span data-mirror="postreno_baths">{{ st.postreno_baths }}</span> ba (<span data-mirror="postreno_private_baths">{{ st.postreno_private_baths or 0 }}</span> private / <span data-mirror="postreno_shared_baths">{{ st.postreno_shared_baths or 0 }}</span> shared) · <span data-mirror="postreno_sqft">{{ st.postreno_sqft }}</span> sqft — original: {{ p.beds|num }} bd / {{ p.baths|num }} ba / {{ p.sqft|num }} sqft. <span class="muted">(Add ADU: add its cost under Repair → ADU &amp; Additions.)</span></div>
+</div></details>
+
+<details class="acc" open><summary><span class="acc-t">Repair &amp; Renovation Costs</span><span class="acc-mode" data-out="rehab_mode_label">CALCULATED TOTAL</span><span class="acc-total" data-out="rehab_total">$0</span></summary><div class="acc-b">
+<div class="rowflex">
+<div><label>Total mode</label><select name="rehab_mode"><option value="calc" {% if st.rehab_mode=='calc' %}selected{% endif %}>Calculated — room-by-room rows</option><option value="est" {% if st.rehab_mode=='est' %}selected{% endif %}>Estimated — $/sqft by rehab level</option></select></div>
+</div>
+<div class="rehab-est">
+ <div class="rowflex">
+ <div><label>Rehab level (Sherif's rates)</label><select name="rehab_level"><option value="cosmetic" {% if st.rehab_level=='cosmetic' %}selected{% endif %}>Average / Cosmetic Rehab — $25–$35/sqft</option><option value="heavy" {% if st.rehab_level=='heavy' %}selected{% endif %}>Heavy / Full Gut Rehab — $40–$50+/sqft</option></select></div>
+ <div><label>Estimated Total Rehab Cost $</label><input type="number" step="any" name="rehab_est_total" value="{{ st.rehab_est_total }}"></div>
+ <div style="flex:0"><button type="button" class="btn sec" onclick="return uwUseMidpoint(this)">Use midpoint</button></div>
+ </div>
+ <p class="small muted" data-out="rehab_range">—</p>
+</div>
+<div class="rehab-calc">
+<details class="acc sub"><summary><span class="acc-t">Interior Renovations</span><span class="acc-total" data-out="rehab_interior_total">$0</span></summary><div class="acc-b">
+<div class="rhead"><span>Room / item</span><span>Material $</span><span>Labor $</span><span>Total</span><span></span></div>
+<div data-rows="rehab_rooms"></div>
+<button type="button" class="btn sm sec" onclick="return uwAddRow(this,'rehab_rooms')">+ Add room / item</button>
+</div></details>
+<div class="rhead"><span>Flat item</span><span>Material $</span><span>Labor $</span><span>Total</span><span></span></div>
+<div data-rows="rehab_flats"></div>
+</div>
+<p class="small muted">Footer — <b>Total Rehab Costs: <span data-out="rehab_total">$0</span></b></p>
+</div></details>
+
+<details class="acc"><summary><span class="acc-t">Appliance Costs</span><span class="acc-mode">CALCULATED TOTAL</span><span class="acc-total" data-out="appliances_total">$0</span></summary><div class="acc-b">
+<div class="rhead u"><span>Appliance</span><span>Qty</span><span>Unit cost $</span><span>Total</span><span></span></div>
+<div data-rows="appliances"></div>
+<button type="button" class="btn sm sec" onclick="return uwAddRow(this,'appliances')">+ Add appliance</button>
+</div></details>
+
+{% if strat=='Co-Living' %}
+<details class="acc"><summary><span class="acc-t">Co-Living Conversion Costs</span><span class="acc-mode">CALCULATED TOTAL</span><span class="acc-total" data-out="conversion_total">$0</span></summary><div class="acc-b">
+<div class="rhead u"><span>Item</span><span>Qty</span><span>Unit cost $</span><span>Total</span><span></span></div>
+<div data-rows="conversion"></div>
+<button type="button" class="btn sm sec" onclick="return uwAddRow(this,'conversion')">+ Add item</button>
+</div></details>
+{% endif %}
+
+{% if strat in ('Co-Living','Short Term','Mid Term') %}
+<details class="acc"><summary><span class="acc-t">Furnishing Costs</span><span class="acc-mode">CALCULATED TOTAL</span><span class="acc-total" data-out="furnishing_total">$0</span></summary><div class="acc-b">
+<div class="rhead u"><span>Item</span><span>Qty</span><span>Unit cost $</span><span>Total</span><span></span></div>
+<div data-rows="furnishing"></div>
+<button type="button" class="btn sm sec" onclick="return uwAddRow(this,'furnishing')">+ Add item</button>
+</div></details>
+{% endif %}
+
+{% if strat!='Fix & Flip' %}
+<details class="acc" open><summary><span class="acc-t">Operating Revenue</span><span class="acc-mode">CALCULATED TOTAL</span><span class="acc-total" data-out="egi_mo">$0</span></summary><div class="acc-b">
+{% if strat=='Co-Living' %}
+<div class="rhead r"><span>Room</span><span>Bathroom</span><span>Rent $/Wk</span><span>Rent $/Mo</span><span>Vacancy %</span><span>Net $/Mo</span><span></span></div>
+<div data-rows="rooms_rows"></div>
+<button type="button" class="btn sm sec" onclick="return uwAddRow(this,'rooms_rows')">+ Add room</button>
+<div class="rowflex">
+<div><label>Amenities Total $/mo</label><input type="number" step="any" name="amenities_mo" value="{{ st.amenities_mo }}"></div>
+<div><label>Rental Late Fees $/mo</label><input type="number" step="any" name="late_fees_mo" value="{{ st.late_fees_mo }}"></div>
+<div><label>Shared Laundry $</label><input type="number" step="any" name="laundry_amt" value="{{ st.laundry_amt }}"></div>
+<div><label>Laundry period</label><select name="laundry_period"><option value="wk" {% if st.laundry_period=='wk' %}selected{% endif %}>per Week</option><option value="mo" {% if st.laundry_period=='mo' %}selected{% endif %}>per Month</option></select></div>
+<div><label>Misc. Income $/mo</label><input type="number" step="any" name="misc_income_mo" value="{{ st.misc_income_mo }}"></div>
+<div><label>Moving Fee $ (one time)</label><input type="number" step="any" name="moving_fee" value="{{ st.moving_fee }}"></div>
+</div>
+<div class="sumcard"><h4>Revenue summary</h4>
+<div class="srow"><span>Bedroom Rental Revenue</span><b data-out="gross_mo">$0</b></div>
+<div class="srow"><span>Other Fees &amp; Misc</span><b data-out="rev_other_fees">$0</b></div>
+<div class="srow"><span>Amenity Income</span><b data-out="rev_amenity">$0</b></div>
+<div class="srow"><span>Vacancy Loss</span><b data-out="vacancy_loss_mo">$0</b></div>
+<div class="srow tot"><span>Gross Income (effective)</span><b data-out="egi_mo">$0</b></div></div>
+{% elif strat=='Short Term' %}
+<div class="rowflex">
+<div><label>Units</label><input type="number" step="any" name="units" value="{{ st.units }}"></div>
+<div><label>Nightly Rate $ (Main Residence)</label><input type="number" step="any" name="nightly_rate" value="{{ st.nightly_rate }}"></div>
+<div><label>Occupancy %</label><input type="number" step="any" name="occupancy_pct" value="{{ st.occupancy_pct }}"></div>
+</div>
+<h4>Booking Assumptions</h4>
+<div class="rowflex">
+<div><label>Avg Length of Stay (nights)</label><input type="number" step="any" name="avg_stay_nights" value="{{ st.avg_stay_nights }}"></div>
+<div><label>Cleaning Fee / stay $</label><input type="number" step="any" name="cleaning_fee" value="{{ st.cleaning_fee }}"></div>
+<div><label>Platform Fee %</label><input type="number" step="any" name="platform_pct" value="{{ st.platform_pct }}"></div>
+</div>
+<h4>Other Income</h4>
+<div class="rowflex">
+<div><label>Pet Fees $/mo</label><input type="number" step="any" name="pet_fees_mo" value="{{ st.pet_fees_mo }}"></div>
+<div><label>Parking $/mo</label><input type="number" step="any" name="parking_mo" value="{{ st.parking_mo }}"></div>
+<div><label>Misc. $/mo</label><input type="number" step="any" name="misc_mo" value="{{ st.misc_mo }}"></div>
+</div>
+<div class="sumcard"><h4>Revenue summary</h4>
+<div class="srow"><span>Gross Booking Revenue</span><b data-out="gross_mo">$0</b></div>
+<div class="srow"><span>Cleaning Fee Income</span><b data-out="cleaning_income_mo">$0</b></div>
+<div class="srow"><span>Other Income</span><b data-out="rev_other_plain">$0</b></div>
+<div class="srow"><span>Platform Fees (in Operating Expenses)</span><b data-out="platform_fee_mo">$0</b></div>
+<div class="srow tot"><span>Effective Gross Income</span><b data-out="egi_mo">$0</b></div></div>
+{% else %}
+<div class="rowflex">
+<div><label>Units</label><input type="number" step="any" name="units" value="{{ st.units }}"></div>
+<div><label>Monthly Rent $ (Main Residence)</label><input type="number" step="any" name="rent_per_unit" value="{{ st.rent_per_unit }}"></div>
+<div><label>Vacancy %</label><input type="number" step="any" name="vacancy_pct" value="{{ st.vacancy_pct }}"></div>
+</div>
+<h4>Other Income</h4>
+<div class="rowflex">
+<div><label>Pet Rent $/mo</label><input type="number" step="any" name="pet_mo" value="{{ st.pet_mo }}"></div>
+<div><label>Parking $/mo</label><input type="number" step="any" name="parking_mo" value="{{ st.parking_mo }}"></div>
+<div><label>Storage $/mo</label><input type="number" step="any" name="storage_mo" value="{{ st.storage_mo }}"></div>
+<div><label>Laundry $/mo</label><input type="number" step="any" name="laundry_mo" value="{{ st.laundry_mo }}"></div>
+<div><label>Misc. $/mo</label><input type="number" step="any" name="misc_mo" value="{{ st.misc_mo }}"></div>
+</div>
+<div class="sumcard"><h4>Revenue summary</h4>
+<div class="srow"><span>Gross Scheduled Rent</span><b data-out="gross_mo">$0</b></div>
+<div class="srow"><span>Other Income</span><b data-out="other_income_mo">$0</b></div>
+<div class="srow"><span>Vacancy &amp; Credit Loss</span><b data-out="vacancy_loss_mo">$0</b></div>
+<div class="srow tot"><span>Effective Gross Income</span><b data-out="egi_mo">$0</b></div></div>
+{% endif %}
+</div></details>
+
+<details class="acc" open><summary><span class="acc-t">Operating Expenses</span><span class="acc-mode">CALCULATED TOTAL</span><span class="acc-total" data-out="opex_mo">$0</span></summary><div class="acc-b">
+<h4>Booking &amp; Service Fee</h4>
+<div class="rowflex">
+<div><label>First Days to PadSplit (days)</label><input type="number" step="any" name="booking_days" value="{{ st.booking_days }}"></div>
+<div><label>First-days fee cost $/mo <span class="muted">(once per booking, amortized monthly)</span></label><input type="text" data-out="booking_fee_mo" readonly tabindex="-1"></div>
+<div><label>Ongoing Service Fee %</label><input type="number" step="any" name="service_fee_pct" value="{{ st.service_fee_pct }}"></div>
+<div><label>Service fee cost $/mo</label><input type="text" data-out="service_fee_mo" readonly tabindex="-1"></div>
+<div><label>Blended rate</label><input type="text" data-out="blended_rate" readonly tabindex="-1"></div>
+</div>
+<div class="rowflex">
+<div><label>Property Management Fee %</label><input type="number" step="any" name="mgmt_fee_pct" value="{{ st.mgmt_fee_pct }}"></div>
+<div><label>Fee basis</label><select name="mgmt_fee_basis"><option value="gross" {% if st.mgmt_fee_basis=='gross' %}selected{% endif %}>% of Gross</option><option value="net" {% if st.mgmt_fee_basis=='net' %}selected{% endif %}>% of Net (effective)</option></select></div>
+<div><label>Management fee cost $/mo</label><input type="text" data-out="mgmt_fee_mo" readonly tabindex="-1"></div>
+</div>
+<h4>Utilities</h4>
+{% for k, lab in [('electric_mo','Electric'),('water_mo','Water'),('gas_mo','Gas'),('internet_mo','Internet')] %}
+<div class="xrow"><span>{{ lab }}</span><input type="number" step="any" name="{{ k }}" value="{{ st[k] }}"><span class="yr" data-yr="{{ k }}"></span></div>{% endfor %}
+<h4>Cleaning Service</h4>
+<div class="xrow"><span>Cleaning Service</span><input type="number" step="any" name="cleaning_mo" value="{{ st.cleaning_mo }}"><span class="yr" data-yr="cleaning_mo"></span></div>
+<h4>Maintenance</h4>
+{% for k, lab in [('landscaping_mo','Landscaping'),('pest_mo','Pest Control'),('handyman_mo','Handy Man')] %}
+<div class="xrow"><span>{{ lab }}</span><input type="number" step="any" name="{{ k }}" value="{{ st[k] }}"><span class="yr" data-yr="{{ k }}"></span></div>{% endfor %}
+<h4>Management</h4>
+{% for k, lab in [('property_manager_mo','Property Manager'),('turnover_reserve_mo','Turnover Reserve'),('additional_insurance_mo','Additional Insurance')] %}
+<div class="xrow"><span>{{ lab }}</span><input type="number" step="any" name="{{ k }}" value="{{ st[k] }}"><span class="yr" data-yr="{{ k }}"></span></div>{% endfor %}
+<h4>Taxes, Insurance &amp; HOA <span class="small muted">(0 = sanity default at calculation: taxes 1.1% of price/yr, insurance $180/mo)</span></h4>
+{% for k, lab in [('taxes_mo','Taxes'),('insurance_mo','Insurance'),('hoa_mo','HOA dues')] %}
+<div class="xrow"><span>{{ lab }}</span><input type="number" step="any" name="{{ k }}" value="{{ st[k] }}"><span class="yr" data-yr="{{ k }}"></span></div>{% endfor %}
+<div class="sumcard"><h4>Expense summary</h4>
+<div class="srow"><span>Booking &amp; Service Fees</span><b data-out="cat_fees">$0</b></div>
+<div class="srow"><span>Utilities</span><b data-out="cat_utilities">$0</b></div>
+<div class="srow"><span>Cleaning Service</span><b data-out="cat_cleaning">$0</b></div>
+<div class="srow"><span>Maintenance</span><b data-out="cat_maintenance">$0</b></div>
+<div class="srow"><span>Management</span><b data-out="cat_management">$0</b></div>
+<div class="srow"><span>Taxes, Insurance &amp; HOA</span><b data-out="cat_taxes">$0</b></div>
+<div class="srow tot"><span>Total Operating Expenses</span><b data-out="opex_mo">$0</b></div>
+<div class="srow tot"><span>Net (NOI after expenses, before debt)</span><b data-out="noi_mo">$0</b></div></div>
+</div></details>
+{% endif %}
+
+<details class="acc" open><summary><span class="acc-t">Funding Structure</span><span class="acc-mode">LIVE TOTALS</span><span class="acc-total" data-out="funded">$0</span></summary><div class="acc-b">
+<p class="small muted" style="margin-top:0">How will you fund this deal? Pick a preset or build a custom stack. <b>Subject-To</b> uses the Existing Mortgage Data below (entry fee + existing PITI payment).</p>
+<div class="rowflex">
+<div><label>Purchase price $</label><input type="number" step="any" name="purchase_price" value="{{ st.purchase_price }}"></div>
+<div><label>ARV $</label><input type="number" step="any" name="arv" value="{{ st.arv }}"></div>
+<div><label>Closing costs $ (est. financing costs)</label><input type="number" step="any" name="closing_costs" value="{{ st.closing_costs }}"></div>
+</div>
+<div class="presets">
+{% for pr in ['Cash','Conventional','DSCR','Hard Money','Private Money','Seller Financing','Subject-To','Custom Stack'] %}<button type="button" class="btn sm sec" onclick="return uwPreset(this,'{{ pr }}')">{{ pr }}</button>{% endfor %}
+</div>
+<div class="rhead f"><span>Type</span><span>Amount $</span><span>Rate %</span><span>Term (yrs)</span><span>Payment $/mo</span><span></span></div>
+<div data-rows="funding"></div>
+<button type="button" class="btn sm sec" onclick="return uwAddRow(this,'funding')">+ Add Funding Source</button>
+<div class="sumcard"><h4>Funding Snapshot</h4>
+<div class="srow"><span>Total Uses (purchase + renovation + holding)</span><b data-out="uses">$0</b></div>
+<div class="srow"><span>Funding Added</span><b data-out="funded">$0</b></div>
+<div class="srow"><span>Remaining Funding Gap</span><b data-out="gap">$0</b></div>
+<div class="srow"><span>Cash Contribution</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Monthly Debt Service</span><b data-out="debt_service_mo">$0</b></div>
+<div class="srow tot"><span>Estimated Financing Costs</span><b data-out="financing_costs">$0</b></div></div>
+{% if strat!='Fix & Flip' %}
+<details class="acc sub"><summary><span class="acc-t">Existing Mortgage Data</span><span class="acc-total" data-out="md_monthly_payment_label"></span></summary><div class="acc-b">
+<h4>Price Details</h4>
+<div class="rowflex">
+<div><label>Average Est Price $</label><input type="number" step="any" name="md_avg_price" value="{{ st.md_avg_price }}"></div>
+<div><label>Est. Repair Costs $</label><input type="number" step="any" name="md_repairs" value="{{ st.md_repairs }}"></div>
+<div><label>After Repair Value $</label><input type="number" step="any" name="md_arv" value="{{ st.md_arv }}"></div>
+<div><label>Max Allowable Offer $</label><input type="number" step="any" name="md_mao" value="{{ st.md_mao }}"></div>
+</div>
+<div class="rowflex">
+<div><label>Contract Price $</label><input type="number" step="any" name="md_contract_price" value="{{ st.md_contract_price }}"></div>
+<div><label>Listing Price $</label><input type="number" step="any" name="md_listing_price" value="{{ st.md_listing_price }}"></div>
+<div><label>Assignment Fee $</label><input type="number" step="any" name="md_assignment_fee" value="{{ st.md_assignment_fee }}"></div>
+<div><label>Cash to Seller $</label><input type="number" step="any" name="md_cash_to_seller" value="{{ st.md_cash_to_seller }}"></div>
+</div>
+<div class="rowflex">
+<div><label>MLS Agent Commission $</label><input type="number" step="any" name="md_mls_commission" value="{{ st.md_mls_commission }}"></div>
+<div><label><b>Total Entry Fee $</b> <span class="muted">(adds to cash needed)</span></label><input type="number" step="any" name="md_entry_fee" value="{{ st.md_entry_fee }}"></div>
+</div>
+<h4>PITI &amp; Loan</h4>
+<div class="rowflex">
+<div><label>Principal $/mo</label><input type="number" step="any" name="md_piti_principal" value="{{ st.md_piti_principal }}"></div>
+<div><label>Interest Amount $/mo</label><input type="number" step="any" name="md_piti_interest" value="{{ st.md_piti_interest }}"></div>
+<div><label>PMI $/mo</label><input type="number" step="any" name="md_piti_pmi" value="{{ st.md_piti_pmi }}"></div>
+<div><label>Taxes $/mo</label><input type="number" step="any" name="md_piti_taxes" value="{{ st.md_piti_taxes }}"></div>
+</div>
+<div class="rowflex">
+<div><label>Insurance $/mo</label><input type="number" step="any" name="md_piti_insurance" value="{{ st.md_piti_insurance }}"></div>
+<div><label>Escrow $/mo</label><input type="number" step="any" name="md_piti_escrow" value="{{ st.md_piti_escrow }}"></div>
+<div><label>Liens Amount $</label><input type="number" step="any" name="md_liens" value="{{ st.md_liens }}"></div>
+<div><label><b>Monthly Payment (PITI) $</b> <span class="muted">(counts as debt service)</span></label><input type="number" step="any" name="md_monthly_payment" value="{{ st.md_monthly_payment }}"></div>
+</div>
+<div class="rowflex">
+<div><label>Interest Rate %</label><input type="number" step="any" name="md_rate" value="{{ st.md_rate }}"></div>
+</div>
+</div></details>
+{% endif %}
+</div></details>
+
+<details class="acc"><summary><span class="acc-t">Holding Costs</span><span class="acc-mode">CALCULATED TOTAL</span><span class="acc-total" data-out="holding_cost">$0</span></summary><div class="acc-b">
+<div class="rowflex">
+<div><label>Holding period</label><input type="number" step="any" name="holding_period" value="{{ st.holding_period }}"></div>
+<div><label>Unit</label><select name="holding_unit"><option {% if st.holding_unit=='Days' %}selected{% endif %}>Days</option><option {% if st.holding_unit=='Months' %}selected{% endif %}>Months</option></select></div>
+<div><label>Monthly carry $/mo</label><input type="number" step="any" name="holding_mo" value="{{ st.holding_mo }}"></div>
+</div>
+<p class="small muted" data-out="holding_desc">—</p>
+</div></details>
+
+{% if strat=='Fix & Flip' %}
+<details class="acc" open><summary><span class="acc-t">Sale &amp; Exit</span><span class="acc-mode">CALCULATED TOTAL</span><span class="acc-total" data-out="net_proceeds">$0</span></summary><div class="acc-b">
+<div class="rowflex">
+<div><label>Sale price (ARV) $</label><input type="number" step="any" name="sale_price" value="{{ st.sale_price }}"></div>
+<div><label>ARV source</label><select name="arv_source"><option value="comps">Sold Comps</option><option value="market">Market Estimate</option></select></div>
+</div>
+<p class="small muted">From your sold comps: {% if sold_stats %}Comps suggest <b>{{ sold_stats.avg_price|money }}</b>{% if flip_range %}, Range {{ flip_range[0]|money }} – {{ flip_range[1]|money }}{% endif %} ({{ 'pinned' if sold_stats.basis=='pinned' else 'top-3' }} set). <button type="button" class="btn sm sec" onclick="return uwUseCompArv(this, {{ sold_stats.avg_price or 0 }})">Use comp average</button>{% else %}No sold comps yet — pull comps first.{% endif %}</p>
+{% if flip_pool %}<table><thead><tr><th>Selected sold comp</th><th>Sold price</th><th>$/sqft</th><th>Distance</th></tr></thead>
+<tbody>{% for c in flip_pool %}<tr><td>{{ c.address }}</td><td>{{ c.price|money }}</td><td>{{ ('$' ~ c.ppsf|round(0)) if c.ppsf else '—' }}</td><td>{{ c.distance_mi|num(2) }} mi</td></tr>{% endfor %}</tbody>
+<tfoot><tr><td><b>Averages</b></td><td><b>{{ sold_stats.avg_price|money }}</b></td><td><b>{{ ('$' ~ sold_stats.avg_ppsf) if sold_stats.avg_ppsf else '—' }}</b></td><td><b>DOM {{ sold_stats.avg_dom if sold_stats.avg_dom is not none else '—' }}</b></td></tr></tfoot></table>{% endif %}
+<div class="rowflex">
+<div><label>Agent commission %</label><input type="number" step="any" name="commission_pct" value="{{ st.commission_pct }}"></div>
+<div><label>= $</label><input type="text" data-out="commission_amt" readonly tabindex="-1"></div>
+<div><label>Seller closing costs %</label><input type="number" step="any" name="closing_pct" value="{{ st.closing_pct }}"></div>
+<div><label>= $</label><input type="text" data-out="closing_amt" readonly tabindex="-1"></div>
+</div>
+<p><b>Net Sale Proceeds: <span data-out="net_proceeds">$0</span></b> <span class="small muted">(sale price − commission − closing costs)</span></p>
+</div></details>
+{% endif %}
+
+{% if strat=='Co-Living' %}
+<div class="card uwbottom">
+<h3>Underwriting Summary</h3>
+<div class="hcards">
+<div class="hcard"><span>Cash Needed</span><b data-out="cash_in">$0</b><small data-out="cash_per_room"></small></div>
+<div class="hcard"><span>Net Cash Flow / Mo</span><b data-out="cashflow_mo">$0</b><small data-out="cf_per_room"></small></div>
+<div class="hcard"><span>Cash-on-Cash</span><b data-out="coc_pct">—</b><small data-out="payback"></small></div>
+<div class="hcard"><span>DSCR</span><b data-out="dscr">—</b><small>&nbsp;</small></div>
+</div>
+<div class="grid2">
+<div class="moneyblock">
+<h4>Cash Flow (Monthly)</h4>
+<div class="srow"><span><b>MONEY IN</b></span><b></b></div>
+<div class="srow"><span>Revenue (effective gross income)</span><b data-out="egi_mo">$0</b></div>
+<div class="srow"><span>Scheduled Rent (gross)</span><b data-out="gross_mo">$0</b></div>
+<div class="srow"><span>Vacancy Loss</span><b data-out="vacancy_loss_mo">$0</b></div>
+<div class="srow"><span><b>MONEY OUT</b></span><b></b></div>
+<div class="srow"><span>Operating Expenses</span><b data-out="opex_mo">$0</b></div>
+<div class="srow"><span>Loan Payments</span><b data-out="debt_service_mo">$0</b></div>
+<div class="srow tot"><span>Net Cash Flow</span><b data-out="cashflow_mo">$0</b></div>
+<p class="small muted" data-out="breakeven_line"></p>
+</div>
+<div>
+<h4>Year 1 Returns</h4>
+<div class="srow"><span>Cash Flow (Year 1)</span><b data-out="cashflow_y1">$0</b></div>
+<div class="srow"><span>Loan Paydown (Year 1)</span><b data-out="paydown_y1">$0</b></div>
+<div class="srow"><span>Total Return</span><b data-out="total_return_y1">$0</b></div>
+<div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
+<div class="srow"><span>Total ROI</span><b data-out="total_roi_y1">—</b></div>
+<h4>Per-Room Economics</h4>
+<div class="srow"><span>Net Cash Flow / room</span><b data-out="cf_per_room">$0</b></div>
+<div class="srow"><span>Cash Needed / room</span><b data-out="cash_per_room">$0</b></div>
+<div class="srow"><span>Rooms</span><b data-out="rooms">—</b></div>
+</div>
+</div>
+</div>
+{% endif %}
+
+<div class="rowflex" style="margin-top:12px">
+<div><label>Scenario name</label><input name="save_name" placeholder="{{ strat }} — base case"></div>
+<div style="flex:0"><button class="btn big">💾 Save {{ strat }} scenario</button></div>
+</div>
+<p class="small muted">Saving stores the scenario (numbers above are always live). Saved scenarios load from the picker at the top.</p>
+</div>{# /uw-main #}
+
+<aside class="uw-side">
+{% if strat in ('Co-Living','Fix & Flip') %}
+<div class="sidecard"><h3>Underwriting Summary</h3>
+<div class="sidetabs">
+<button type="button" class="on" data-stab="overview" onclick="return uwSideTab(this,'overview')">Overview</button>
+<button type="button" data-stab="visual" onclick="return uwSideTab(this,'visual')">Visual</button>
+<button type="button" data-stab="scenarios" onclick="return uwSideTab(this,'scenarios')">Scenarios</button>
+<button type="button" data-stab="details" onclick="return uwSideTab(this,'details')">Details</button>
+<button type="button" data-stab="capital" onclick="return uwSideTab(this,'capital')">Capital</button>
+</div>
+<div class="sidepane on" data-spane="overview">
+{% if strat=='Co-Living' %}
+<div class="scorebox"><span>Deal Score</span><b data-out="score">—</b><small data-out="score_label"></small></div>
+<div class="srow"><span>Net Cash Flow</span><b><span data-out="cashflow_mo">$0</span>/mo</b></div>
+<div class="srow"><span>Net Cash Flow (annual)</span><b data-out="cashflow_y1">$0</b></div>
+<div class="srow"><span>Revenue</span><b data-out="egi_mo">$0</b></div>
+<div class="srow"><span>Expenses</span><b data-out="opex_mo">$0</b></div>
+<div class="srow"><span>Loan Payments</span><b data-out="debt_service_mo">$0</b></div>
+<div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Cash-on-Cash</span><b data-out="coc_pct">—</b></div>
+<div class="srow"><span>DSCR</span><b data-out="dscr">—</b></div>
+<div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
+{% else %}
+<div class="scorebox"><span>Deal Score</span><b data-out="score">—</b><small data-out="score_label"></small></div>
+<div class="srow"><span>Net Profit</span><b data-out="profit">$0</b></div>
+<div class="srow"><span>Profit % of sale price</span><b data-out="margin_pct">—</b></div>
+<div class="srow"><span>Sale Price</span><b data-out="sale_price_out">$0</b></div>
+<div class="srow"><span>All-in Cost</span><b data-out="all_in">$0</b></div>
+<div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>ROI</span><b data-out="roi">—</b></div>
+<div class="srow"><span>Annualized ROI</span><b data-out="annualized_roi">—</b></div>
+<div class="srow"><span>Profit Margin</span><b data-out="margin_pct">—</b></div>
+<div class="srow"><span>70% Rule — max offer</span><b data-out="rule70_mao">$0</b></div>
+<div class="srow"><span></span><b class="small" data-out="rule70_note"></b></div>
+{% endif %}
+</div>
+<div class="sidepane" data-spane="visual"><div data-visual="main"></div><h4>Expense breakdown</h4><div data-visual="exp"></div></div>
+<div class="sidepane" data-spane="scenarios"><div data-scenarios></div><p class="small muted">Key metrics shown are the Base Case (Overview tab).</p></div>
+<div class="sidepane" data-spane="details"><div class="gapalert" data-gapalert style="display:none"></div><div data-details></div></div>
+<div class="sidepane" data-spane="capital">
+{% if strat=='Co-Living' %}
+<div class="srow"><span>Total Project Cost</span><b data-out="total_project">$0</b></div>
+<div class="srow"><span>Refinance Proceeds (75% of ARV, gross)</span><b data-out="refi_proceeds">$0</b></div>
+<div class="srow"><span>Remaining in Deal</span><b data-out="remaining_in_deal">$0</b></div>
+<div class="srow"><span>Net Cash Flow</span><b><span data-out="cashflow_mo">$0</span>/mo</b></div>
+<div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Cash-on-Cash</span><b data-out="coc_pct">—</b></div>
+<div class="srow"><span>DSCR</span><b data-out="dscr">—</b></div>
+<div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
+<div class="srow"><span>Year-1 Total Return</span><b data-out="total_return_y1">$0</b></div>
+{% else %}
+<div class="srow"><span>Total Project Cost</span><b data-out="total_project">$0</b></div>
+<div class="srow"><span>Total Uses (incl. holding)</span><b data-out="uses">$0</b></div>
+<div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Net Sale Proceeds</span><b data-out="net_proceeds">$0</b></div>
+<div class="srow"><span>Net Profit</span><b data-out="profit">$0</b></div>
+<div class="srow"><span>ROI</span><b data-out="roi">—</b></div>
+<div class="srow"><span>Total Return</span><b data-out="profit">$0</b></div>
+{% endif %}
+</div>
+</div>
+{% else %}
+<div class="sidecard"><h3>Deal Analysis Summary</h3>
+<div class="srow"><span>Cash Outlay</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Income (effective, /mo)</span><b data-out="egi_mo">$0</b></div>
+<div class="srow"><span>Expenses (/mo, incl. loan payments)</span><b data-out="expenses_total">$0</b></div>
+<div class="srow tot"><span>Net Cash Flow</span><b><span data-out="cashflow_mo">$0</span>/mo</b></div>
+<div class="srow"><span>NOI</span><b data-out="noi_mo">$0</b></div>
+<div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
+<div class="srow"><span>DSCR</span><b data-out="dscr">—</b></div>
+</div>
+{% endif %}
+<div class="sidecard"><h3>Loan Amortization</h3>
+<p class="small muted">Annual interest / principal / balance table for any loan amount, rate and term.</p>
+<a class="btn sec" href="#amortcard">Open Calculator</a></div>
+</aside>
+</div>{# /uw-grid #}
+</form>
+</div>
+{% endfor %}
+
+<div class="card"><h2>Saved scenarios + cross-strategy best exit</h2>
+<table><tr><th>Strategy</th><th>Name</th><th>Score</th><th>Key result</th><th>Cash in</th><th></th></tr>
+{% set best = namespace(sid=None, score=-1) %}
+{% for s in scenarios %}{% set r = s.results|jload %}{% if r.score and r.score > best.score %}{% set best.sid = s.id %}{% set best.score = r.score %}{% endif %}{% endfor %}
+{% for s in scenarios %}{% set r = s.results|jload %}
+<tr {% if s.id==best.sid %}style="background:#ecfdf5"{% endif %}><td>{{ s.strategy }}{% if s.id==best.sid %} <span class="badge cash">BEST EXIT</span>{% endif %}</td><td>{{ s.name }}</td>
+<td>{% if r.score %}<b>{{ r.score }}</b> ({{ r.label }}){% else %}—{% endif %}</td>
+<td class="small">{% if s.strategy=='Fix & Flip' %}Profit {{ r.profit|money }} · ROI {{ r.roi }}% · margin {{ r.margin_pct }}%{% else %}CF {{ r.cashflow_mo|money }}/mo · CoC {{ r.coc_pct }}% · cap {{ r.cap_rate_pct }}% · DSCR {{ r.dscr }}{% endif %}</td>
+<td>{{ r.cash_in|money }}</td>
+<td><form method="post" action="{{ url_for('del_scenario', sid=s.id) }}"><button class="btn sm danger">✕</button></form></td></tr>
+<tr><td colspan="6" class="small muted">{% if r.score_parts %}Score parts: {% for k,val in r.score_parts.items() %}{{ k }}: {{ val }} · {% endfor %}{% endif %}
+{% if r.penalties %}Penalties: {% for pen in r.penalties %}−{{ pen.points }} ({{ pen.reason }}) · {% endfor %}{% endif %}
+{% if r.scenarios %}Scenarios: {% for k,val in r.scenarios.items() %}{{ k }}: {{ (val.net if val is mapping else val)|money }}{{ '' if val is mapping else '/mo' }} · {% endfor %}{% endif %}
+{% if r.flags %}Flags: {{ r.flags|join('; ') }}{% endif %}</td></tr>
+{% else %}<tr><td colspan="6" class="muted">No scenarios yet — run one above.</td></tr>{% endfor %}</table></div>
+
+<div class="card" id="amortcard"><h2>Amortization calculator</h2>
+<form method="post" action="{{ url_for('amortize', pid=p.id) }}"><div class="rowflex">
+<div><label>Loan amount $</label><input type="number" step="any" name="loan_amount" value="{{ p.loan_balance or 300000 }}"></div>
+<div><label>Rate %</label><input type="number" step="any" name="rate" value="{{ p.loan_rate or 6.5 }}"></div>
+<div><label>Amortization (yrs)</label><input type="number" step="any" name="amort_years" value="30"></div>
+<div><label>Loan term (yrs, balloon)</label><input type="number" step="any" name="loan_years" value="30"></div>
+<div><label>Add to funding stack</label><input type="checkbox" name="add_to_stack"></div>
+<div style="flex:0"><button class="btn sec">Calculate</button></div></div></form>
+<p class="small muted">Produces the annual interest/principal/balance table on the next screen.</p></div>
+
+<script>
+window.UW = {"sqft": {{ p.sqft or 0 }}, "fresh": {{ uw_fresh|tojson }}, "current": {{ uw_current|tojson }}, "saved": {{ uw_saved|tojson }},
+  "flatLabels": {{ {"adu": "ADU & Additions", "hvac": "HVAC", "electrical": "Electrical", "plumbing": "Plumbing", "exterior": "Exterior & Structural", "contingency": "Repairs Contingency", "other": "Other (flat)"}|tojson }},
+  "levels": {"cosmetic": {"low": 25, "high": 35, "mid": 30}, "heavy": {"low": 40, "high": 50, "mid": 45}}};
+</script>
+<script src="{{ url_for('static', filename='uw.js') }}"></script>

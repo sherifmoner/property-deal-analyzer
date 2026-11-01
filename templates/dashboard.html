@@ -1,5 +1,5 @@
 {% extends "base.html" %}{% block body %}
-<h1>Dashboard</h1><p class="muted">Property queue, recent analyses, monitoring alerts. No tokens, ever.</p>
+<h1>Dashboard</h1><p class="muted">Property queue and recent analyses. No tokens, ever.</p>
 <div class="grid3">
 <div class="card"><h2>{{ counts.get('Draft',0) }} Drafts</h2><p class="muted">Being analyzed</p></div>
 <div class="card"><h2>{{ counts.get('Shared',0) }} Shared</h2><p class="muted">Shared with the team</p></div>
@@ -14,11 +14,8 @@
 {% for p in props %}<p style="margin:6px 0"><a href="{{ url_for('property_page', pid=p.id) }}"><b>{{ p.address }}</b></a><br>
 <span class="small muted">{{ p.deal_method }} · {{ p.status }} · list {{ p.list_price|money }} · flood {{ p.flood_zone or 'Not found' }}</span></p>
 {% else %}<p class="muted">None yet — add your first property above.</p>{% endfor %}</div>
-<div><div class="card"><h2>Monitoring alerts</h2>
-{% for a in alerts %}<p style="margin:6px 0"><a href="{{ url_for('monitoring_page') }}">{{ a.address }}</a><br><span class="small muted">{{ a.last_checked }} — {{ a.last_note }}</span></p>
-{% else %}<p class="muted">No alerts yet.</p>{% endfor %}</div>
-<div class="card"><h2>Recent underwriting</h2>
+<div><div class="card"><h2>Recent underwriting</h2>
 {% for s in recent %}{% set r = s.results|jload %}<p style="margin:6px 0"><a href="{{ url_for('property_page', pid=s.property_id, tab='underwriting') }}">{{ s.address }}</a><br>
-<span class="small muted">{{ s.strategy }} — {{ s.name }} · {% if r.score %}score {{ r.score }} ({{ r.label }}){% elif r.profit is defined %}profit {{ r.profit|money }}{% endif %}</span></p>
+<span class="small muted">{{ s.strategy }} — {{ s.name }} · {% if r.score %}score {{ r.score }} ({{ r.label }}){% elif r.profit is defined and r.profit is not none %}profit {{ r.profit|money }}{% endif %}</span></p>
 {% else %}<p class="muted">No scenarios yet.</p>{% endfor %}</div></div></div>
 {% endblock %}
