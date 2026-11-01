@@ -318,3 +318,40 @@ export JSON/CSV intact (1 property, 88 comps, 42 docs, 26 contractors, 3 scenari
   logins/multi-user auth are **out of scope** — Sherif confirmed 2026-11-01 he does not
   want them. The data model and export/import remain the migration path to the hosted
   version: one codebase, clean data layer in `app.py`.
+
+
+## v1.5 (2026-11-01) — Underwriting workflow: defaults, autosave, ReiSearch layout parity
+
+Built directly from Sherif's ReiSearch screenshots (Senisa Drive deal as the numeric fixture):
+
+- **PadSplit expense template prefilled**: a fresh rental panel opens with ReiSearch's
+  defaults — Booking & Service Fee (First Days 10, Ongoing 8%, Management 0% Gross/Net),
+  Utilities (Electric $400, Water $80, Gas $50, Internet $70), Cleaning $120/mo,
+  Maintenance (Landscaping $100, Pest $50, Handy Man $150), Management (Property Manager
+  $300, Turnover $0, Additional Insurance $0). Saved scenarios keep their stored values.
+- **AUTOSAVE**: edits debounce-save (~1s) to a server draft per property+strategy
+  (`uw_drafts` table, `POST /property/<id>/uw-autosave`), restored ahead of saved
+  scenarios on return; "☁ Autosave on" + "Last saved …" indicator in every panel head;
+  localStorage mirror as backup. Root cause of the old data loss: edits lived only in
+  the DOM and persisted only via the manual Save POST, while property tabs are full
+  page loads — navigation discarded everything unsaved.
+- **Rooms like ReiSearch**: Private/Shared bath, bath group (A/B, AABB pattern), Gross
+  Rent $/wk + $/mo (bidirectionally synced), Vacancy % stepper, effective Weekly/Monthly,
+  per-room amenities. "Add Room" inherits the previous room's rent/vacancy pattern.
+  First-days booking fee now uses ReiSearch's per-room formula (weekly rent ÷ 7 × days).
+- **Funding Source cards**: "FHA · Subject-To"-style titles (loan type · preset), Loan
+  Position, Existing Loan Type, Loan Balance, Interest Rate, Remaining Term (Months/Years),
+  Points, Fees, Payment Type (Amortized | Interest Only | Principal Only | Fixed Payment),
+  Taxes/Insurance escrow, Monthly payment line, Open Calculator. Points+fees count in
+  Estimated Financing Costs and Cash Needed. Funding Snapshot gains a status badge
+  (Not Funded / Partially Funded / Fully Funded). Subject-To on a Flip creates the card
+  from the property's existing loan; on rentals it still uses Existing Mortgage Data.
+- **Sidebar Overview parity**: scenario chips (Break Even −10% | Proforma | Fully
+  Booked +10%), Monthly Cash Flow box with Expenses %/Cash Flow % bar, ROI Metrics
+  (CoC, Cap Rate, DSCR, Annual Cash Flow, Return of Capital), Deal Score insight line
+  ("Strongest: … / Weak spot: …"), Loan Amortization mini-chart + annual table in the
+  sidebar, View Details / View Full Analysis links.
+- **Math corrections proven by the Senisa fixture**: All-in Cost now includes sale costs
+  (commission + seller closing); $0 taxes/insurance sanity defaults fire only when the
+  deal has no loan payment (they are inside PITI when one exists — no double count);
+  Flip Deal Score can reach 0 ("Weak") like ReiSearch.

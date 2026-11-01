@@ -189,3 +189,66 @@ details.acc.sub{margin-top:10px;background:#f8fafc}
 .moneyblock h4{margin:0 0 7px;font-size:13px}
 .gapalert{background:#fef3c7;border:1px solid #fde68a;color:#92400e;border-radius:8px;padding:9px 12px;font-size:13px;margin-top:10px}
 .rehab-calc,.rehab-est{border:1px dashed #cbd5e1;border-radius:10px;padding:10px 12px;margin-bottom:10px}
+
+/* ---- v1.5: autosave pill, summary panels, funding cards, chips, amort mini ---- */
+.autopill{display:inline-block;background:#dcfce7;color:#166534;border:1px solid #86efac;border-radius:99px;padding:2px 10px;font-size:12px;font-weight:700;margin-left:10px;vertical-align:middle}
+.uw-head{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+.secgrid{display:grid;grid-template-columns:1fr;gap:14px;align-items:start}
+.sumpanel{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:grid;grid-template-columns:1fr 1fr;column-gap:24px}
+.sumpanel .sump-head{grid-column:1/-1}
+.sumpanel .srow.tot{grid-column:1/-1}
+@media(max-width:700px){.sumpanel{grid-template-columns:1fr}}
+.rrow .r-del{width:26px;padding:3px 0;text-align:center}
+.sump-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.sump-head h4{margin:0}
+.ptoggle{display:inline-flex;gap:2px}
+.ptoggle button{border:1px solid var(--line);background:#fff;padding:2px 9px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer}
+.ptoggle button.on{background:var(--accent2);color:#fff;border-color:var(--accent2)}
+.gtot{float:right;font-size:12px;color:var(--muted);font-weight:600}
+.disp{padding:7px 0;font-size:14px}
+.rhead.r15,.rrow.r15{display:grid;grid-template-columns:46px 88px 62px minmax(74px,1fr) minmax(74px,1fr) 108px 66px 78px 100px 30px;gap:7px;align-items:center}
+.r-vacwrap{display:flex;gap:3px;align-items:center}
+.r-vacwrap input{width:52px}
+.r-vacstep{border:1px solid var(--line);background:#fff;border-radius:6px;width:22px;height:26px;cursor:pointer;font-weight:700;line-height:1}
+.r-amenwrap{display:flex;gap:4px;align-items:center}
+.r-amenmo{width:64px}
+.r-effwk{background:#f1f5f9}
+.fundgrid{display:grid;grid-template-columns:1fr 320px;gap:16px;align-items:start}
+@media(max-width:1100px){.fundgrid{grid-template-columns:1fr}}
+.fcard{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px;background:#fff}
+.fcard-h{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.f-title{font-weight:800;font-size:15px}
+.f-poslab{font-size:12px;color:var(--muted);margin-left:auto}
+.fgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px}
+.ffield label{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}
+.fterm{display:flex;gap:5px}
+.fterm input{flex:1}
+.fseg{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:11px}
+.fseg-lab{font-size:12px;color:var(--muted);margin-right:4px}
+.f-pt{border:1px solid var(--line);background:#fff;padding:5px 11px;border-radius:99px;font-size:12px;font-weight:600;cursor:pointer}
+.f-pt.on{background:var(--accent2);color:#fff;border-color:var(--accent2)}
+.f-fixed{width:110px}
+.fpay{margin-top:10px;font-size:14px}
+.fpay b{font-size:16px}
+.fbadge{float:right;font-size:11px;font-weight:700;border-radius:99px;padding:2px 9px;background:#e2e8f0;color:#334155}
+.fbadge.part{background:#fef3c7;color:#92400e}
+.fbadge.full{background:#dcfce7;color:#166534}
+.fbadge.none{background:#fee2e2;color:#991b1b}
+.snapcard{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.chips{display:flex;gap:5px;flex-wrap:wrap;margin:10px 0}
+.chips button{border:1px solid #24405c;background:#1d3850;color:#dbe7f2;padding:5px 10px;border-radius:99px;font-size:11.5px;font-weight:600;cursor:pointer}
+.chips button.on{background:var(--accent2);color:#fff;border-color:var(--accent2)}
+.cfbox{background:#17334d;border-radius:10px;padding:11px 13px;margin:10px 0}
+.cfbox h4{margin:0 0 6px;color:#fff}
+.cfbar{display:flex;height:9px;border-radius:99px;overflow:hidden;background:#24405c;margin-top:9px}
+.cfseg{height:100%}
+.cfseg.exp{background:#dc2626}
+.cfseg.debt{background:#d97706}
+.cfseg.cf{background:#16a34a}
+.insight{color:#dbe7f2;margin:4px 0}
+.am-chart{display:flex;gap:2px;align-items:flex-end;height:52px;margin:6px 0}
+.am-bar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%}
+.am-i{background:#d97706}
+.am-p{background:#2563eb}
+.am-tab{width:100%;font-size:11.5px}
+.am-det summary{cursor:pointer;color:#9db8cf}

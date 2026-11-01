@@ -3,7 +3,9 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏠</text></svg>">
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet.css') }}">
-<script src="{{ url_for('static', filename='vendor/leaflet.js') }}"></script></head>
+<script src="{{ url_for('static', filename='vendor/leaflet.js') }}"></script>
+<script src="https://us-assets.i.posthog.com/static/array.js" async></script>
+<script>window.addEventListener('load',function(){if(window.posthog){posthog.init('phc_r6MLtMTBCsWT8b2UkasUoEKsgasX9QHs6ibH4nfZREES',{api_host:'https://us.i.posthog.com',capture_pageview:true})}})</script></head>
 <body><div class="layout">
 <nav class="sidenav"><div class="brand">🏠 Deal Analyzer</div>
 <a href="{{ url_for('dashboard') }}">Dashboard</a>
