@@ -102,8 +102,14 @@ def init_db():
     d = sqlite3.connect(DB_PATH); d.executescript(SCHEMA)
     # migrations for existing DBs: v1.1 amenity cache; v1.2 photo gallery + demographics cache
     cols = [r[1] for r in d.execute("PRAGMA table_info(properties)")]
-    for col in ("amenities_json", "amenities_date", "photos_json", "photos_date", "demo_json", "demo_date"):
+    for col in ("amenities_json", "amenities_date", "photos_json", "photos_date", "demo_json", "demo_date",
+                "demo_error", "amenities_error"):
         if col not in cols: d.execute(f"ALTER TABLE properties ADD COLUMN {col} TEXT")
+    ccols = [r[1] for r in d.execute("PRAGMA table_info(comps)")]
+    if "ptype" not in ccols: d.execute("ALTER TABLE comps ADD COLUMN ptype TEXT")
+    if "lot_sqft" not in ccols: d.execute("ALTER TABLE comps ADD COLUMN lot_sqft REAL")
+    jcols = [r[1] for r in d.execute("PRAGMA table_info(jobs)")]
+    if "dismissed" not in jcols: d.execute("ALTER TABLE jobs ADD COLUMN dismissed INTEGER DEFAULT 0")
     d.commit(); d.close()
 
 # Schema creation must happen at import time, not only under __main__: production
@@ -232,20 +238,47 @@ def fema_flood(lat, lon):
             continue
     return ("Not found", "FEMA NFHL (hazards.fema.gov)", today)
 
+COMP_WEIGHT_DEFAULTS = {"distance": 30, "sqft": 20, "beds": 14, "baths": 14, "year": 14, "lot": 8}
+
+def comp_weights():
+    """Comp match weights from app settings (Weights dialog on the Comparables tab),
+    ReiSearch pass-2 defaults: Distance 30 / Sqft 20 / Beds 14 / Baths 14 / Year 14 / Lot 8."""
+    try: w = json.loads(get_setting("comp_weights") or "{}")
+    except Exception: w = {}
+    out = {}
+    for k, dv in COMP_WEIGHT_DEFAULTS.items():
+        v = fnum(w.get(k), None)
+        out[k] = v if (v is not None and v >= 0) else dv
+    if sum(out.values()) <= 0: return dict(COMP_WEIGHT_DEFAULTS)
+    return out
+
 def score_breakdown(subj, comp):
-    """ReiSearch weights: distance 40, sqft 20, beds 13, baths 13, year built 13.
-    Returns weighted points per component (sums to the match score). One score, used everywhere."""
+    """ReiSearch comp-match model (pass 2): SIX factors — Distance, Sqft, Beds, Baths,
+    Year Built, Lot Size — with editable weights (defaults 30/20/14/14/14/8) and
+    tolerances 1 mi / 35% of subject sqft / 2 bd / 2 ba / 20 yrs / 50% of subject lot.
+    Points are each factor's normalized share of 100, so the total stays a 0-100
+    match score whatever weights are saved. Missing data scores a neutral 0.5.
+    One score, used everywhere."""
+    w = comp_weights()
+    tot = sum(w.values()) or 100
+    def share(k): return w[k] / tot * 100
     def closeness(a, b, tol):
+        a = fnum(a, None); b = fnum(b, None)
         if a is None or b is None: return 0.5
         return max(0.0, 1.0 - abs(a - b) / tol)
     d = comp.get("distance_mi")
-    d_score = 0.5 if d is None else max(0.0, 1.0 - d / 2.0)          # 0 mi = 1.0, 2+ mi = 0
+    d_score = 0.5 if d is None else max(0.0, 1.0 - d / 1.0)          # 0 mi = 1.0, 1+ mi = 0
+    sq = subj.get("sqft") or 1500
+    lot = subj.get("lot_sqft")
+    lot_c = closeness(comp.get("lot_sqft"), lot, lot * 0.5) if lot else 0.5
+    def lab(name, k): return f"{name} ({share(k):.0f})"
     return {
-        "Distance (40)": round(40 * d_score, 1),
-        "Sqft (20)": round(20 * closeness(comp.get("sqft"), subj.get("sqft"), (subj.get("sqft") or 1500)), 1),
-        "Beds (13)": round(13 * closeness(comp.get("beds"), subj.get("beds"), 3), 1),
-        "Baths (13)": round(13 * closeness(comp.get("baths"), subj.get("baths"), 2.5), 1),
-        "Year built (13)": round(13 * closeness(comp.get("year_built"), subj.get("year_built"), 50), 1),
+        lab("Distance", "distance"): round(share("distance") * d_score, 1),
+        lab("Sqft", "sqft"): round(share("sqft") * closeness(comp.get("sqft"), subj.get("sqft"), sq * 0.35), 1),
+        lab("Beds", "beds"): round(share("beds") * closeness(comp.get("beds"), subj.get("beds"), 2), 1),
+        lab("Baths", "baths"): round(share("baths") * closeness(comp.get("baths"), subj.get("baths"), 2), 1),
+        lab("Year built", "year"): round(share("year") * closeness(comp.get("year_built"), subj.get("year_built"), 20), 1),
+        lab("Lot size", "lot"): round(share("lot") * lot_c, 1),
     }
 
 def match_score(subj, comp):
@@ -350,7 +383,7 @@ def room_estimate_weekly(comp):
 
 def pinned_sold_stats(sold):
     """Sold-view header averages from the PINNED set (falls back to top 3 by score, labeled)."""
-    pool = [c for c in sold if c["price"]]
+    pool = [c for c in sold if c["price"] and c["kind"] == "sold"]
     if not pool: return None
     pinned = [c for c in pool if c["pinned"]]
     basis = pinned or sorted(pool, key=lambda c: -(c["match_score"] or 0))[:3]
@@ -459,10 +492,39 @@ def _row_payment(f):
     elif pt == "interest_only":
         pay = amt * rate / 100 / 12
     elif pt == "principal_only":
-        pay = amt / months if months else 0.0
+        # ReiSearch: Principal Only = monthly interest + straight-line principal (balance / amort months)
+        pay = amt * rate / 100 / 12 + (amt / months if months else 0.0)
     else:
         pay = _loan_payment(amt, rate, months / 12 if months else 0)
     return pay, (fnum(f.get("taxes_mo"), 0) or 0) + (fnum(f.get("insurance_mo"), 0) or 0)
+
+def _paydown_y1(f):
+    """Year-1 principal paydown for one funding card, by payment type.
+    Interest Only pays NO principal (balance flat) — v1.6 fix: the old code ran the
+    generic amortization table for IO loans and booked the whole balance as paydown."""
+    if (f.get("type") or "") in ("Cash", "Equity"):
+        return 0.0
+    amt = fnum(f.get("amount"), 0) or 0
+    if amt <= 0: return 0.0
+    rate = fnum(f.get("rate"), 0) or 0
+    tv = fnum(f.get("term_value"), 0) or 0
+    months = tv if (f.get("term_unit") or "Months") == "Months" else tv * 12
+    pt = f.get("payment_type") or "amortized"
+    if pt == "interest_only":
+        return 0.0
+    if pt == "principal_only":
+        return min(amt, amt / months * 12) if months else 0.0
+    if pt == "fixed":
+        pay = fnum(f.get("fixed_payment"), 0) or 0
+    else:
+        pay = _loan_payment(amt, rate, months / 12 if months else 0)
+    if pay <= 0: return 0.0
+    r = rate / 100 / 12; bal = amt; prin = 0.0
+    for _ in range(12):
+        if bal <= 0: break
+        p = min(max(pay - bal * r, 0.0), bal)
+        prin += p; bal -= p
+    return prin
 
 def canon_inputs(strategy, inp, prop):
     """Translate stored/legacy (v1.2) scenario inputs into the v1.3 canonical field set.
@@ -550,6 +612,7 @@ def compute_underwriting(strategy, raw_inp, prop):
     funded = cash_equity = debt_amt = debt_rows_service = 0.0
     paydown_y1 = 0.0
     points_fees = 0.0
+    debt_lines = []
     for s in stack:
         amt = fnum(s.get("amount"), 0) or 0
         funded += amt
@@ -560,12 +623,10 @@ def compute_underwriting(strategy, raw_inp, prop):
             debt_amt += amt
             pay, esc = _row_payment(s)
             debt_rows_service += pay + esc
-            yrs = fnum(s.get("term_years"), 0) or 0
-            if s.get("payment_type") == "principal_only" and amt > 0:
-                paydown_y1 += min(amt, pay * 12)
-            elif yrs > 0 and amt > 0:
-                am = amortization(amt, fnum(s.get("rate"), 0) or 0, yrs, 1)
-                if am["rows"]: paydown_y1 += am["rows"][0]["principal"]
+            paydown_y1 += _paydown_y1(s)
+            lab = s.get("loan_type") or s.get("type") or "Loan"
+            if s.get("preset") and s.get("preset") != lab: lab = f"{lab} · {s['preset']}"
+            debt_lines.append({"label": lab, "payment": round(pay + esc)})
     # existing mortgage data (all strategies except Fix & Flip)
     entry_fee = md_payment = 0.0
     if strategy != "Fix & Flip":
@@ -577,8 +638,14 @@ def compute_underwriting(strategy, raw_inp, prop):
     financing_costs = closing + points_fees
     uses = total_project + holding_total
     gap = uses - funded
-    # Cash/equity stack lines ARE cash invested; any unfunded gap is also cash (v1.2 fix).
-    cash_in = cash_equity + max(gap, 0) + financing_costs + entry_fee
+    # v1.6 Cash Needed semantics (ReiSearch): cash contributions + points/fees + closing
+    # + entry fee. A loan-only funding GAP does not inflate Cash Needed on rentals
+    # (ReiSearch: Conventional 80% loan -> Cash Needed $0, CoC "—"). Fix & Flip keeps
+    # the gap in Cash Needed — the flip buyer brings the gap in cash at closing
+    # (Senisa fixture: gap $61,684 = Cash Needed $61,684).
+    cash_in = cash_equity + points_fees + closing + entry_fee
+    if strategy == "Fix & Flip":
+        cash_in += max(gap, 0)
     if funded <= 0:
         funding_status = "Not Funded"
     elif gap <= 0:
@@ -592,7 +659,10 @@ def compute_underwriting(strategy, raw_inp, prop):
            "holding_months": round(h_months, 2), "uses": round(uses), "funded": round(funded),
            "gap": round(gap), "cash_in": round(cash_in), "financing_costs": round(financing_costs),
            "funding_status": funding_status,
-           "debt_service_mo": round(debt_service), "entry_fee": round(entry_fee)}
+           "debt_service_mo": round(debt_service), "entry_fee": round(entry_fee),
+           "cash_contrib": round(cash_equity), "points_fees": round(points_fees),
+           "closing_costs": round(closing), "debt_lines": debt_lines,
+           "md_payment_mo": round(md_payment)}
 
     if strategy == "Fix & Flip":
         sale = fnum(inp.get("sale_price"), 0) or arv
@@ -639,13 +709,38 @@ def compute_underwriting(strategy, raw_inp, prop):
     penalties, flags = [], []
     taxes_mo = fnum(inp.get("taxes_mo"), 0) or 0
     ins_mo = fnum(inp.get("insurance_mo"), 0) or 0
+    # v1.6 standard-numbers rule (Sherif): standard costs AUTO-POPULATE visibly in their
+    # fields as editable defaults — the real annual tax from the property record / 12
+    # where known, else a labeled estimate. The UI writes the estimate into the field
+    # (flagged taxes_est/insurance_est) so fields and totals tie out on screen; the
+    # estimate withdraws automatically when a loan payment exists (taxes/insurance then
+    # live inside PITI) and never touches a value the user typed themselves.
+    prop_tax_mo = 0
+    if prop is not None:
+        try: prop_tax_mo = round((fnum(prop["tax_amount"], 0) or 0) / 12)
+        except Exception: prop_tax_mo = 0
+    def _est_flag(k):
+        return str(inp.get(k) or "") in ("1", "True", "true")
+    taxes_est = ins_est = False
     if debt_service == 0 and taxes_mo == 0:
-        taxes_mo = round((price or arv) * 0.011 / 12) if (price or arv) else 0
-        penalties.append({"points": 6, "reason": "Taxes were $0 — sanity default applied (1.1% of price/yr, county-style estimate)"})
+        taxes_mo = prop_tax_mo or (round((price or arv) * 0.011 / 12) if (price or arv) else 0)
+        taxes_est = taxes_mo > 0
+        if taxes_est:
+            src = "county tax record" if prop_tax_mo else "1.1% of price/yr estimate"
+            penalties.append({"points": 6, "reason": f"Taxes were $0 — auto-estimate applied ({src}), shown in the field"})
+            flags.append("Taxes estimated — verify with county")
+    elif debt_service == 0 and _est_flag("taxes_est") and taxes_mo > 0:
+        taxes_est = True
+        penalties.append({"points": 6, "reason": "Taxes are an auto-estimate (shown in the field) — verify with county"})
         flags.append("Taxes estimated — verify with county")
     if debt_service == 0 and ins_mo == 0:
         ins_mo = 180
-        penalties.append({"points": 6, "reason": "Insurance was $0 — sanity default applied ($180/mo estimate)"})
+        ins_est = True
+        penalties.append({"points": 6, "reason": "Insurance was $0 — auto-estimate applied ($180/mo estimate), shown in the field"})
+        flags.append("Insurance estimated")
+    elif debt_service == 0 and _est_flag("insurance_est") and ins_mo > 0:
+        ins_est = True
+        penalties.append({"points": 6, "reason": "Insurance is an auto-estimate (shown in the field) — verify"})
         flags.append("Insurance estimated")
     # revenue
     cleaning_income = 0.0
@@ -718,7 +813,12 @@ def compute_underwriting(strategy, raw_inp, prop):
                "downside_cf": (egi * 0.9 - opex - debt_service)}
     def _scen(mult, no_vac=False):
         e2 = gross + other if no_vac else (gross - vac_loss) * mult + other
-        return {"revenue": round(e2), "expenses": round(opex + debt_service), "net": round(e2 - opex - debt_service)}
+        noi_s = e2 - opex
+        return {"revenue": round(e2), "expenses": round(opex), "loan": round(debt_service),
+                "net": round(e2 - opex - debt_service),
+                "dscr": round(noi_s / debt_service, 2) if debt_service else (1.5 if noi_s > 0 else 0),
+                "cap_rate_pct": round(noi_s * 12 / value * 100, 2) if value else 0,
+                "coc_pct": round((e2 - opex - debt_service) * 12 / cash_in * 100, 1) if cash_in else None}
     scen = {"Downside (-10%)": _scen(0.9), "Base Case (0%)": _scen(1.0), "Upside (+10%)": _scen(1.1)}
     if strategy == "Co-Living":
         scen["Fully Booked (0% vacancy)"] = _scen(1.0, no_vac=True)
@@ -740,10 +840,12 @@ def compute_underwriting(strategy, raw_inp, prop):
                 "platform_fee_mo": round(platform_fee),
                 "service_fee_mo": round(service_fee), "mgmt_fee_mo": round(mgmt_fee),
                 "egi_mo": round(egi), "opex_mo": round(opex), "opex_cats": opex_cats,
-                "taxes_mo": taxes_mo, "insurance_mo": ins_mo, "noi_mo": round(noi),
+                "taxes_mo": taxes_mo, "insurance_mo": ins_mo,
+                "taxes_est": taxes_est, "insurance_est": ins_est, "noi_mo": round(noi),
                 "cashflow_mo": round(cf), "cf_per_room": round(metrics["cf_per_room"]),
                 "cash_per_room": round(cash_in / rooms_n) if rooms_n else None,
-                "dscr": round(metrics["dscr"], 2), "coc_pct": round(metrics["coc"] * 100, 1),
+                "dscr": round(metrics["dscr"], 2),
+                "coc_pct": round(metrics["coc"] * 100, 1) if cash_in else None,
                 "cap_rate_pct": round(metrics["cap_rate"] * 100, 2),
                 "breakeven_pct": round(metrics["breakeven"] * 100, 1),
                 "payback_yrs": round(1 / metrics["coc"], 1) if metrics["coc"] > 0 else None,
@@ -912,6 +1014,7 @@ def uw_state(strategy, prop, saved_inp, ctx):
                   "landscaping_mo", "pest_mo", "handyman_mo", "property_manager_mo",
                   "turnover_reserve_mo", "additional_insurance_mo", "taxes_mo", "insurance_mo", "hoa_mo"):
             st[k] = g(k, template.get(k, 0) if fresh else 0)
+        st["taxes_est"] = g("taxes_est", ""); st["insurance_est"] = g("insurance_est", "")
         # legacy aggregates surface as fallbacks in compute; show them on the matching first line
         if not any(fnum(st[k], 0) for k in ("electric_mo", "water_mo", "gas_mo", "internet_mo")) and fnum(inp.get("utilities_mo"), 0):
             st["electric_mo"] = inp.get("utilities_mo")
@@ -927,6 +1030,15 @@ def uw_state(strategy, prop, saved_inp, ctx):
     return st
 
 
+def _norm_ptype(raw):
+    """HomeHarvest 'style' text -> Market Data filter bucket."""
+    t = (raw or "").lower()
+    if "condo" in t: return "Condo"
+    if "townhouse" in t or "townhome" in t or "town house" in t: return "Townhouse"
+    if "multi" in t: return "Multi-Family"
+    if t: return "Single Family"
+    return None
+
 # ---------------------------------------------------------------- comps pull (HomeHarvest)
 def pull_comps(prop, radius_mi=1.0, past_days=365):
     """ZIP-mode query + post-filter on ZIP and coordinates. NEVER raw full-address mode (mis-resolves).
@@ -939,7 +1051,7 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     warnings = []
     sold = scrape_property(location=prop["zip"], listing_type="sold", past_days=past_days)
     added = updated = 0; n_sold = 0
-    subj = {"sqft": prop["sqft"], "beds": prop["beds"], "baths": prop["baths"], "year_built": prop["year_built"]}
+    subj = {"sqft": prop["sqft"], "beds": prop["beds"], "baths": prop["baths"], "year_built": prop["year_built"], "lot_sqft": prop["lot_sqft"]}
     for _, r in sold.iterrows():
         if str(r.get("zip_code")) != str(prop["zip"]): continue
         lat, lon = r.get("latitude"), r.get("longitude")
@@ -958,10 +1070,13 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                     year_built=int(r["year_built"]) if fnum(r.get("year_built")) else None,
                     event_date=_s(r.get("last_sold_date"))[:10] or None,
                     dom=fnum(r.get("days_on_mls")), lat=float(lat), lon=float(lon), distance_mi=dist,
+                    lot_sqft=fnum(r.get("lot_sqft")),
+                    ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
                     source="HomeHarvest (Realtor.com)", source_url=_s(r.get("property_url")),
                     photo_url=_s(r.get("primary_photo")))
         vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
-                                                 "baths": vals["baths"], "year_built": vals["year_built"]})
+                                                 "baths": vals["baths"], "year_built": vals["year_built"],
+                                                 "lot_sqft": vals["lot_sqft"]})
         ex = d.execute("SELECT id FROM comps WHERE property_id=? AND kind='sold' AND address=? AND price=?",
                        (prop["id"], addr, price)).fetchone()
         cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
@@ -989,10 +1104,13 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                         year_built=int(r["year_built"]) if fnum(r.get("year_built")) else None,
                         event_date=None, dom=fnum(r.get("days_on_mls")),
                         lat=float(lat), lon=float(lon), distance_mi=dist,
+                        lot_sqft=fnum(r.get("lot_sqft")),
+                        ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
                         source="HomeHarvest (Realtor.com rentals)", source_url=_s(r.get("property_url")),
                         photo_url=_s(r.get("primary_photo")))
             vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
-                                                     "baths": vals["baths"], "year_built": vals["year_built"]})
+                                                     "baths": vals["baths"], "year_built": vals["year_built"],
+                                                     "lot_sqft": vals["lot_sqft"]})
             ex = d.execute("SELECT id FROM comps WHERE property_id=? AND kind='rent' AND address=? AND price=?",
                            (prop["id"], addr, price)).fetchone()
             cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
@@ -1016,6 +1134,16 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         srow = find_subject_row(sold, prop)
     if srow is None:
         srow = find_subject_row(rent_df, prop)
+    if srow is None:
+        # v1.6 (item N): DEEP subject lookup — the subject's own last sale is often
+        # older than the comp window, so the frames above miss it and photos/specs
+        # never populate. One wider sold scrape (10 years, ZIP mode) finds the
+        # subject's own listing row: photos + blank specs come from it.
+        try:
+            deep = scrape_property(location=prop["zip"], listing_type="sold", past_days=3650)
+            srow = find_subject_row(deep, prop)
+        except Exception as e:
+            warnings.append(f"deep subject lookup failed ({e})")
     if srow is not None:
         photos = extract_photos(srow)
         fills = {}
@@ -1050,33 +1178,291 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     return {"added": added, "updated": updated, "sold": total_sold, "rentals": total_rent,
             "sold_new": n_sold, "photos": photos_found, "warnings": warnings, "date": today}
 
-def census_demographics(zip_code, city=None, state_fips="12"):
-    """Keyless Census ACS 5-year. ZIP (ZCTA) + optional city (place) basics."""
-    key = get_setting("census_key"); out = {"zip": None, "city": None, "source": "US Census ACS 2023 5-year (api.census.gov)", "date": datetime.date.today().isoformat()}
-    vars_ = "NAME,B01003_001E,B25077_001E,B25064_001E,B19013_001E,B25003_002E,B25003_003E,B23025_005E,B23025_003E"
-    def fetch(geo_params):
-        p = {"get": vars_, "for": geo_params}
+ACS_YEAR = 2023
+STATE_FIPS = {"AL": "01", "AK": "02", "AZ": "04", "AR": "05", "CA": "06", "CO": "08", "CT": "09",
+              "DE": "10", "DC": "11", "FL": "12", "GA": "13", "HI": "15", "ID": "16", "IL": "17",
+              "IN": "18", "IA": "19", "KS": "20", "KY": "21", "LA": "22", "ME": "23", "MD": "24",
+              "MA": "25", "MI": "26", "MN": "27", "MS": "28", "MO": "29", "MT": "30", "NE": "31",
+              "NV": "32", "NH": "33", "NJ": "34", "NM": "35", "NY": "36", "NC": "37", "ND": "38",
+              "OH": "39", "OK": "40", "OR": "41", "PA": "42", "RI": "44", "SC": "45", "SD": "46",
+              "TN": "47", "TX": "48", "UT": "49", "VT": "50", "VA": "51", "WA": "53", "WV": "54",
+              "WI": "55", "WY": "56"}
+
+def _census_key():
+    """Census DATA API key: env CENSUS_API_KEY first (v1.6 — the data API now requires
+    a key and 302s to a 'Missing Key' page without one), then the settings store."""
+    return os.environ.get("CENSUS_API_KEY") or get_setting("census_key") or ""
+
+def _acs_fetch(year, varlist, geo_params):
+    """One ACS 5-year query -> {var: value} dict, or None on any failure.
+    The Census *geocoder* is keyless; the *data* API needs the key when configured."""
+    key = _census_key()
+    for path in (f"https://api.census.gov/data/{year}/acs/acs5", f"https://api.census.gov/data/{year}/acs5"):
+        try:
+            p = {"get": varlist, "for": geo_params}
+            if key: p["key"] = key
+            r = requests.get(path, params=p, timeout=10)
+            rows = r.json()
+            if isinstance(rows, list) and len(rows) >= 2:
+                return dict(zip(rows[0], rows[1]))
+        except Exception:
+            continue
+    return None
+
+def _acs_num(d, k):
+    x = fnum((d or {}).get(k))
+    return x if x is not None and x > 0 else None
+
+def _income_buckets(d):
+    """B19001 16 brackets -> ReiSearch's 4 buckets (<25k / 25-50k / 50-100k / >100k)."""
+    if not d: return []
+    total = _acs_num(d, "B19001_001E")
+    if not total: return []
+    groups = [("<$25k", (2, 3, 4, 5)), ("$25–50k", (6, 7, 8, 9, 10)),
+              ("$50–100k", (11, 12, 13)), (">$100k", (14, 15, 16, 17))]
+    out = []
+    for lab, idxs in groups:
+        c = sum(_acs_num(d, f"B19001_{i:03d}E") or 0 for i in idxs)
+        out.append({"label": lab, "count": int(c), "pct": round(c / total * 100, 1)})
+    return out
+
+_RACE_DEFS = [("White", "B02001_002E", "#2563eb"), ("Hispanic or Latino", "B03003_003E", "#d97706"),
+              ("Black", "B02001_003E", "#16a34a"), ("Asian", "B02001_005E", "#7c3aed"),
+              ("Two or More", "B02001_008E", "#db2777"), ("Other", "B02001_007E", "#64748b"),
+              ("Native American", "B02001_004E", "#0891b2"), ("Native Hawaiian / Pacific Isl.", "B02001_006E", "#94a3b8")]
+
+def _race_table(d, pop):
+    if not d or not pop: return []
+    out = []
+    for lab, var, color in _RACE_DEFS:
+        c = _acs_num(d, var)
+        if c is None: continue
+        out.append({"label": lab, "count": int(c), "pct": round(c / pop * 100, 1), "color": color})
+    out.sort(key=lambda x: -x["count"])
+    acc = 0.0  # conic-gradient stops for the donut
+    for e in out:
+        e["from"] = round(acc, 1); acc += e["pct"]; e["to"] = round(min(acc, 100.0), 1)
+    return out
+
+def _age_pyramid(d):
+    """B01001 sex-by-age cells -> 5-year bands (male left / female right)."""
+    if not d: return []
+    def cell(sex_off, i): return _acs_num(d, f"B01001_{sex_off + i:03d}E") or 0
+    bands = [("0–4", (3,)), ("5–9", (4,)), ("10–14", (5,)), ("15–19", (6, 7)),
+             ("20–24", (8, 9, 10)), ("25–29", (11,)), ("30–34", (12,)), ("35–39", (13,)),
+             ("40–44", (14,)), ("45–49", (15,)), ("50–54", (16,)), ("55–59", (17,)),
+             ("60–64", (18, 19)), ("65–69", (20, 21)), ("70–74", (22,)), ("75–79", (23,)),
+             ("80+", (24, 25))]
+    out = []
+    for lab, cells in bands:
+        m = sum(cell(0, c) for c in cells); f = sum(cell(24, c) for c in cells)
+        out.append({"band": lab, "male": int(m), "female": int(f)})
+    mx = max([max(e["male"], e["female"]) for e in out] + [1])
+    for e in out:
+        e["male_w"] = round(e["male"] / mx * 100, 1); e["female_w"] = round(e["female"] / mx * 100, 1)
+    return out
+
+def _block_from_vals(v, name=None):
+    """Dashboard block from a flat {VAR_E: value} dict (either Census source)."""
+    if not v: return None
+    pop = _acs_num(v, "B01003_001E")
+    if pop is None: return None
+    own, rent = _acs_num(v, "B25003_002E") or 0, _acs_num(v, "B25003_003E") or 0
+    un, lf = _acs_num(v, "B23025_005E"), _acs_num(v, "B23025_003E")
+    blk = {"name": v.get("NAME") or name, "population": pop,
+           "median_home_value": _acs_num(v, "B25077_001E"), "median_rent": _acs_num(v, "B25064_001E"),
+           "median_income": _acs_num(v, "B19013_001E"),
+           "owner_pct": round(own / (own + rent) * 100, 1) if (own + rent) else None,
+           "renter_pct": round(rent / (own + rent) * 100, 1) if (own + rent) else None,
+           "unemployment_pct": round(un / lf * 100, 2) if un and lf else None}
+    blk["income_buckets"] = _income_buckets(v)
+    blk["race"] = _race_table(v, pop)
+    blk["pyramid"] = _age_pyramid(v)
+    return blk
+
+def _geo_block(geo_params, year=ACS_YEAR):
+    """Direct api.census.gov path (OPTIONAL ALTERNATE — needs CENSUS_API_KEY)."""
+    core = _acs_fetch(year, "NAME,B01003_001E,B25077_001E,B25064_001E,B19013_001E,"
+                            "B25003_002E,B25003_003E,B23025_003E,B23025_005E", geo_params)
+    if not core: return None
+    merged = dict(core)
+    for varlist in (",".join(["B19001_001E"] + [f"B19001_{i:03d}E" for i in range(2, 18)]),
+                    "B02001_001E,B02001_002E,B02001_003E,B02001_004E,B02001_005E,"
+                    "B02001_006E,B02001_007E,B02001_008E,B03003_003E",
+                    ",".join(["B01001_001E"] + [f"B01001_{i:03d}E" for i in range(3, 26)]
+                             + [f"B01001_{i:03d}E" for i in range(27, 50)])):
+        d = _acs_fetch(year, varlist, geo_params)
+        if d: merged.update(d)
+    return _block_from_vals(merged)
+
+# ------------------------------------------------ Census Reporter (PRIMARY, keyless)
+CR_TABLES = "B01003,B01001,B19001,B19013,B02001,B03003,B25003,B25064,B25077,B23025"
+
+def _cr_fetch(geo_id, release="latest", tables=CR_TABLES):
+    """Census Reporter API (NO key): one call -> flat {B01003_001E: value} dict in
+    api.census.gov naming + the release label. Latest-release responses are cached
+    server-side per geography in settings (30 days) so repeat opens are instant."""
+    ck = f"crvals_{release}_{geo_id}"
+    if release == "latest":
+        try:
+            cached = json.loads(get_setting(ck) or "{}")
+            if cached.get("vals") and cached.get("date") and \
+                    (datetime.date.today() - datetime.date.fromisoformat(cached["date"])).days < 30:
+                return cached["vals"], cached.get("rel") or "ACS 5-year"
+        except Exception:
+            pass
+    r = requests.get(f"https://api.censusreporter.org/1.0/data/show/{release}",
+                     params={"table_ids": tables, "geo_ids": geo_id}, timeout=60,
+                     headers={"User-Agent": "PropertyDealAnalyzer/1.6 (Census Reporter client)"})
+    r.raise_for_status()
+    j = r.json()
+    rel = ((j.get("release") or {}).get("name") or "ACS 5-year").replace("_", " ")
+    vals = {}
+    for t, blk in ((j.get("data") or {}).get(geo_id) or {}).items():
+        for code, v in ((blk or {}).get("estimate") or {}).items():
+            m = re.match(r"^(B\d{5})(\d{3})$", str(code))
+            if m: vals[f"{m.group(1)}_{m.group(2)}E"] = v
+    if vals and release == "latest":
+        try: set_setting(ck, json.dumps({"vals": vals, "rel": rel,
+                                         "date": datetime.date.today().isoformat()}))
+        except Exception: pass
+    return vals, rel
+
+def _geo_block_any(geo_id, name, direct_params):
+    """Dashboard block for one geography: Census Reporter first (keyless);
+    the keyed direct Census API only as an optional alternate. Returns (block, source)."""
+    try:
+        vals, rel = _cr_fetch(geo_id)
+    except Exception:
+        vals, rel = {}, None
+    if vals:
+        blk = _block_from_vals(vals, name)
+        if blk: return blk, f"US Census {rel} via Census Reporter"
+    if direct_params and _census_key():
+        blk = _geo_block(direct_params)
+        if blk: return blk, "US Census ACS 5-year (api.census.gov, keyed alternate)"
+    return None, None
+
+def _growth_series(pts):
+    pts.sort(key=lambda x: x["year"])
+    for i, pt in enumerate(pts):
+        if i and pts[i - 1]["pop"]:
+            pt["growth"] = round((pt["pop"] - pts[i - 1]["pop"]) / pts[i - 1]["pop"] * 100, 2)
+        else: pt["growth"] = None
+        prev_g = pts[i - 1].get("growth") if i else None
+        pt["growth_change"] = round(pt["growth"] - prev_g, 2) if (pt["growth"] is not None and prev_g is not None) else None
+    return pts
+
+def _pop_trend(zip_code):
+    """Population trend via the direct API (optional alternate path)."""
+    pts = []
+    for year in range(2011, ACS_YEAR + 1):
+        d = _acs_fetch(year, "B01003_001E", f"zip code tabulation area:{zip_code}")
+        pop = _acs_num(d, "B01003_001E") if d else None
+        if pop: pts.append({"year": year, "pop": int(pop)})
+    return _growth_series(pts)
+
+def _pop_trend_cr(geo_id):
+    """Population trend from Census Reporter releases: ACS 2014 / 2019 5-year + latest."""
+    pts = []
+    for release, yr in (("acs2014_5yr", 2014), ("acs2019_5yr", 2019)):
+        try:
+            vals, _r = _cr_fetch(geo_id, release=release, tables="B01003")
+            pop = _acs_num(vals, "B01003_001E")
+            if pop: pts.append({"year": yr, "pop": int(pop)})
+        except Exception:
+            continue
+    try:
+        vals, rel = _cr_fetch(geo_id, tables="B01003")
+        pop = _acs_num(vals, "B01003_001E")
+        m = re.search(r"(20\d\d)", rel or "")
+        if pop: pts.append({"year": int(m.group(1)) if m else 2024, "pop": int(pop)})
+    except Exception:
+        pass
+    return _growth_series(pts)
+
+def census_geographies(address):
+    """Keyless Census Geocoder: address -> {state_fips, place_fips, place_name, tract}.
+    Replaces the old hard-coded FL place map (audit gap 3.10)."""
+    if not address: return None
+    try:
+        r = requests.get("https://geocoding.census.gov/geocoder/geographies/onelineaddress",
+                         params={"address": address, "benchmark": "Public_AR_2020",
+                                 "vintage": "Current_Current", "format": "json"}, timeout=10)
+        matches = ((r.json().get("result") or {}).get("addressMatches")) or []
+        if not matches: return None
+        geos = matches[0].get("geographies") or {}
+        def first(layer):
+            v = geos.get(layer) or []
+            return v[0] if v else {}
+        st = first("States")
+        pl = first("Incorporated Places") or first("Census Designated Places")
+        return {"state_fips": st.get("STATE"), "place_fips": pl.get("PLACE"),
+                "place_name": pl.get("NAME"), "tract": first("Census Tracts").get("TRACT"),
+                "county": first("Counties").get("NAME")}
+    except Exception:
+        return None
+
+def _resolve_place(city, state_abbr, address):
+    """(state_fips, place_fips) for the property's city: Census Geocoder first,
+    then a state place-list name match as fallback."""
+    geo = census_geographies(address)
+    if geo and geo.get("place_fips"):
+        return geo.get("state_fips"), geo.get("place_fips")
+    fips = STATE_FIPS.get((state_abbr or "").upper())
+    if not fips or not city: return fips, None
+    try:
+        key = _census_key()
+        p = {"get": "NAME", "for": "place:*", "in": f"state:{fips}"}
         if key: p["key"] = key
-        r = requests.get("https://api.census.gov/data/2023/acs/acs5", params=p, timeout=8)
-        rows = r.json()
-        if len(rows) < 2: return None
-        h, v = rows[0], rows[1]; d = dict(zip(h, v))
-        def n(k):
-            x = fnum(d.get(k)); return x if x is not None and x > 0 else None
-        own, rent = n("B25003_002E") or 0, n("B25003_003E") or 0
-        un, lf = n("B23025_005E"), n("B23025_003E")
-        return {"name": d.get("NAME"), "population": n("B01003_001E"), "median_home_value": n("B25077_001E"),
-                "median_rent": n("B25064_001E"), "median_income": n("B19013_001E"),
-                "owner_pct": round(own / (own + rent) * 100, 1) if (own + rent) else None,
-                "renter_pct": round(rent / (own + rent) * 100, 1) if (own + rent) else None,
-                "unemployment_pct": round(un / lf * 100, 2) if un and lf else None}
-    try: out["zip"] = fetch(f"zip code tabulation area:{zip_code}")
-    except Exception: out["zip"] = None
-    # Tampa place FIPS 1271000; generic: only attempt known FL places map for v1
-    PLACES = {"tampa": "71000", "winter springs": "78025", "kissimmee": "36975", "orlando": "53000", "jacksonville": "35000"}
-    if city and city.lower() in PLACES:
-        try: out["city"] = fetch(f"place:{PLACES[city.lower()]}&in=state:{state_fips}")
-        except Exception: out["city"] = None
+        r = requests.get(f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5", params=p, timeout=10)
+        for row in (r.json() or [])[1:]:
+            nm = (row[0] or "").lower()
+            if nm.startswith(city.lower() + ",") or nm.startswith(city.lower() + " "):
+                return fips, row[2]
+    except Exception:
+        pass
+    return fips, None
+
+def census_demographics(zip_code, city=None, state=None, address=None):
+    """Demographics dashboard data: ZIP (ZCTA) + city (place) blocks with income
+    distribution (B19001), race (B02001+B03003), age pyramid (B01001), population
+    trend, and prior-release change for home value / rent.
+    PRIMARY source: Census Reporter API (keyless, api.censusreporter.org).
+    The direct api.census.gov path remains only as an optional keyed alternate."""
+    out = {"zip": None, "city": None, "source": None,
+           "date": datetime.date.today().isoformat()}
+    zip_geo = f"86000US{zip_code}"
+    blk, src = _geo_block_any(zip_geo, f"ZCTA5 {zip_code}", f"zip code tabulation area:{zip_code}")
+    out["zip"] = blk
+    if src: out["source"] = src
+    if blk:
+        blk["pop_trend"] = _pop_trend_cr(zip_geo)
+        if len(blk["pop_trend"]) < 2 and _census_key():
+            # Census Reporter's public API serves the latest release only (older
+            # releases 403) — vintage trend falls back to the keyed direct API.
+            blk["pop_trend"] = _pop_trend(zip_code)
+        prev_vals = {}
+        try:
+            prev_vals, _r = _cr_fetch(zip_geo, release="acs2019_5yr", tables="B25077,B25064")
+        except Exception:
+            prev_vals = {}
+        if not prev_vals and _census_key():
+            prev_vals = _acs_fetch(ACS_YEAR - 5, "B25077_001E,B25064_001E",
+                                   f"zip code tabulation area:{zip_code}") or {}
+        chg = {}
+        for var, key, field in (("B25077_001E", "home_value_pct", "median_home_value"),
+                                ("B25064_001E", "rent_pct", "median_rent")):
+            cur, prev = blk[field], _acs_num(prev_vals, var)
+            chg[key] = round((cur - prev) / prev * 100, 1) if (cur and prev) else None
+        blk["change"] = chg
+    sfips, pfips = _resolve_place(city, state, address)
+    if pfips:
+        cblk, csrc = _geo_block_any(f"16000US{sfips}{pfips}", city, f"place:{pfips}&in=state:{sfips}")
+        out["city"] = cblk
+        if not out["source"] and csrc: out["source"] = csrc
+    if not out["source"]:
+        out["source"] = "US Census ACS 5-year via Census Reporter (api.censusreporter.org)"
     return out
 
 # ---------------------------------------------------------------- OSM amenities (v1.1)
@@ -1287,20 +1673,33 @@ def job_amenities(pid):
     def fn():
         p = get_prop(pid)
         res = pull_amenities(p)
-        db().execute("UPDATE properties SET amenities_json=?, amenities_date=? WHERE id=?",
+        if res.get("error"):
+            # v1.6 honest-failure: a failed refresh must NEVER destroy cached places —
+            # keep amenities_json/amenities_date, record the error for the tab notice.
+            db().execute("UPDATE properties SET amenities_error=? WHERE id=?", (res["error"], pid)); db().commit()
+            raise RuntimeError(res["error"])
+        db().execute("UPDATE properties SET amenities_json=?, amenities_date=?, amenities_error=NULL WHERE id=?",
                      (json.dumps(res), res.get("date"), pid)); db().commit()
-        if res.get("error"): raise RuntimeError(res["error"])
         return f"✓ {res['total']} nearby places found within {res['radius_mi']} mi (OpenStreetMap)"
     return start_job(pid, "amenities", fn)
 
 def job_demographics(pid):
     def fn():
         p = get_prop(pid)
-        demo = census_demographics(p["zip"], p["city"])
-        db().execute("UPDATE properties SET demo_json=?, demo_date=? WHERE id=?",
+        try:
+            demo = census_demographics(p["zip"], p["city"], p["state"], p["address"])
+        except Exception:
+            demo = None
+        if not demo or (not demo.get("zip") and not demo.get("city")):
+            # v1.6 honest-failure: keep cached demo_json/demo_date untouched; record
+            # the error so the tab shows a scoped, dismissible notice instead of a
+            # fresh 'pulled' stamp over empty data.
+            msg = ("Census data didn't come back — Census Reporter (and the Census Geocoder for the "
+                   "city scope) may be unreachable right now. Cached data, if any, is unchanged.")
+            db().execute("UPDATE properties SET demo_error=? WHERE id=?", (msg, pid)); db().commit()
+            raise RuntimeError("Census demographics failed (key/network) — see the notice on the Demographics tab")
+        db().execute("UPDATE properties SET demo_json=?, demo_date=?, demo_error=NULL WHERE id=?",
                      (json.dumps(demo), demo.get("date"), pid)); db().commit()
-        if not demo.get("zip") and not demo.get("city"):
-            raise RuntimeError("Census API didn't return data for this ZIP — it may be unreachable right now; try again shortly.")
         return f"✓ Demographics loaded for ZIP {p['zip']} (US Census ACS)"
     return start_job(pid, "demographics", fn)
 
@@ -1314,7 +1713,7 @@ def all_boxes():
     return db().execute("SELECT * FROM buy_boxes ORDER BY id").fetchall()
 
 EDITABLE = ["status","stage","deal_method","list_price","property_type","beds","baths","sqft","lot_sqft",
- "year_built","apn","hoa_dues","hoa_freq","subdivision","legal_desc","sewer","water","electric","appliances",
+ "year_built","apn","hoa_dues","hoa_freq","subdivision","legal_desc","sewer","water","appliances",
  "flooring","cooling","heating","roof_age","foundation","occupancy_now","occupancy_closing","as_is_value","arv",
  "repairs","purchase_price","inspection_days","inspection_unit","inspection_deadline","buy_it_now","min_offer",
  "wholesale_contract_amt","emd_ab","emd_bc","title_company","escrow_officer","closing_date","tc_name",
@@ -1357,7 +1756,15 @@ def add_property():
             flood_date,deal_method,status) VALUES(?,?,?,?,?,?,?,?,?,?,?, 'Draft')""",
             (full, street, geo["city"], geo["state"], geo["zip"], geo["lat"], geo["lon"], flood_zone, flood_src, flood_date, method))
         db().commit(); pid = cur.lastrowid; seed_docs(pid)
-        flash(f"Geocoded (ArcGIS score {geo['score']}) — flood zone: {flood_zone}. Now fill details and pull comps.")
+        # v1.6 (item O): auto-enrichment — a fresh property must open POPULATED like
+        # ReiSearch's does, not as an empty shell waiting on manual pulls. The comp
+        # pull also fills the subject's specs + listing photos (incl. the deep
+        # subject lookup); demographics loads from Census Reporter in parallel.
+        job_comps(pid, 1.0, 365)
+        job_demographics(pid)
+        flash(f"Geocoded (ArcGIS score {geo['score']}) — flood zone: {flood_zone}. "
+              "Setting this property up now: comps, listing photos, specs and demographics "
+              "are loading automatically (watch the banner — about a minute).")
         return redirect(url_for("property_page", pid=pid))
     return render_template("add.html")
 
@@ -1386,21 +1793,80 @@ def property_page(pid):
     rents = [c for c in comps if c["kind"] == "rent"]
     market = None
     if sold:
-        prices = sorted(c["price"] for c in sold if c["price"]); ppsfs = sorted(c["ppsf"] for c in sold if c["ppsf"])
-        doms = sorted(c["dom"] for c in sold if c["dom"])
+        # v1.6 working controls: property-type filter recomputes cards + trend +
+        # nearby table; 1Y/3Y/5Y range affects the trend only (ReiSearch semantics).
+        mtype = request.args.get("mtype", "All")
+        if mtype not in ("All", "Single Family", "Condo", "Townhouse"): mtype = "All"
+        mrange = request.args.get("mrange", "3Y")
+        if mrange not in ("1Y", "3Y", "5Y"): mrange = "3Y"
+        def _ptype_of(c): return (c["ptype"] if "ptype" in c.keys() else None) or "Single Family"  # pre-v1.6 rows/DBs carry no stored type
+        msold = [c for c in sold if mtype == "All" or _ptype_of(c) == mtype]
+        type_counts = {}
+        for c in sold: type_counts[_ptype_of(c)] = type_counts.get(_ptype_of(c), 0) + 1
+        prices = sorted(c["price"] for c in msold if c["price"]); ppsfs = sorted(c["ppsf"] for c in msold if c["ppsf"])
+        doms = sorted(c["dom"] for c in msold if c["dom"])
         med = lambda xs: xs[len(xs)//2] if xs else None
         by_month = {}
-        for c in sold:
+        for c in msold:
             if c["event_date"] and c["price"]: by_month.setdefault(c["event_date"][:7], []).append(c["price"])
-        trend = [{"month": m, "median": sorted(vv)[len(vv)//2], "count": len(vv)} for m, vv in sorted(by_month.items())]
-        market = {"count": len(sold), "median_price": med(prices), "median_ppsf": med(ppsfs), "median_dom": med(doms),
-                  "trend": trend, "source": "Computed from stored HomeHarvest sold comps", "date": datetime.date.today().isoformat()}
+        trend_all = [{"month": m, "median": sorted(vv)[len(vv)//2], "count": len(vv)} for m, vv in sorted(by_month.items())]
+        trend = trend_all[-{"1Y": 12, "3Y": 36, "5Y": 60}[mrange]:]
+        spark = ""
+        if len(trend) >= 2:
+            vals = [t["median"] for t in trend]; lo, hi = min(vals), max(vals); span = (hi - lo) or 1
+            spark = " ".join(f"{round(i / (len(vals) - 1) * 300, 1)},{round(34 - (vv - lo) / span * 30, 1)}"
+                             for i, vv in enumerate(vals))
+        zip_groups = {}
+        for c in msold:
+            if c["zip"] and c["price"]: zip_groups.setdefault(c["zip"], []).append(c)
+        nearby = []
+        for z, cs in zip_groups.items():
+            zp = sorted(c["price"] for c in cs if c["price"]); zd = sorted(c["dom"] for c in cs if c["dom"])
+            nearby.append({"zip": z, "median_price": med(zp), "median_dom": med(zd), "n": len(cs), "you": z == p["zip"]})
+        nearby.sort(key=lambda r: (not r["you"], -r["n"]))
+        market = {"count": len(msold), "median_price": med(prices), "median_ppsf": med(ppsfs), "median_dom": med(doms),
+                  "trend": trend, "spark": spark,
+                  "trend_min": min([t["median"] for t in trend]) if trend else None,
+                  "trend_max": max([t["median"] for t in trend]) if trend else None,
+                  "nearby": nearby, "mtype": mtype, "mrange": mrange, "type_counts": type_counts,
+                  "untyped": sum(1 for c in sold if not ("ptype" in c.keys() and c["ptype"])),
+                  "source": "Computed from your stored HomeHarvest sold comps", "date": datetime.date.today().isoformat()}
     # demographics: served from cache (async job fills it); never block page load on Census
     demo = None
     if p["demo_json"]:
         try: demo = json.loads(p["demo_json"])
         except Exception: demo = None
+    demo_error = p["demo_error"] if "demo_error" in p.keys() else None
+    amenities_error = p["amenities_error"] if "amenities_error" in p.keys() else None
+    dscope = request.args.get("dscope", "zip")
+    if dscope not in ("zip", "city"): dscope = "zip"
+    dgeo = None; trend_svg = None
+    if demo:
+        dgeo = demo.get("zip") if dscope == "zip" else demo.get("city")
+        if dgeo is None and dscope == "city": dscope, dgeo = "zip", demo.get("zip")
+        if dgeo is None and dscope == "zip": dscope, dgeo = "city", demo.get("city")
+        pts = (dgeo or {}).get("pop_trend") or []
+        if len(pts) >= 2:
+            vals = [e["pop"] for e in pts]; lo, hi = min(vals), max(vals); span = (hi - lo) or 1
+            trend_svg = {"points": " ".join(f"{round(i / (len(vals) - 1) * 300, 1)},{round(44 - (vv - lo) / span * 38, 1)}"
+                                            for i, vv in enumerate(vals)),
+                         "first_year": pts[0]["year"], "last_year": pts[-1]["year"],
+                         "first_pop": pts[0]["pop"], "last_pop": pts[-1]["pop"]}
     tab = request.args.get("tab", "overview")
+    # v1.6: job banners are scoped to the tab their job belongs to (a stale Census
+    # error must not follow the user across every tab), timestamps are human, and
+    # finished/error banners can be dismissed.
+    JOB_TAB = {"comps": "comps", "demographics": "demographics", "amenities": "demographics"}
+    raw_job = latest_job(pid)
+    banner_job = None
+    if raw_job and not (raw_job["dismissed"] if "dismissed" in raw_job.keys() else 0) \
+            and JOB_TAB.get(raw_job["kind"]) == tab:
+        banner_job = dict(raw_job)
+        ts = raw_job["finished_at"] or raw_job["started_at"] or ""
+        try:
+            banner_job["when"] = datetime.datetime.fromisoformat(str(ts)).strftime("%b %d, %I:%M %p")
+        except Exception:
+            banner_job["when"] = ts
     amort = None
     amenities = None
     if tab == "demographics" and p["amenities_json"]:
@@ -1418,10 +1884,11 @@ def property_page(pid):
     window = int(fnum(request.args.get("window"), 365) or 365)
     if window not in (30, 90, 180, 365): window = 365
     rmax = fnum(request.args.get("rmax"), None)
-    subj_d = {"sqft": p["sqft"], "beds": p["beds"], "baths": p["baths"], "year_built": p["year_built"]}
+    subj_d = {"sqft": p["sqft"], "beds": p["beds"], "baths": p["baths"], "year_built": p["year_built"], "lot_sqft": p["lot_sqft"]}
     def in_radius(c): return rmax is None or (c["distance_mi"] is not None and c["distance_mi"] <= rmax)
     cutoff = (datetime.date.today() - datetime.timedelta(days=window)).isoformat()
-    sold_view = [c for c in sold if in_radius(c) and (not c["event_date"] or c["event_date"] >= cutoff)]
+    actives = [c for c in comps if c["kind"] == "active" and not c["excluded"]]
+    sold_view = [c for c in (sold + actives) if in_radius(c) and (not c["event_date"] or c["event_date"] >= cutoff)]
     rents_view = [c for c in rents if in_radius(c)]
     sold_stats = pinned_sold_stats(sold_view)
     ltr = ltr_stats(rents_view)
@@ -1431,7 +1898,8 @@ def property_page(pid):
     breakdowns = {}
     for c in sold_view + rents_view:
         breakdowns[c["id"]] = score_breakdown(subj_d, {"distance_mi": c["distance_mi"], "sqft": c["sqft"],
-                                                       "beds": c["beds"], "baths": c["baths"], "year_built": c["year_built"]})
+                                                       "beds": c["beds"], "baths": c["baths"], "year_built": c["year_built"],
+                                                       "lot_sqft": c["lot_sqft"] if "lot_sqft" in c.keys() else None})
     room_est = {c["id"]: room_estimate_weekly(c) for c in rents_view}
     steps = {"comps": len(sold) > 0, "scenarios": len(scenarios) > 0}
     # ---- underwriting form states (v1.3): fresh defaults + every saved scenario, canonicalized ----
@@ -1469,19 +1937,20 @@ def property_page(pid):
         else:
             uw_current[strat] = latest if latest is not None else fresh
     # pinned (or top-3) sold comps for the Flip Sale & Exit table
-    flip_pool = [c for c in sold_view if c["pinned"]] or \
-        sorted(sold_view, key=lambda c: -(c["match_score"] or 0))[:3]
+    flip_pool = [c for c in sold_view if c["pinned"] and c["kind"] == "sold"] or \
+        sorted([c for c in sold_view if c["kind"] == "sold"], key=lambda c: -(c["match_score"] or 0))[:3]
     flip_prices = [c["price"] for c in flip_pool if c["price"]]
     return render_template("property.html", p=p, comps=comps, sold=sold, rents=rents, liens=liens, docs=docs,
                            assigns=assigns, contractors=contractors, scenarios=scenarios, plans=plans,
-                           v=v, market=market, demo=demo, tab=tab, amort=amort, amenities=amenities,
-                           photos=photos, job=latest_job(pid), steps=steps,
+                           v=v, market=market, demo=demo, demo_error=demo_error, amenities_error=amenities_error,
+                           dscope=dscope, dgeo=dgeo, trend_svg=trend_svg, tab=tab, amort=amort, amenities=amenities,
+                           photos=photos, job=banner_job, steps=steps,
                            cview=cview, window=window, rmax=rmax, sold_view=sold_view, rents_view=rents_view,
                            sold_stats=sold_stats, ltr=ltr, coli=coli, med_rent=med_rent, afford_view=afford_view,
                            breakdowns=breakdowns, room_est=room_est,
                            strategies=strategies, uw_fresh=uw_fresh, uw_saved=uw_saved, uw_current=uw_current,
                            uw_draft_meta=uw_draft_meta,
-                           flip_pool=flip_pool,
+                           flip_pool=flip_pool, comp_weights=comp_weights(),
                            flip_range=(min(flip_prices), max(flip_prices)) if flip_prices else None)
 
 @app.route("/property/<int:pid>/amenities/refresh", methods=["POST"])
@@ -1498,6 +1967,26 @@ def pull_demographics(pid):
     flash("Loading demographics from the US Census — the result will appear here in a moment.", "info")
     return redirect(url_for("property_page", pid=pid, tab="demographics"))
 
+@app.route("/job/<int:jid>/dismiss", methods=["POST"])
+def dismiss_job(jid):
+    row = db().execute("SELECT property_id, kind FROM jobs WHERE id=?", (jid,)).fetchone()
+    if row:
+        db().execute("UPDATE jobs SET dismissed=1 WHERE id=?", (jid,)); db().commit()
+        tab = {"comps": "comps", "demographics": "demographics", "amenities": "demographics"}.get(row["kind"], "overview")
+        return redirect(url_for("property_page", pid=row["property_id"], tab=tab))
+    return redirect(url_for("index"))
+
+@app.route("/property/<int:pid>/data-error/dismiss", methods=["POST"])
+def dismiss_data_error(pid):
+    get_prop(pid)
+    which = request.form.get("which", "")
+    if which == "demo":
+        db().execute("UPDATE properties SET demo_error=NULL WHERE id=?", (pid,))
+    elif which == "amenities":
+        db().execute("UPDATE properties SET amenities_error=NULL WHERE id=?", (pid,))
+    db().commit()
+    return redirect(url_for("property_page", pid=pid, tab="demographics"))
+
 @app.route("/property/<int:pid>/pull-comps", methods=["POST"])
 def do_pull_comps(pid):
     get_prop(pid)
@@ -1507,6 +1996,157 @@ def do_pull_comps(pid):
     job_comps(pid, radius, days)
     flash(f"Pulling comps — sold (last {days} days) + rentals + listing photos within {radius:g} mi. "
           "This usually takes about a minute; the results will appear here automatically.", "info")
+    return redirect(url_for("property_page", pid=pid, tab="comps", view="sold"))
+
+# ------------------------------------------------- comp weights (item L) + add comp (item M)
+def rerank_all_comps():
+    """Recompute every comp's stored match score with the current weights."""
+    d = db(); n = 0
+    props = {r["id"]: r for r in d.execute("SELECT * FROM properties")}
+    for c in d.execute("SELECT * FROM comps"):
+        p = props.get(c["property_id"])
+        if not p: continue
+        subj = {"sqft": p["sqft"], "beds": p["beds"], "baths": p["baths"],
+                "year_built": p["year_built"], "lot_sqft": p["lot_sqft"]}
+        comp = {"distance_mi": c["distance_mi"], "sqft": c["sqft"], "beds": c["beds"],
+                "baths": c["baths"], "year_built": c["year_built"],
+                "lot_sqft": c["lot_sqft"] if "lot_sqft" in c.keys() else None}
+        d.execute("UPDATE comps SET match_score=? WHERE id=?", (match_score(subj, comp), c["id"]))
+        n += 1
+    d.commit()
+    return n
+
+@app.route("/property/<int:pid>/comp-weights", methods=["POST"])
+def comp_weights_save(pid):
+    get_prop(pid)
+    w = {}
+    for k in COMP_WEIGHT_DEFAULTS:
+        v = fnum(request.form.get("w_" + k), None)
+        w[k] = v if (v is not None and v >= 0) else COMP_WEIGHT_DEFAULTS[k]
+    set_setting("comp_weights", json.dumps(w))
+    n = rerank_all_comps()
+    flash(f"✓ Comp weights saved — {n} comps re-ranked. New weights: "
+          + " · ".join(f"{k} {w[k]:g}" for k in COMP_WEIGHT_DEFAULTS) + ".", "info")
+    return redirect(url_for("property_page", pid=pid, tab="comps", view="sold"))
+
+_ADDR_SUFFIX = {"place": "pl", "pl": "pl", "drive": "dr", "dr": "dr", "court": "ct", "ct": "ct",
+                "avenue": "ave", "ave": "ave", "street": "st", "st": "st", "lane": "ln", "ln": "ln",
+                "road": "rd", "rd": "rd", "circle": "cir", "cir": "cir", "boulevard": "blvd",
+                "blvd": "blvd", "terrace": "ter", "ter": "ter", "trail": "trl", "trl": "trl",
+                "way": "way", "parkway": "pkwy", "pkwy": "pkwy", "highway": "hwy", "hwy": "hwy"}
+
+def _norm_addr(s):
+    """Normalize a street address for lookup matching: lowercase, no punctuation,
+    canonical suffixes, single spaces. '15037 Abby Birch Place' -> '15037 abby birch pl'."""
+    s = re.sub(r"[^a-z0-9 ]", " ", (s or "").lower())
+    toks = [_ADDR_SUFFIX.get(t, t) for t in s.split() if t not in ("fl", "florida")]
+    return " ".join(toks)
+
+def lookup_comp_by_address(prop, address, kind_choice):
+    """Add Comp (ReiSearch parity): resolve a typed address through HomeHarvest with a
+    ZIP-mode query + normalized-address match — NEVER raw full-address mode (mis-resolves).
+    Returns the matched HomeHarvest row (dict-like) or None."""
+    from homeharvest import scrape_property
+    m = re.search(r"\b(\d{5})\b", address or "")
+    z = m.group(1) if m else (prop["zip"] or "")
+    if not z: return None
+    lt = "sold" if kind_choice == "sold" else "for_sale"
+    kw = {"location": z, "listing_type": lt}
+    if lt == "sold": kw["past_days"] = 365
+    try:
+        df = scrape_property(**kw)
+    except Exception:
+        return None
+    if df is None or len(df) == 0: return None
+    target = _norm_addr(address)
+    ttoks = target.split(" ")
+    tnum = ttoks[0] if ttoks else ""
+    tname = ttoks[1] if len(ttoks) > 1 else ""
+    best = None
+    for _, r in df.iterrows():
+        st = _norm_addr(_s(r.get("street")) + " " + (_s(r.get("city")) or ""))
+        if not st: continue
+        if st == target or target in st or st in target:
+            return r
+        stoks = st.split(" ")
+        if (tnum and tname and len(stoks) > 1 and stoks[0] == tnum and stoks[1] == tname
+                and best is None):
+            best = r  # same house number AND street name, suffix/city form differs
+    return best
+
+def _insert_comp(prop, vals):
+    d = db()
+    subj = {"sqft": prop["sqft"], "beds": prop["beds"], "baths": prop["baths"],
+            "year_built": prop["year_built"], "lot_sqft": prop["lot_sqft"]}
+    vals["match_score"] = match_score(subj, {"distance_mi": vals.get("distance_mi"), "sqft": vals.get("sqft"),
+                                             "beds": vals.get("beds"), "baths": vals.get("baths"),
+                                             "year_built": vals.get("year_built"), "lot_sqft": vals.get("lot_sqft")})
+    cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
+    cur = d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values()))
+    d.commit()
+    return cur.lastrowid
+
+@app.route("/property/<int:pid>/comps/add-lookup", methods=["POST"])
+def add_comp_lookup(pid):
+    prop = get_prop(pid)
+    addr = (request.form.get("address") or "").strip()
+    kind_choice = request.form.get("kind_choice", "sold")
+    if kind_choice not in ("sold", "active"): kind_choice = "sold"
+    r = lookup_comp_by_address(prop, addr, kind_choice) if addr else None
+    if r is None:
+        flash(f"No HomeHarvest match found for “{addr}” — use the manual-entry form below; "
+              "the comp still enters pin/average math.", "error")
+        return redirect(url_for("property_page", pid=pid, tab="comps", view="sold", addmanual=1, addr=addr))
+    lat, lon = r.get("latitude"), r.get("longitude")
+    lat = float(lat) if lat is not None and not (isinstance(lat, float) and math.isnan(lat)) else None
+    lon = float(lon) if lon is not None and not (isinstance(lon, float) and math.isnan(lon)) else None
+    price = fnum(r.get("sold_price")) if kind_choice == "sold" else fnum(r.get("list_price"))
+    sqft = fnum(r.get("sqft"))
+    vals = dict(kind=kind_choice, address=_s(r.get("street")).strip() or addr, city=_s(r.get("city")) or prop["city"],
+                zip=_s(r.get("zip_code")) or prop["zip"], price=price,
+                ppsf=(price / sqft) if price and sqft else fnum(r.get("price_per_sqft")),
+                beds=fnum(r.get("beds")), baths=fnum(r.get("full_baths")), sqft=sqft,
+                year_built=int(r["year_built"]) if fnum(r.get("year_built")) else None,
+                event_date=(_s(r.get("last_sold_date"))[:10] or None) if kind_choice == "sold" else (_s(r.get("list_date"))[:10] or None),
+                dom=fnum(r.get("days_on_mls")), lat=lat, lon=lon,
+                distance_mi=haversine_mi(prop["lat"], prop["lon"], lat, lon) if lat is not None else None,
+                lot_sqft=fnum(r.get("lot_sqft")),
+                ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
+                source="HomeHarvest (Realtor.com) — added by address lookup",
+                source_url=_s(r.get("property_url")), photo_url=_s(r.get("primary_photo")))
+    _insert_comp(prop, vals)
+    flash(f"✓ Comp added from HomeHarvest: {vals['address']}, {vals['city']} — "
+          f"{'sold' if kind_choice == 'sold' else 'active listing'} {('$' + format(int(price), ',')) if price else ''}.", "info")
+    return redirect(url_for("property_page", pid=pid, tab="comps", view="sold"))
+
+@app.route("/property/<int:pid>/comps/add-manual", methods=["POST"])
+def add_comp_manual(pid):
+    prop = get_prop(pid)
+    kind_choice = request.form.get("kind_choice", "sold")
+    if kind_choice not in ("sold", "active"): kind_choice = "sold"
+    addr = (request.form.get("address") or "").strip()
+    city = (request.form.get("city") or prop["city"] or "").strip()
+    state = prop["state"] or "FL"
+    zp = (request.form.get("zip") or prop["zip"] or "").strip()
+    if not addr:
+        flash("Manual comp needs at least a street address.", "error")
+        return redirect(url_for("property_page", pid=pid, tab="comps", view="sold", addmanual=1))
+    geo = geocode_arcgis(f"{addr}, {city}, {state} {zp}")
+    lat = geo["lat"] if geo else None; lon = geo["lon"] if geo else None
+    price = fnum(request.form.get("price"), None); sqft = fnum(request.form.get("sqft"), None)
+    vals = dict(kind=kind_choice, address=addr, city=city, zip=zp, price=price,
+                ppsf=(price / sqft) if price and sqft else None,
+                beds=fnum(request.form.get("beds"), None), baths=fnum(request.form.get("baths"), None),
+                sqft=sqft,
+                year_built=int(fnum(request.form.get("year_built"), 0)) or None,
+                event_date=(request.form.get("event_date") or "").strip() or None,
+                dom=fnum(request.form.get("dom"), None), lat=lat, lon=lon,
+                distance_mi=haversine_mi(prop["lat"], prop["lon"], lat, lon) if lat is not None else None,
+                lot_sqft=fnum(request.form.get("lot_sqft"), None),
+                ptype=None, source="Manual entry (added by user)",
+                source_url=(request.form.get("source_url") or "").strip() or None, photo_url=None)
+    _insert_comp(prop, vals)
+    flash(f"✓ Comp added manually: {addr}, {city} — it counts in pin/average math like a pulled comp.", "info")
     return redirect(url_for("property_page", pid=pid, tab="comps", view="sold"))
 
 @app.route("/job/<int:jid>")
@@ -1652,6 +2292,33 @@ def doc_update(did):
     db().execute("UPDATE documents SET done=?, notes=? WHERE id=?",
                  (1 if request.form.get("done") else 0, request.form.get("notes", ""), did))
     db().commit(); return redirect(url_for("property_page", pid=row["property_id"], tab="documents"))
+
+@app.route("/property/<int:pid>/documents/add", methods=["POST"])
+def doc_add(pid):
+    """v1.6 (item T): the checklist is no longer fixed — users add their own documents."""
+    get_prop(pid)
+    title = (request.form.get("title") or "").strip()
+    cat = (request.form.get("category") or "Custom").strip() or "Custom"
+    if not title:
+        flash("Give the document a title first.", "error")
+        return redirect(url_for("property_page", pid=pid, tab="documents"))
+    try:
+        db().execute("INSERT INTO documents(property_id,category,slot,notes) VALUES(?,?,?,?)",
+                     (pid, cat, title, (request.form.get("notes") or "").strip() or None))
+        db().commit()
+        flash(f"✓ Document added: {title}", "info")
+    except Exception:
+        flash(f"A document named “{title}” already exists on this property.", "error")
+    return redirect(url_for("property_page", pid=pid, tab="documents"))
+
+@app.route("/document/<int:did>/delete", methods=["POST"])
+def doc_delete(did):
+    row = db().execute("SELECT property_id, slot FROM documents WHERE id=?", (did,)).fetchone()
+    if row:
+        db().execute("DELETE FROM documents WHERE id=?", (did,)); db().commit()
+        flash(f"Document removed: {row['slot']}", "info")
+        return redirect(url_for("property_page", pid=row["property_id"], tab="documents"))
+    return redirect(url_for("index"))
 
 @app.route("/documents")
 def documents_index():

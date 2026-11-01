@@ -1,4 +1,4 @@
-<div class="card"><h2>Underwriting — ReiSearch layout</h2>
+<div class="card"><h2>Underwriting</h2>
 <div class="segwrap">
  <div class="segbar" id="segbar">
  {% for strat in strategies %}<button type="button" class="seg {{ 'on' if strat=='Co-Living' }}" data-seg="{{ strat }}" onclick="return uwSeg('{{ strat }}')">{{ strat }}</button>{% endfor %}
@@ -10,7 +10,7 @@
   <button type="button" class="btn sec sm" onclick="return uwCreateNew()">Create New</button>
  </div>
 </div>
-<p class="small muted">Strategy buttons swap in place. Every total recalculates as you type — there is no Calculate button. Section headers show CALCULATED TOTAL (computed from rows) or ESTIMATED TOTAL (your sqft estimate). Revenue defaults come from your pulled comps: Co-Living rent/room from the ZIP room-rent benchmark, Long/Mid Term rent from the rental-comp average. Deal Score (Co-Living): CF/room 25% · DSCR 20% · CoC 20% · cap 15% · break-even 12% · downside CF 8%, minus v1.2 realism penalties — $0 taxes/insurance get sanity defaults, never a free "Strong".</p>
+<p class="small muted">Strategy buttons swap in place. Every total recalculates as you type — there is no Calculate button. Section headers show CALCULATED TOTAL (computed from rows) or ESTIMATED TOTAL (your sqft estimate). Revenue defaults come from your pulled comps: Co-Living rent/room from the ZIP room-rent benchmark, Long/Mid Term rent from the rental-comp average. Deal Score (Co-Living): CF/room 25% · DSCR 20% · CoC 20% · cap 15% · break-even 12% · downside CF 8%, minus realism penalties — standard costs (taxes/insurance) auto-fill visibly in their fields as editable estimates, never hidden charges, and never a free "Strong".</p>
 </div>
 
 {% for strat in strategies %}
@@ -180,9 +180,12 @@
 <h4>Management <span class="gtot"><b data-out="cat_management">$0</b> <span class="muted">Month</span> · <b data-outyr="cat_management">$0</b> <span class="muted">Year</span></span></h4>
 {% for k, lab in [('property_manager_mo','Property Manager'),('turnover_reserve_mo','Turnover Reserve'),('additional_insurance_mo','Additional Insurance')] %}
 <div class="xrow"><span>{{ lab }}</span><input type="number" step="any" name="{{ k }}" value="{{ st[k] }}"><span class="yr" data-yr="{{ k }}"></span></div>{% endfor %}
-<h4>Taxes, Insurance &amp; HOA <span class="small muted">(inside PITI when a loan payment exists; 0 on an all-cash deal = sanity default: taxes 1.1% of price/yr, insurance $180/mo)</span> <span class="gtot"><b data-out="cat_taxes">$0</b> <span class="muted">Month</span> · <b data-outyr="cat_taxes">$0</b> <span class="muted">Year</span></span></h4>
+<h4>Taxes, Insurance &amp; HOA <span class="small muted">(auto-filled with an editable estimate — real county tax ÷ 12 where known, else 1.1% of price/yr; insurance $180/mo. Skipped when a loan payment exists: they live inside PITI then)</span> <span class="gtot"><b data-out="cat_taxes">$0</b> <span class="muted">Month</span> · <b data-outyr="cat_taxes">$0</b> <span class="muted">Year</span></span></h4>
 {% for k, lab in [('taxes_mo','Taxes'),('insurance_mo','Insurance'),('hoa_mo','HOA dues')] %}
 <div class="xrow"><span>{{ lab }}</span><input type="number" step="any" name="{{ k }}" value="{{ st[k] }}"><span class="yr" data-yr="{{ k }}"></span></div>{% endfor %}
+<input type="hidden" name="taxes_est" data-estflag value="{{ st.taxes_est }}">
+<input type="hidden" name="insurance_est" data-estflag value="{{ st.insurance_est }}">
+<p class="small muted">Fields shaded amber are auto-estimates — type over them to replace with the real number.</p>
 </div>
 <aside class="sumpanel"><div class="sump-head"><h4>Operating Expenses</h4><span class="ptoggle"><button type="button" class="on" data-ptog="mo" onclick="return uwPanelPeriod(this,'mo')">Month</button><button type="button" data-ptog="yr" onclick="return uwPanelPeriod(this,'yr')">Year</button></span></div>
 <div class="srow"><span>Booking &amp; Service Fees</span><b data-pv="cat_fees">$0</b></div>
@@ -198,7 +201,7 @@
 {% endif %}
 
 <details class="acc" open data-sec="funding"><summary><span class="acc-t">Funding Structure</span><span class="acc-mode">LIVE TOTALS</span><span class="acc-total" data-out="funded">$0</span></summary><div class="acc-b">
-<p class="small muted" style="margin-top:0">How will you fund this deal? Pick a preset or build a custom stack. <b>Subject-To</b> on a rental uses the Existing Mortgage Data below (entry fee + existing PITI payment); on a Fix &amp; Flip it adds the existing loan as a funding card.</p>
+<p class="small muted" style="margin-top:0">How will you fund this deal? Pick a preset to <b>add</b> a funding card — presets stack, and every card is removable. Each card's loan-type dropdown re-applies that type's standard terms. <b>Subject-To</b> adds an existing-loan card (fill in its balance/payment); on rentals, the Existing Mortgage Data below separately adds an entry fee + existing PITI payment when you model the deal that way.</p>
 <div class="rowflex">
 <div><label>Purchase price $</label><input type="number" step="any" name="purchase_price" value="{{ st.purchase_price }}"></div>
 <div><label>ARV $</label><input type="number" step="any" name="arv" value="{{ st.arv }}"></div>
@@ -215,9 +218,11 @@
 <div class="srow"><span>Total Uses (purchase + renovation + holding)</span><b data-out="uses">$0</b></div>
 <div class="srow"><span>Funding Added</span><b data-out="funded">$0</b></div>
 <div class="srow"><span>Remaining Funding Gap</span><b data-out="gap">$0</b></div>
-<div class="srow"><span>Cash Contribution</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Cash Contributions</span><b data-out="cash_contrib">$0</b></div>
+<div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
 <div class="srow"><span>Monthly Debt Service</span><b data-out="debt_service_mo">$0</b></div>
-<div class="srow tot"><span>Estimated Financing Costs</span><b data-out="financing_costs">$0</b></div></div>
+<div class="srow tot"><span>Estimated Financing Costs</span><b data-out="financing_costs">$0</b></div>
+<div data-breakdown="debt"></div><div data-breakdown="cash"></div></div>
 </div>
 {% if strat!='Fix & Flip' %}
 <details class="acc sub"><summary><span class="acc-t">Existing Mortgage Data</span><span class="acc-total" data-out="md_monthly_payment_label"></span></summary><div class="acc-b">
@@ -348,9 +353,9 @@
 <div class="scorebox"><span>Deal Score</span><b data-out="score">—</b><small data-out="score_label"></small></div>
 <p class="small insight" data-out="score_insight"></p>
 <p class="small"><a href="#" onclick="return uwGoDetails(this)">View Details</a></p>
-<div class="chips"><button type="button" data-scenchip="Downside (-10%)" onclick="return uwScenChip(this)">↓ Break Even −10%</button><button type="button" class="on" data-scenchip="Base Case (0%)" onclick="return uwScenChip(this)">Proforma</button><button type="button" data-scenchip="Fully Booked (0% vacancy)" onclick="return uwScenChip(this)">↑ Fully Booked +10%</button></div>
+<div class="chips"><button type="button" data-scenchip="Downside (-10%)" onclick="return uwScenChip(this)">Downside −10%</button><button type="button" class="on" data-scenchip="Base Case (0%)" onclick="return uwScenChip(this)">Base Case</button><button type="button" data-scenchip="Upside (+10%)" onclick="return uwScenChip(this)">Upside +10%</button><button type="button" data-scenchip="Fully Booked (0% vacancy)" onclick="return uwScenChip(this)">Fully Booked</button></div>
 <div class="srow big"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
-<p class="small muted">One-time cash to get into the deal (down payment gap + closing + entry fee).</p>
+<p class="small muted">One-time cash to get into the deal (cash contributions + closing + points/fees + entry fee — a loan-only funding gap doesn't count).</p>
 <div class="cfbox"><h4>Monthly Cash Flow</h4>
 <div class="srow"><span>+ Revenue</span><b data-scen="rev">$0</b></div>
 <div class="srow"><span>− Expenses</span><b data-scen="exp">$0</b></div>
@@ -380,12 +385,12 @@
 {% endif %}
 </div>
 <div class="sidepane" data-spane="visual"><div data-visual="main"></div><h4>Expense breakdown</h4><div data-visual="exp"></div></div>
-<div class="sidepane" data-spane="scenarios"><div data-scenarios></div><h4>Key Metrics (Base Case)</h4>
+<div class="sidepane" data-spane="scenarios"><div data-scenarios></div><h4>Key Metrics (<span data-scenm="name">Base Case</span>)</h4>
 {% if strat=='Co-Living' %}
-<div class="srow"><span>Net Cash Flow</span><b><span data-out="cashflow_mo">$0</span>/mo</b></div>
-<div class="srow"><span>Cash-on-Cash</span><b data-out="coc_pct">—</b></div>
-<div class="srow"><span>DSCR</span><b data-out="dscr">—</b></div>
-<div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
+<div class="srow"><span>Net Cash Flow</span><b data-scenm="net">$0/mo</b></div>
+<div class="srow"><span>Cash-on-Cash</span><b data-scenm="coc">—</b></div>
+<div class="srow"><span>DSCR</span><b data-scenm="dscr">—</b></div>
+<div class="srow"><span>Cap Rate</span><b data-scenm="cap">—</b></div>
 {% else %}
 <div class="srow"><span>Net Profit</span><b data-out="profit">$0</b></div>
 <div class="srow"><span>ROI</span><b data-out="roi">—</b></div>
@@ -460,6 +465,7 @@
 
 <script>
 window.UW = {"sqft": {{ p.sqft or 0 }}, "pid": {{ p.id }}, "drafts": {{ uw_draft_meta|tojson }},
+  "propTaxMo": {{ ((p.tax_amount or 0) / 12)|round(0)|int }},
   "propLoan": {"balance": {{ p.loan_balance or 0 }}, "type": {{ (p.loan_type or '')|tojson }}, "rate": {{ p.loan_rate or 0 }}, "piti": {{ p.loan_piti or 0 }}},
   "fresh": {{ uw_fresh|tojson }}, "current": {{ uw_current|tojson }}, "saved": {{ uw_saved|tojson }},
   "flatLabels": {{ {"adu": "ADU & Additions", "hvac": "HVAC", "electrical": "Electrical", "plumbing": "Plumbing", "exterior": "Exterior & Structural", "contingency": "Repairs Contingency", "other": "Other (flat)"}|tojson }},

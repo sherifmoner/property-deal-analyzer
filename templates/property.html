@@ -1,14 +1,26 @@
 {% extends "base.html" %}{% block title %}{{ p.address }} — Deal Analyzer{% endblock %}{% block body %}
+{% macro sitelinks(street, city, state, zip, source_url, source_name) %}
+{# Outbound source links (Sherif's rule: every number one click from the real listing).
+   Built from the row's own stored address fields; only links the data supports. #}
+{% set street = (street or '')|trim %}{% set city = (city or '')|trim %}{% set state = (state or '')|trim %}{% set zip = (zip or '')|string|trim %}
+{% if street or source_url %}<div class="sitelinks">
+{% if source_url %}<a class="sl-chip src" target="_blank" rel="noopener" href="{{ source_url }}" title="The actual listing this row came from">🏠 Listing · {{ source_name or 'source' }} ↗</a>{% endif %}
+{% if street %}{% set zslug = (street ~ ' ' ~ city ~ ' ' ~ state ~ ' ' ~ zip)|replace(',', '')|replace(' ', '-') %}
+<a class="sl-chip" target="_blank" rel="noopener" href="https://www.zillow.com/homes/{{ zslug }}_rb/">Zillow ↗</a>
+<a class="sl-chip" target="_blank" rel="noopener" href="https://www.redfin.com/search?query={{ (street ~ ', ' ~ city ~ ', ' ~ state ~ ' ' ~ zip)|urlencode }}">Redfin ↗</a>
+<a class="sl-chip" target="_blank" rel="noopener" href="https://www.realtor.com/realestateandhomes-search/{{ street|replace(' ', '-') }}_{{ city|replace(' ', '-') }}_{{ state }}_{{ zip }}">Realtor ↗</a>{% endif %}
+</div>{% endif %}
+{% endmacro %}
 {% macro compcard(c, mode) %}
 <div class="ccard {{ 'pinned' if c.pinned }}" data-cid="{{ c.id }}">
  {% if c.photo_url %}<img class="cphoto" src="{{ c.photo_url }}" alt="Comp photo" loading="lazy">{% else %}<div class="cphoto" style="height:150px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px">No photo available</div>{% endif %}
  <div class="cb">
  <div class="score">{{ c.match_score|num }}<small>MATCH</small></div>
  <div class="cprice">{% if mode=='rent' %}{{ c.price|money }}<span class="small muted">/mo rent</span>{% else %}{{ c.price|money }}{% endif %}</div>
- <div class="small"><b>{{ c.address }}</b>, {{ c.city }} {{ c.zip }}{% if c.pinned %} · <span class="pin">📌 PINNED</span>{% endif %}</div>
+ <div class="small"><b>{{ c.address }}</b>, {{ c.city }} {{ c.zip }}{% if c.pinned %} · <span class="pin">📌 PINNED</span>{% endif %}{% if c.kind=='active' %} · <span class="badge" style="background:#fef3c7;color:#92400e">● ACTIVE LISTING</span>{% endif %}</div>
  <div class="small muted">{{ c.beds|num }} bd · {{ c.baths|num }} ba · {{ c.sqft|num }} sqft · built {{ c.year_built or '—' }} · {{ c.distance_mi|num(2) }} mi away</div>
  {% if mode=='sold' %}
- <div class="small">Sold {{ c.event_date or '—' }} · {{ ('$' ~ c.ppsf|round(0) ~ '/sqft') if c.ppsf else '—' }} · DOM {{ c.dom|num }}
+ <div class="small">{% if c.kind=='active' %}Listed {{ c.event_date or '—' }} (asking){% else %}Sold {{ c.event_date or '—' }}{% endif %} · {{ ('$' ~ c.ppsf|round(0) ~ '/sqft') if c.ppsf else '—' }} · DOM {{ c.dom|num }}
  {% if p.list_price and c.price %}<br>Price vs subject list: <b class="{{ 'diffup' if c.price>p.list_price else 'diffdn' }}">{{ ((c.price - p.list_price)|money) if c.price>=p.list_price else ('−' ~ ((p.list_price - c.price)|money)) }}</b>{% endif %}
  {% if p.sqft and c.sqft %}<br>Size vs subject: <b>{{ ('+' if c.sqft>p.sqft else '') ~ ((c.sqft - p.sqft)|round(0)) }} sqft</b>{% endif %}
  </div>
@@ -18,8 +30,8 @@
  <div class="small">{{ ('$' ~ c.ppsf|round(2) ~ '/sqft/mo') if c.ppsf else '' }}{% if room_est[c.id] %} · est. ${{ room_est[c.id] }}/wk per room{% endif %}</div>
  {% endif %}
  <details><summary>Score breakdown</summary><div class="small muted">{% for k, val in breakdowns[c.id].items() %}{{ k }}: {{ val }} · {% endfor %}</div></details>
- <div class="small muted">{% if c.source_url %}<a target="_blank" href="{{ c.source_url }}">{{ c.source }}</a>{% else %}{{ c.source }}{% endif %}
- · <a href="#" onclick="return openMapOverlay({{ c.id }})">Show on map</a></div>
+ <div class="small muted">{{ c.source }} · <a href="#" onclick="return openMapOverlay({{ c.id }})">Show on map</a></div>
+ {{ sitelinks(c.address, c.city, p.state, c.zip, c.source_url, c.source) }}
  <button type="button" class="pinbtn {{ '' if c.pinned else 'off' }}" data-pinbtn="{{ c.id }}" onclick="return togglePin(event, {{ c.id }})">{{ '📌 Pinned — tap to unpin' if c.pinned else '📌 Pin this comp' }}</button>
  {% if mode=='sold' %}<form method="post" action="{{ url_for('comp_action', cid=c.id, action='exclude') }}"><input type="hidden" name="view" value="{{ cview }}"><button class="btn sm danger" style="width:100%;margin-top:5px">Exclude comp</button></form>{% endif %}
  </div>
@@ -41,6 +53,7 @@
  Occupancy: Not found (no free PadSplit feed)<br>Active rooms: Not found</div>
  {% elif mode=='rent' %}<div class="small">Rent benchmark for this ZIP: {% if ltr %}<b>{{ ltr.avg_rent|money }}/mo</b> avg of {{ ltr.basis }} set{% else %}Not found — pull comps{% endif %}</div>
  {% endif %}
+ {{ sitelinks(p.street, p.city, p.state, p.zip, none, none) }}
  </div>
  <div class="minimap" data-subject="1" data-lat="{{ p.lat if p.lat is not none else '' }}" data-lon="{{ p.lon if p.lon is not none else '' }}"><button type="button" class="mmfull" onclick="return openMapOverlay()">⛶ Fullscreen</button></div>
 </div>
@@ -67,15 +80,16 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <span class="badge">{{ p.status }}</span> <span class="badge">{{ p.stage }}</span>
 · List {{ p.list_price|money }} · Flood zone <b>{{ p.flood_zone or 'Not found' }}</b> <span class="small">({{ p.flood_source or '' }}, {{ p.flood_date or '' }})</span>
 · <a target="_blank" href="https://www.google.com/maps/search/{{ p.address|urlencode }}">Maps</a>
-· <a target="_blank" href="https://www.zillow.com/homes/{{ p.address|urlencode }}_rb/">Zillow</a>
-· <a target="_blank" href="https://www.realtor.com/realestateandhomes-search/{{ p.zip }}">Realtor</a>
-· <a target="_blank" href="https://www.redfin.com/zipcode/{{ p.zip }}">Redfin</a></p>
+· <a target="_blank" href="https://www.zillow.com/homes/{{ ((p.street or p.address) ~ ' ' ~ p.city ~ ' ' ~ p.state ~ ' ' ~ p.zip)|replace(',', '')|replace(' ', '-') }}_rb/">Zillow</a>
+· <a target="_blank" href="https://www.realtor.com/realestateandhomes-search/{{ (p.street or p.address)|replace(' ', '-') }}_{{ p.city|replace(' ', '-') }}_{{ p.state }}_{{ p.zip }}">Realtor</a>
+· <a target="_blank" href="https://www.redfin.com/search?query={{ p.address|urlencode }}">Redfin</a></p>
 
 {% if job %}
 <div class="jobbanner {{ job.status }}" id="jobbanner">
- {% if job.status=='running' %}<span class="spin">⏳</span> <b>Working…</b> {{ job.kind|title }} started {{ (job.started_at or '')[11:16] }} — don't worry, this page refreshes itself when it finishes. You can keep this tab open.
- {% elif job.status=='done' %}<b>Done.</b> {{ job.message }} <span class="small">({{ (job.finished_at or '')[:16] }})</span>
- {% elif job.status=='error' %}<b>⚠ Something went wrong:</b> {{ job.message }} <span class="small">({{ (job.finished_at or '')[:16] }})</span>{% endif %}
+ {% if job.status in ('done','error') %}<form method="post" action="{{ url_for('dismiss_job', jid=job.id) }}" style="float:right;margin:0"><button class="btn sm sec" title="Dismiss this notice">✕</button></form>{% endif %}
+ {% if job.status=='running' %}<span class="spin">⏳</span> <b>Working…</b> {{ job.kind|title }} started {{ job.when }} — don't worry, this page refreshes itself when it finishes. You can keep this tab open.
+ {% elif job.status=='done' %}<b>Done.</b> {{ job.message }} <span class="small">({{ job.when }})</span>
+ {% elif job.status=='error' %}<b>⚠ Something went wrong:</b> {{ job.message }} <span class="small">({{ job.when }})</span>{% endif %}
 </div>
 {% if job.status=='running' %}<script>
 (function(){var jid={{ job.id }};function poll(){fetch('/job/'+jid).then(function(r){return r.json()}).then(function(j){
@@ -123,9 +137,8 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>HOA dues $</label><input name="hoa_dues" value="{{ p.hoa_dues if p.hoa_dues is not none else '' }}"></div>
 <div><label>HOA freq</label><input name="hoa_freq" value="{{ p.hoa_freq or '' }}"></div>
 <div><label>Sewer / septic</label><input name="sewer" value="{{ p.sewer or '' }}"></div>
-<div><label>Water</label><input name="water" value="{{ p.water or '' }}"></div></div>
+<div><label>Water source</label><input name="water" value="{{ p.water or '' }}"></div></div>
 <div class="rowflex">
-<div><label>Electric</label><input name="electric" value="{{ p.electric or '' }}"></div>
 <div><label>Cooling</label><input name="cooling" value="{{ p.cooling or '' }}"></div>
 <div><label>Heating</label><input name="heating" value="{{ p.heating or '' }}"></div>
 <div><label>Roof age</label><input name="roof_age" value="{{ p.roof_age or '' }}"></div></div>
@@ -223,10 +236,43 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>…or custom radius (mi)</label><input name="radius_custom" placeholder="e.g. 0.75"></div>
 <div><label>Sold within</label><select name="window_days">{% for dval,lab in [(30,'Last 30 days'),(90,'Last 90 days'),(180,'Last 6 months'),(365,'Last year')] %}<option value="{{ dval }}" {% if dval==365 %}selected{% endif %}>{{ lab }}</option>{% endfor %}</select></div>
 <div style="flex:0"><button class="btn big">🔍 Pull Comps</button></div></div></form>
-<p class="small muted">Pulls sold comps + rental comps + this property's own listing photos in the background (about a minute). The banner at the top of this page shows progress and the final counts — nothing happens silently. Match score weights: distance 40% · sqft 20% · beds 13% · baths 13% · year built 13%. On file now: <b>{{ sold|length }} sold</b>, <b>{{ rents|length }} rentals</b>.</p>
+<p class="small muted">Pulls sold comps + rental comps + this property's own listing photos in the background (about a minute). The banner at the top of this page shows progress and the final counts — nothing happens silently. Match score weights: distance {{ comp_weights.distance|round|int }}% · sqft {{ comp_weights.sqft|round|int }}% · beds {{ comp_weights.beds|round|int }}% · baths {{ comp_weights.baths|round|int }}% · year built {{ comp_weights.year|round|int }}% · lot size {{ comp_weights.lot|round|int }}% — adjust them in the Weights box below. On file now: <b>{{ sold|length }} sold</b>, <b>{{ rents|length }} rentals</b>.</p>
+<details class="weightsbox"><summary>⚖ Comp match weights — Distance {{ comp_weights.distance|round|int }} · Sqft {{ comp_weights.sqft|round|int }} · Beds {{ comp_weights.beds|round|int }} · Baths {{ comp_weights.baths|round|int }} · Year {{ comp_weights.year|round|int }} · Lot {{ comp_weights.lot|round|int }}</summary>
+<form method="post" action="{{ url_for('comp_weights_save', pid=p.id) }}"><div class="rowflex">
+<div><label>Distance %</label><input type="number" step="any" min="0" name="w_distance" value="{{ comp_weights.distance }}"></div>
+<div><label>Sqft %</label><input type="number" step="any" min="0" name="w_sqft" value="{{ comp_weights.sqft }}"></div>
+<div><label>Beds %</label><input type="number" step="any" min="0" name="w_beds" value="{{ comp_weights.beds }}"></div>
+<div><label>Baths %</label><input type="number" step="any" min="0" name="w_baths" value="{{ comp_weights.baths }}"></div>
+<div><label>Year built %</label><input type="number" step="any" min="0" name="w_year" value="{{ comp_weights.year }}"></div>
+<div><label>Lot size %</label><input type="number" step="any" min="0" name="w_lot" value="{{ comp_weights.lot }}"></div>
+<div style="flex:0"><button class="btn sec">Save &amp; re-rank comps</button></div></div>
+<p class="small muted">Tolerances (fixed, ReiSearch defaults): distance 1 mi · sqft 35% · beds 2 · baths 2 · year built 20 yrs · lot size 50%. Scores are normalized to 100 points; saving re-ranks every comp in the app. This build ships editable weights + re-rank + persistence — no locks or auto-rebalance.</p></form></details>
+<div class="addcomp"><h3 style="margin:12px 0 4px">＋ Add a comp by address</h3>
+<form method="post" action="{{ url_for('add_comp_lookup', pid=p.id) }}"><div class="rowflex">
+<div style="flex:2"><label>Comp address (street, city, state ZIP)</label><input name="address" placeholder="e.g. 1210 E 140th Ave, Tampa, FL 33613" value="{{ request.args.get('addr','') }}"></div>
+<div><label>Type</label><select name="kind_choice"><option value="sold">Sold</option><option value="active">Active listing</option></select></div>
+<div style="flex:0"><button class="btn sec">Look up &amp; add</button></div></div></form>
+<p class="small muted">Resolves the address through HomeHarvest (ZIP query + address match — the same free source as comp pulls). If nothing matches, the manual form below takes over; either way the comp enters pin/average math like a pulled one. Active listings show in the comp list with an ACTIVE badge but never count as sales.</p>
+<details {% if request.args.get('addmanual') %}open{% endif %} id="manual-comp"><summary>Manual entry (fallback — when lookup finds nothing)</summary>
+<form method="post" action="{{ url_for('add_comp_manual', pid=p.id) }}"><div class="rowflex">
+<div style="flex:2"><label>Street address *</label><input name="address" value="{{ request.args.get('addr','') }}"></div>
+<div><label>City</label><input name="city" value="{{ p.city }}"></div>
+<div><label>ZIP</label><input name="zip" value="{{ p.zip }}"></div>
+<div><label>Type</label><select name="kind_choice"><option value="sold">Sold</option><option value="active">Active listing</option></select></div></div>
+<div class="rowflex">
+<div><label>Price $</label><input name="price" type="number" step="any"></div>
+<div><label>Beds</label><input name="beds" type="number" step="any"></div>
+<div><label>Baths</label><input name="baths" type="number" step="any"></div>
+<div><label>Sqft</label><input name="sqft" type="number" step="any"></div>
+<div><label>Year built</label><input name="year_built" type="number"></div>
+<div><label>Lot sqft</label><input name="lot_sqft" type="number" step="any"></div>
+<div><label>Sold / list date</label><input name="event_date" type="date"></div>
+<div><label>Days on market</label><input name="dom" type="number" step="any"></div>
+<div style="flex:2"><label>Listing URL (optional)</label><input name="source_url" placeholder="https://…"></div>
+<div style="flex:0"><button class="btn sec">Add comp manually</button></div></div></form></details></div>
 <form method="get" action="{{ url_for('property_page', pid=p.id) }}"><input type="hidden" name="tab" value="comps"><input type="hidden" name="view" value="{{ cview }}" id="filter-view">
-<div class="rowflex"><div><label>Show sold from</label><select name="window">{% for dval,lab in [(30,'Last 30 days'),(90,'Last 90 days'),(180,'Last 6 months'),(365,'Last year')] %}<option value="{{ dval }}" {% if window==dval %}selected{% endif %}>{{ lab }}</option>{% endfor %}</select></div>
-<div><label>Show within radius</label><select name="rmax"><option value="" {% if not rmax %}selected{% endif %}>All pulled</option>{% for r in [0.25,0.5,1,1.25,1.5,2,2.5,5,10] %}<option value="{{ r }}" {% if rmax==r %}selected{% endif %}>{{ r }} mi</option>{% endfor %}</select></div>
+<div class="rowflex"><div><label>Show sold from</label><select name="window" onchange="this.form.submit()">{% for dval,lab in [(30,'Last 30 days'),(90,'Last 90 days'),(180,'Last 6 months'),(365,'Last year')] %}<option value="{{ dval }}" {% if window==dval %}selected{% endif %}>{{ lab }}</option>{% endfor %}</select></div>
+<div><label>Show within radius</label><select name="rmax" onchange="this.form.submit()"><option value="" {% if not rmax %}selected{% endif %}>All pulled</option>{% for r in [0.25,0.5,1,1.25,1.5,2,2.5,5,10] %}<option value="{{ r }}" {% if rmax==r %}selected{% endif %}>{{ r }} mi</option>{% endfor %}</select></div>
 <div style="flex:0"><button class="btn sec">Apply filters</button></div></div></form></div>
 
 <div class="viewtabs" id="viewpills">
@@ -261,7 +307,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><span>Based on</span><b>{{ coli.n }} rental comps</b></div>
 <div><span>How it's estimated</span><b style="font-size:12px">{{ coli.method }}</b></div>
 <div><span>Source</span><b style="font-size:12px">{{ coli.source }} · {{ coli.date }}</b></div></div>
-<p class="small muted">This benchmark pre-fills the Co-Living underwriting rent per room — ReiSearch does the same from PadSplit ZIP stats. It is an estimate from whole-house rents, not live PadSplit listings (no free PadSplit feed exists).</p>
+<p class="small muted">This benchmark pre-fills the Co-Living underwriting rent per room from ZIP room-rent stats. It is an estimate from whole-house rents, not live PadSplit listings (no free PadSplit feed exists).</p>
 {% else %}<p class="muted">Not found — not enough rental comps with bedroom counts to estimate a per-room rent yet. Pull comps (with a wider radius if needed) and this benchmark will appear.</p>{% endif %}</div>
 {% if rents_view %}<div class="compcards">{{ subjcard('coliving') }}{% for c in rents_view %}{{ compcard(c, 'coliving') }}{% endfor %}</div>
 {% else %}<div class="card"><p class="muted">No rental comps yet — pull comps above.</p></div>{% endif %}
@@ -269,7 +315,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 
 <div class="viewpane {{ 'on' if cview=='str' }}" data-pane="str">
 <div class="card"><h2>Short Term Rental comps</h2>
-<p class="muted">No free data source for short-term (Airbnb-style) comps exists yet — and we won't fake it. ReiSearch itself showed <b>0 STR comps</b> for this ZIP. Enter your nightly rate, occupancy and cleaning fee manually in <a href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">Underwriting → Short Term</a> — the math there is fully wired.</p></div>
+<p class="muted">No free data source for short-term (Airbnb-style) comps exists yet — and we won't fake it. Enter your nightly rate, occupancy and cleaning fee manually in <a href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">Underwriting → Short Term</a> — the math there is fully wired.</p></div>
 </div>
 
 {% macro ltrstatbar() %}
@@ -281,7 +327,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 
 <div class="viewpane {{ 'on' if cview=='mtr' }}" data-pane="mtr">
 {{ ltrstatbar() }}
-<p class="small muted">Mid Term view — ReiSearch disables this view; ours reads the same pulled rental comps as Long Term (30+ day stays are listed in the same feeds).</p>
+<p class="small muted">Mid Term view — reads the same pulled rental comps as Long Term (30+ day stays are listed in the same feeds).</p>
 {% if rents_view %}<div class="compcards">{{ subjcard('rent') }}{% for c in rents_view %}{{ compcard(c, 'rent') }}{% endfor %}</div>
 {% else %}<div class="card"><p class="muted">No rental comps yet — pull comps above.</p></div>{% endif %}
 </div>
@@ -415,27 +461,70 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% endif %}
 
 {% if tab=='demographics' %}
-<div class="card"><h2>Demographics — ZIP {{ p.zip }} vs {{ p.city }}</h2>
-{% if not demo %}<p class="muted">US Census ACS data (free, no key needed) hasn't been loaded for this property yet.</p>
+<div class="card"><h2>Demographics — {{ ('ZIP ' ~ p.zip) if dscope=='zip' else (p.city ~ ' (city)') }}</h2>
+{% if demo_error %}<div class="notice err"><b>Last refresh failed.</b> {{ demo_error }}{% if demo %} The data below (pulled {{ p.demo_date or demo.date }}) was <b>not</b> overwritten.{% endif %}
+<form method="post" action="{{ url_for('dismiss_data_error', pid=p.id) }}" style="display:inline;margin-left:8px"><input type="hidden" name="which" value="demo"><button class="btn sm sec">Dismiss</button></form></div>{% endif %}
+{% if not demo %}<p class="muted">US Census ACS data hasn't been loaded for this property yet. (The Census <i>geocoder</i> is keyless; the Census <i>data</i> API now requires a free API key — set <code>CENSUS_API_KEY</code>.)</p>
 <form method="post" action="{{ url_for('pull_demographics', pid=p.id) }}"><button class="btn big blue">📊 Load demographics</button></form>
-<p class="small muted">Runs in the background — watch the banner at the top of this page. If the Census API is unreachable, you'll see the reason there instead of a silent blank.</p>
+<p class="small muted">Runs in the background — the result appears on this tab. If the pull fails, you'll see the reason here on this tab, not a silent blank.</p>
 {% else %}<p class="small muted">Source: {{ demo.source }} · pulled {{ p.demo_date or demo.date }}</p>
+<div class="scopetabs">
+<a class="btn sm {{ 'blue' if dscope=='zip' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='zip') }}">ZIP {{ p.zip }}</a>
+{% if demo.city %}<a class="btn sm {{ 'blue' if dscope=='city' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='city') }}">{{ p.city }} (city)</a>{% endif %}
+{% if dgeo %}<span class="small muted" style="margin-left:8px">{{ dgeo.name }}</span>{% endif %}
+</div>
+{% if dgeo %}
+<div class="demogrid">
+<div class="dcard"><h4>Housing — Tenure</h4>
+{% if dgeo.owner_pct is not none %}<div class="donutwrap"><svg viewBox="0 0 84 84" class="donut"><circle cx="42" cy="42" r="34" fill="none" stroke="#e5e7eb" stroke-width="12"/><circle cx="42" cy="42" r="34" fill="none" stroke="#2563eb" stroke-width="12" stroke-dasharray="{{ (dgeo.owner_pct / 100 * 213.63)|round(1) }} 213.63" transform="rotate(-90 42 42)"/><text x="42" y="46" text-anchor="middle" font-size="12" font-weight="700">{{ dgeo.owner_pct }}%</text></svg>
+<p class="small">Owner-occupied <b>{{ dgeo.owner_pct }}%</b><br>Renter-occupied <b>{{ dgeo.renter_pct }}%</b></p></div>{% else %}<p class="muted">Not found</p>{% endif %}
+<div class="kv"><div><span>Median home value</span><b>{{ dgeo.median_home_value|money }}</b>{% if dgeo.change and dgeo.change.home_value_pct is not none %}<span class="small {{ 'up' if dgeo.change.home_value_pct >= 0 else 'dn' }}">{{ '▲' if dgeo.change.home_value_pct >= 0 else '▼' }} {{ dgeo.change.home_value_pct }}% vs prior ACS vintage</span>{% endif %}</div>
+<div><span>Median rent</span><b>{{ dgeo.median_rent|money }}</b>{% if dgeo.change and dgeo.change.rent_pct is not none %}<span class="small {{ 'up' if dgeo.change.rent_pct >= 0 else 'dn' }}">{{ '▲' if dgeo.change.rent_pct >= 0 else '▼' }} {{ dgeo.change.rent_pct }}% vs prior ACS vintage</span>{% endif %}</div></div>
+</div>
+<div class="dcard"><h4>Income Distribution</h4>
+{% for b in dgeo.income_buckets %}<div class="bar-row"><span>{{ b.label }}</span><div class="bar-track"><div class="bar-fill" style="width:{{ b.pct }}%;background:#2563eb"></div></div><b>{{ b.pct }}%</b></div>{% else %}<p class="muted">Not found</p>{% endfor %}
+<p class="small muted">Median household income <b>{{ dgeo.median_income|money }}</b> · share of households per bracket</p>
+</div>
+<div class="dcard"><h4>Unemployment Rate</h4>
+{% if dgeo.unemployment_pct is not none %}<svg viewBox="0 0 100 58" class="gauge"><path d="M 10 52 A 40 40 0 0 1 90 52" fill="none" stroke="#e5e7eb" stroke-width="10"/><path d="M 10 52 A 40 40 0 0 1 90 52" fill="none" stroke="#d97706" stroke-width="10" stroke-dasharray="{{ (dgeo.unemployment_pct / 100 * 125.66)|round(1) }} 125.66"/><text x="50" y="48" text-anchor="middle" font-size="14" font-weight="700">{{ dgeo.unemployment_pct }}%</text></svg>
+<p class="small muted">Share of the labor force unemployed (ACS B23025)</p>{% else %}<p class="muted">Not found</p>{% endif %}
+</div>
+<div class="dcard"><h4>Population</h4>
+<p class="bignum">{{ dgeo.population|num }}</p>
+{% if trend_svg %}<svg viewBox="0 0 300 50" preserveAspectRatio="none" class="trendchart" style="width:100%;height:64px"><polyline points="{{ trend_svg.points }}" fill="none" stroke="#ea580c" stroke-width="2"/></svg>
+<p class="small muted">{{ trend_svg.first_year }}: {{ trend_svg.first_pop|num }} → {{ trend_svg.last_year }}: {{ trend_svg.last_pop|num }} (ACS 5-year vintages)</p>
+{% if dgeo.pop_trend and dgeo.pop_trend[-1].growth is not none %}<p class="small">Latest vintage growth: <b>{{ dgeo.pop_trend[-1].growth }}%</b>{% if dgeo.pop_trend[-1].growth_change is not none %} ({{ '+' if dgeo.pop_trend[-1].growth_change >= 0 else '' }}{{ dgeo.pop_trend[-1].growth_change }} pts vs prior vintage){% endif %}</p>{% endif %}
+{% else %}<p class="small muted">Latest ACS release figure. Vintage trend appears when the keyed Census API alternate is configured (Census Reporter's public API serves the latest release only).</p>
+{% endif %}
+</div>
+</div>
+{% if dgeo.race %}<h3>Race &amp; Ethnicity</h3>
+<div class="racewrap">{% set ns = namespace(g='') %}{% for r in dgeo.race %}{% set ns.g = ns.g ~ r.color ~ ' ' ~ r.from ~ '% ' ~ r.to ~ '%,' %}{% endfor %}
+<div class="racedonut" style="background:conic-gradient({{ ns.g[:-1] }})"></div>
+<table class="racetab"><tr><th>Group</th><th>Residents</th><th>Share</th></tr>
+{% for r in dgeo.race %}<tr><td><span class="swatch" style="background:{{ r.color }}"></span>{{ r.label }}</td><td>{{ r.count|num }}</td><td>{{ r.pct }}%</td></tr>{% endfor %}</table></div>
+<p class="small muted">Shares of total population. Hispanic or Latino (any race) comes from ACS B03003; the other groups from B02001 — the two tables overlap by design.</p>{% endif %}
+{% if dgeo.pyramid %}<h3>Age &amp; Sex</h3>
+<div class="pyr">{% for b in dgeo.pyramid %}<div class="pyrrow"><div class="pyrl"><span>{{ b.male|num }}</span><div class="pyrbar m" style="width:{{ b.male_w }}%"></div></div><span class="pyrb">{{ b.band }}</span><div class="pyrr"><div class="pyrbar f" style="width:{{ b.female_w }}%"></div><span>{{ b.female|num }}</span></div></div>{% endfor %}
+<p class="small muted">Male (left, blue) · Female (right, pink) — residents per age band (ACS B01001; the 80+ band totals the source's 80–84 and 85+ cells)</p></div>{% endif %}
+<h3>All figures</h3>
 <table><tr><th></th><th>ZIP {{ p.zip }}</th><th>{{ p.city }} (city)</th></tr>
 {% for lab, k in [('Population','population'),('Median home value','median_home_value'),('Median rent','median_rent'),('Median household income','median_income'),('Owner-occupied %','owner_pct'),('Renter-occupied %','renter_pct'),('Unemployment %','unemployment_pct')] %}
 <tr><td><b>{{ lab }}</b></td>
 <td>{% if demo.zip and demo.zip[k] is not none %}{% if 'value' in k or 'rent' in k or 'income' in k %}{{ demo.zip[k]|money }}{% else %}{{ demo.zip[k]|num(1) }}{% endif %}{% else %}Not found{% endif %}</td>
 <td>{% if demo.city and demo.city[k] is not none %}{% if 'value' in k or 'rent' in k or 'income' in k %}{{ demo.city[k]|money }}{% else %}{{ demo.city[k]|num(1) }}{% endif %}{% else %}Not found{% endif %}</td></tr>{% endfor %}
-</table><p class="small muted">City coverage in v1: Tampa, Orlando, Jacksonville, Kissimmee, Winter Springs place codes built in; others show ZIP only.</p>
+</table>
+{% endif %}
 <form method="post" action="{{ url_for('pull_demographics', pid=p.id) }}"><button class="btn sec">↻ Refresh demographics</button></form>{% endif %}
 <h3>Area &amp; geographics</h3>
 <div class="kv"><div><span>FEMA flood zone</span><b>{{ p.flood_zone or 'Not found' }}</b></div>
 <div><span>Flood source</span><b style="font-size:12px">{{ p.flood_source or '' }} {{ p.flood_date or '' }}</b></div>
-<div><span>Coordinates</span><b style="font-size:12px">{{ p.lat }}, {{ p.lon }}</b></div></div>
+<div><span>Coordinates</span><b style="font-size:12px">{% if p.lat is not none and p.lon is not none %}{{ '%.6f'|format(p.lat) }}, {{ '%.6f'|format(p.lon) }}{% else %}Not found{% endif %}</b></div></div>
 <h3>Nearby — within ~1 mile of the property</h3>
-{% if amenities and amenities.error %}
-<p class="muted">{{ amenities.error }}</p>
-<p class="small muted">Source: OpenStreetMap (Overpass API) · attempted {{ amenities.date or '' }}.</p>
-{% elif amenities %}
+{% set amen_err = amenities_error or (amenities.error if amenities and amenities.error else None) %}
+{% if amen_err %}<div class="notice err"><b>Nearby-places refresh failed.</b> {{ amen_err }}{% if amenities and amenities.groups %} The places below (pulled {{ amenities.date }}) were <b>not</b> overwritten.{% endif %}
+<form method="post" action="{{ url_for('dismiss_data_error', pid=p.id) }}" style="display:inline;margin-left:8px"><input type="hidden" name="which" value="amenities"><button class="btn sm sec">Dismiss</button></form></div>{% endif %}
+{% if amenities and amenities.groups %}
 <p class="small muted">Source: {{ amenities.source }} · pulled {{ amenities.date }} · radius {{ amenities.radius_mi }} mi · {{ amenities.total }} places found · cached on this property (Refresh re-pulls).</p>
 <div class="grid3">
 {% for cat, items in amenities.groups.items() %}<div>
@@ -444,7 +533,7 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% else %}<p class="small muted" style="margin:2px 0">None found within 1 mile</p>{% endfor %}
 </div>{% endfor %}
 </div>
-{% else %}
+{% elif not amen_err %}
 <p class="muted">Nearby amenities have not been pulled for this property yet — hit Refresh and they'll load in the background (~30 seconds).</p>
 {% endif %}
 <form method="post" action="{{ url_for('refresh_amenities', pid=p.id) }}"><button class="btn sec">↻ Refresh nearby amenities (OpenStreetMap)</button></form>
@@ -481,15 +570,27 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 
 {% if tab=='market' %}
 <div class="card"><h2>Market Data — ZIP {{ p.zip }}</h2>
-{% if market %}<div class="kv">
+{% if market %}
+<div class="mkt-filters"><span class="small muted">Property type:</span>
+{% for mt in ['All','Single Family','Condo','Townhouse'] %}<a class="btn sm {{ 'blue' if market.mtype==mt else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='market', mtype=mt, mrange=market.mrange) }}">{{ mt }}{% if mt=='All' %} ({{ market.type_counts.values()|sum }}){% elif market.type_counts.get(mt) %} ({{ market.type_counts.get(mt) }}){% endif %}</a>{% endfor %}
+<span class="small muted" style="margin-left:12px">Trend range:</span>
+{% for mr in ['1Y','3Y','5Y'] %}<a class="btn sm {{ 'blue' if market.mrange==mr else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='market', mtype=market.mtype, mrange=mr) }}">{{ mr }}</a>{% endfor %}
+</div>
+{% if market.untyped %}<p class="small muted" style="margin:4px 0 10px">Note: {{ market.untyped }} stored comp(s) were pulled before property types were recorded and are counted as Single Family — re-pull comps (Comparables tab) to record their real types and sharpen this filter.</p>{% endif %}
+<div class="kv">
 <div><span>Sold comps in set</span><b>{{ market.count }}</b></div>
 <div><span>Median sale price</span><b>{{ market.median_price|money }}</b></div>
 <div><span>Median $/sqft</span><b>${{ market.median_ppsf|num }}</b></div>
 <div><span>Median DOM</span><b>{{ market.median_dom|num }}</b></div></div>
-<p class="small muted">Source: {{ market.source }} · computed {{ market.date }}. (ReiSearch's Redfin tracker was stale — ours is computed live from your pulled comps, always date-stamped.)</p>
+<p class="small muted">Source: {{ market.source }} · computed {{ market.date }} from the comps stored on this property — always date-stamped.</p>
 <h3>Price trend (median sale price by month)</h3>
+{% if market.spark %}<svg viewBox="0 0 300 40" preserveAspectRatio="none" class="trendchart" style="width:100%;height:90px"><polyline points="{{ market.spark }}" fill="none" stroke="#ea580c" stroke-width="2"/></svg>
+<p class="small muted">{{ market.trend[0].month }} → {{ market.trend[-1].month }} · low {{ market.trend_min|money }} · high {{ market.trend_max|money }} (range buttons change the chart + table only; the cards above always use the full filtered set)</p>{% endif %}
 <table><tr><th>Month</th><th>Median</th><th>Sales</th></tr>
 {% for t in market.trend %}<tr><td>{{ t.month }}</td><td>{{ t.median|money }}</td><td>{{ t.count }}</td></tr>{% endfor %}</table>
+<h3>Nearby ZIP comparison</h3>
+<table><tr><th>ZIP</th><th>Median price</th><th>Median DOM</th><th>Sold comps</th></tr>
+{% for z in market.nearby %}<tr{% if z.you %} style="background:#eff6ff"{% endif %}><td><b>{{ z.zip }}</b>{% if z.you %} <span class="badge cash">YOU</span>{% endif %}</td><td>{{ z.median_price|money }}</td><td>{{ z.median_dom|num }}</td><td>{{ z.n }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No ZIP data in the filtered set.</td></tr>{% endfor %}</table>
 {% else %}<p class="muted">Not found — pull comps first (Comparables tab); market stats are computed from them.</p>{% endif %}
 <h3>Rent benchmark</h3>
 {% if rents %}{% set rs = rents|map(attribute='price')|list %}<p>Median asking rent nearby: <b>{{ (rs|sort)[rs|length//2]|money }}/mo</b> from {{ rents|length }} rental comps (HomeHarvest, pulled with comps). Long Term comp average (pinned/top-3): <b>{{ ltr.avg_rent|money }}/mo</b>. HUD SAFMR ZIP benchmark: add via county/HUD download — Not found in-app yet.</p>
@@ -497,7 +598,7 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% endif %}
 
 {% if tab=='taxes' %}
-<div class="card"><h2>Taxes — real county fields <span class="small muted">(ReiSearch hides this behind "Coming Soon" — ours stores real values from the county appraiser/tax collector)</span></h2>
+<div class="card"><h2>Taxes — real county fields <span class="small muted">(stored real values from the county appraiser/tax collector)</span></h2>
 <form method="post"><div class="rowflex">
 <div><label>Tax year</label><input name="tax_year" value="{{ p.tax_year or '' }}"></div>
 <div><label>Market value $</label><input name="tax_market" value="{{ p.tax_market if p.tax_market is not none else '' }}"></div>
@@ -513,13 +614,18 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% endif %}
 
 {% if tab=='documents' %}
-<div class="card"><h2>Documents — 42-slot checklist</h2>
-<p class="small muted">{{ docs|selectattr('done')|list|length }} of {{ docs|length }} complete. Check off + note each slot (file storage slots in as uploads mature; notes carry the reference in v1).</p>
+<div class="card"><h2>Documents checklist</h2>
+<p class="small muted">{{ docs|selectattr('done')|list|length }} of {{ docs|length }} complete. Check off + note each slot (file storage slots in as uploads mature; notes carry the reference in v1). The checklist starts from a standard 42-slot template — add your own documents below, or remove any row with ✕.</p>
+<form method="post" action="{{ url_for('doc_add', pid=p.id) }}" style="display:flex;gap:8px;align-items:center;margin:8px 0 14px;flex-wrap:wrap">
+<input name="title" placeholder="New document title (e.g. Insurance binder)" style="flex:2;min-width:220px">
+<select name="category">{% for cn in docs|map(attribute='category')|unique|list %}<option value="{{ cn }}">{{ cn }}</option>{% endfor %}<option value="Custom">Custom</option></select>
+<input name="notes" placeholder="file ref / note (optional)" style="flex:1;min-width:160px">
+<button class="btn">＋ Add document</button></form>
 {% set cats = docs|groupby('category') %}{% for cat, items in cats %}<h3>{{ cat }}</h3>
-{% for d in items %}<form method="post" action="{{ url_for('doc_update', did=d.id) }}" style="display:flex;gap:8px;align-items:center;margin:5px 0">
+{% for d in items %}<div style="display:flex;gap:6px;align-items:center;margin:5px 0"><form method="post" action="{{ url_for('doc_update', did=d.id) }}" style="display:flex;gap:8px;align-items:center;flex:1">
 <input type="checkbox" name="done" {% if d.done %}checked{% endif %} onchange="this.form.submit()">
 <span style="min-width:230px" class="{% if d.done %}muted{% endif %}">{{ d.slot }}</span>
 <input name="notes" value="{{ d.notes or '' }}" placeholder="file ref / note" style="flex:1">
-<button class="btn sm sec">Save</button></form>{% endfor %}{% endfor %}</div>
+<button class="btn sm sec">Save</button></form><form method="post" action="{{ url_for('doc_delete', did=d.id) }}" onsubmit="return confirm('Remove this document row?')"><button class="btn sm sec" title="Remove this document">✕</button></form></div>{% endfor %}{% endfor %}</div>
 {% endif %}
 {% endblock %}

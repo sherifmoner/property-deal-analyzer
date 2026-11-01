@@ -24,16 +24,49 @@
     var rate = N(f.rate), months = termMonths(f), pt = f.payment_type || "amortized", pay = 0;
     if (pt === "fixed") pay = N(f.fixed_payment);
     else if (pt === "interest_only") pay = amt * rate / 100 / 12;
-    else if (pt === "principal_only") pay = months ? amt / months : 0;
+    else if (pt === "principal_only") pay = amt * rate / 100 / 12 + (months ? amt / months : 0); // ReiSearch: interest + straight-line principal
     else pay = loanPayment(amt, rate, months / 12);
     return { pay: pay, esc: N(f.taxes_mo) + N(f.insurance_mo) };
   }
-  function amortY1Principal(amt, rate, yrs) {
-    amt = N(amt); rate = N(rate); yrs = N(yrs);
-    if (amt <= 0 || yrs <= 0) return 0;
-    var r = rate / 100 / 12, pmt = loanPayment(amt, rate, yrs), bal = amt, prin = 0;
-    for (var i = 0; i < 12; i++) { var inter = bal * r, p = Math.min(pmt - inter, bal); prin += p; bal -= p; if (bal <= 0) break; }
+  function paydownY1For(f) {
+    /* Year-1 principal paydown by payment type (mirrors app.py _paydown_y1).
+       Interest Only pays NO principal — balance flat (v1.6 fix F: the old generic
+       amortization table booked IO balances as Year-1 paydown). */
+    if (!f || f.type === "Cash" || f.type === "Equity") return 0;
+    var amt = N(f.amount); if (amt <= 0) return 0;
+    var rate = N(f.rate), months = termMonths(f), pt = f.payment_type || "amortized";
+    if (pt === "interest_only") return 0;
+    if (pt === "principal_only") return months ? Math.min(amt, amt / months * 12) : 0;
+    var pay = pt === "fixed" ? N(f.fixed_payment) : loanPayment(amt, rate, (months || 360) / 12);
+    if (pay <= 0) return 0;
+    var r = rate / 100 / 12, bal = amt, prin = 0;
+    for (var i = 0; i < 12 && bal > 0; i++) { var p = Math.min(Math.max(pay - bal * r, 0), bal); prin += p; bal -= p; }
     return prin;
+  }
+  function loanSchedule(f) {
+    /* Full schedule simulated by the card's OWN payment type (mirrors the sidebar
+       view): IO = interest only, $0 principal, balance flat. */
+    var amt = N(f.amount), rate = N(f.rate), months = termMonths(f) || 360;
+    var pt = f.payment_type || "amortized";
+    var rp = rowPayment(f);
+    var r = rate / 100 / 12, bal = amt, rows = [];
+    var pmtAm = loanPayment(amt, rate, months / 12);
+    var maxY = Math.min(Math.ceil(months / 12), 40);
+    for (var y = 1; y <= maxY; y++) {
+      var ti = 0, tp = 0;
+      for (var i = 0; i < 12; i++) {
+        var inter = bal * r, prin = 0;
+        if (pt === "interest_only") { inter = amt * r; prin = 0; }
+        else if (pt === "principal_only") prin = Math.min(amt / months, bal);
+        else if (pt === "fixed") prin = Math.min(Math.max(rp.pay - inter, 0), bal);
+        else prin = Math.min(Math.max(pmtAm - inter, 0), bal);
+        ti += inter; tp += prin; bal -= prin; if (bal < 0) bal = 0;
+      }
+      rows.push({ year: y, interest: ti, principal: tp, balance: Math.max(bal, 0) });
+      if (pt === "interest_only") { if (y >= 10) break; }
+      else if (bal <= 0.5) break;
+    }
+    return { payment: rp.pay + rp.esc, rows: rows };
   }
   function scoreLabel(t) { return t >= 75 ? "Strong" : (t >= 55 ? "Workable" : (t >= 40 ? "Thin" : "Weak")); }
   function scoreRental(m, penalties) {
@@ -85,6 +118,7 @@
     var hMonths = hUnit === "Months" ? hPeriod : hPeriod / 30;
     var holdingMo = N(s.holding_mo), holdingTotal = holdingMo * hMonths;
     var funded = 0, cashEquity = 0, debtAmt = 0, debtRows = 0, paydownY1 = 0, pointsFees = 0;
+    var debtLines = [];
     (s.funding || []).forEach(function (f) {
       var amt = N(f.amount); funded += amt;
       pointsFees += amt * N(f.points) / 100 + N(f.fees);
@@ -92,8 +126,10 @@
       else {
         debtAmt += amt;
         var rp = rowPayment(f); debtRows += rp.pay + rp.esc;
-        if (f.payment_type === "principal_only") paydownY1 += Math.min(amt, rp.pay * 12);
-        else paydownY1 += amortY1Principal(amt, f.rate, termMonths(f) / 12);
+        paydownY1 += paydownY1For(f);
+        var lab = f.loan_type || f.type || "Loan";
+        if (f.preset && f.preset !== lab) lab += " · " + f.preset;
+        debtLines.push({ label: lab, payment: Math.round(rp.pay + rp.esc) });
       }
     });
     var entryFee = 0, mdPayment = 0;
@@ -106,13 +142,18 @@
     var financingCosts = closing + pointsFees;
     var uses = totalProject + holdingTotal;
     var gap = uses - funded;
-    var cashIn = cashEquity + Math.max(gap, 0) + financingCosts + entryFee;
+    /* v1.6 Cash Needed (ReiSearch): cash contributions + points/fees + closing +
+       entry fee. A loan-only funding GAP does not inflate Cash Needed on rentals;
+       Fix & Flip keeps the gap (mirrors app.py compute_underwriting). */
+    var cashIn = cashEquity + pointsFees + closing + entryFee + (strat === "Fix & Flip" ? Math.max(gap, 0) : 0);
     var fundingStatus = funded <= 0 ? "Not Funded" : (gap <= 0 ? "Fully Funded" : "Partially Funded");
     var out = { strategy: strat, arv: arv, purchase_price: price, rehab: rehab, rehab_calc: rehabCalc,
       rehab_mode: rehabMode, appliances: appliances, furnishing: furnishing, conversion: conversion,
       total_project: totalProject, holding_cost: holdingTotal, uses: uses, funded: funded, gap: gap,
       cash_in: cashIn, financing_costs: financingCosts, funding_status: fundingStatus,
-      debt_service_mo: debtService, entry_fee: entryFee };
+      debt_service_mo: debtService, entry_fee: entryFee,
+      cash_contrib: cashEquity, points_fees: pointsFees, closing_costs: closing,
+      debt_lines: debtLines, md_payment_mo: mdPayment };
 
     if (strat === "Fix & Flip") {
       var sale = N(s.sale_price) || arv;
@@ -151,14 +192,33 @@
        loan payment (they live inside PITI when one exists — ReiSearch/Senisa behavior). */
     var penalties = [], flags = [];
     var taxesMo = N(s.taxes_mo), insMo = N(s.insurance_mo);
+    /* v1.6 standard-numbers rule (Sherif): standard costs AUTO-POPULATE visibly in
+       their fields as editable defaults — real annual tax from the property record
+       / 12 where known, else a labeled estimate (mirrors app.py). writeOutputs
+       writes the estimate into the field (flagged) so fields and totals tie out;
+       the estimate withdraws when a loan payment exists (taxes/insurance then live
+       inside PITI) and never touches a value the user typed. */
+    var propTaxMo = N(UW.propTaxMo), taxesEst = false, insEst = false;
+    function estFlag(k) { return String(s[k]) === "1" || s[k] === 1; }
     if (debtService === 0 && taxesMo === 0) {
-      taxesMo = (price || arv) ? Math.round((price || arv) * 0.011 / 12) : 0;
-      penalties.push({ points: 6, reason: "Taxes were $0 — sanity default applied (1.1% of price/yr, county-style estimate)" });
+      taxesMo = propTaxMo || ((price || arv) ? Math.round((price || arv) * 0.011 / 12) : 0);
+      if (taxesMo > 0) {
+        taxesEst = true;
+        penalties.push({ points: 6, reason: "Taxes were $0 — auto-estimate applied (" + (propTaxMo ? "county tax record" : "1.1% of price/yr estimate") + "), shown in the field" });
+        flags.push("Taxes estimated — verify with county");
+      }
+    } else if (debtService === 0 && estFlag("taxes_est") && taxesMo > 0) {
+      taxesEst = true;
+      penalties.push({ points: 6, reason: "Taxes are an auto-estimate (shown in the field) — verify with county" });
       flags.push("Taxes estimated — verify with county");
     }
     if (debtService === 0 && insMo === 0) {
-      insMo = 180;
-      penalties.push({ points: 6, reason: "Insurance was $0 — sanity default applied ($180/mo estimate)" });
+      insMo = 180; insEst = true;
+      penalties.push({ points: 6, reason: "Insurance was $0 — auto-estimate applied ($180/mo estimate), shown in the field" });
+      flags.push("Insurance estimated");
+    } else if (debtService === 0 && estFlag("insurance_est") && insMo > 0) {
+      insEst = true;
+      penalties.push({ points: 6, reason: "Insurance is an auto-estimate (shown in the field) — verify" });
       flags.push("Insurance estimated");
     }
     var gross = 0, vacLoss = 0, other = 0, roomsN = 1, cleaningIncome = 0, amenityRows = 0;
@@ -217,7 +277,11 @@
       downside_cf: egi * 0.9 - opex - debtService };
     function scenR(mult, noVac) {
       var e2 = noVac ? gross + other : (gross - vacLoss) * mult + other;
-      return { revenue: e2, expenses: opex + debtService, net: e2 - opex - debtService };
+      var noiS = e2 - opex;
+      return { revenue: e2, expenses: opex, loan: debtService, net: e2 - opex - debtService,
+        dscr: debtService ? noiS / debtService : (noiS > 0 ? 1.5 : 0),
+        cap_rate_pct: value ? noiS * 12 / value * 100 : 0,
+        coc_pct: cashIn ? (e2 - opex - debtService) * 12 / cashIn * 100 : null };
     }
     var scen2 = { "Downside (-10%)": scenR(0.9), "Base Case (0%)": scenR(1.0), "Upside (+10%)": scenR(1.1) };
     if (strat === "Co-Living") scen2["Fully Booked (0% vacancy)"] = scenR(1.0, true);
@@ -228,10 +292,11 @@
     out.cleaning_income_mo = cleaningIncome; out.fees_mo = feesCat; out.booking_fee_mo = bookingFee;
     out.service_fee_mo = serviceFee; out.mgmt_fee_mo = mgmtFee; out.platform_fee_mo = platformFee;
     out.egi_mo = egi; out.opex_mo = opex; out.opex_cats = opexCats; out.taxes_mo = taxesMo; out.insurance_mo = insMo;
+    out.taxes_est = taxesEst; out.insurance_est = insEst;
     out.noi_mo = noi; out.cashflow_mo = cf; out.cf_per_room = metrics.cf_per_room;
     out.cash_per_room = roomsN ? cashIn / roomsN : null;
     out.dscr = Math.round(metrics.dscr * 100) / 100;
-    out.coc_pct = metrics.coc * 100; out.cap_rate_pct = metrics.cap_rate * 100;
+    out.coc_pct = cashIn ? metrics.coc * 100 : null; out.cap_rate_pct = metrics.cap_rate * 100;
     out.breakeven_pct = metrics.breakeven * 100;
     out.payback_yrs = metrics.coc > 0 ? Math.round(10 / metrics.coc) / 10 : null;
     out.scenarios = scen2; out.rooms = roomsN;
@@ -406,6 +471,8 @@
     panel.querySelectorAll("input[name], select[name]").forEach(function (e) {
       if (e.type === "hidden") return; s[e.name] = e.value;
     });
+    /* auto-estimate flags ride along (hidden inputs the main loop skips) */
+    panel.querySelectorAll("input[data-estflag]").forEach(function (e) { s[e.name] = e.value; });
     s.rehab_rooms = readRows(panel, "rehab_rooms");
     s.rehab_flats = readRows(panel, "rehab_flats");
     s.appliances = readRows(panel, "appliances");
@@ -520,7 +587,23 @@
     var sc = (r.scenarios || {})[scenKey] || (r.scenarios || {})["Base Case (0%)"];
     panel.querySelectorAll("[data-scen]").forEach(function (elm) {
       var k = elm.dataset.scen;
-      elm.textContent = k === "rev" ? M(sc ? sc.revenue : r.egi_mo) : (k === "exp" ? M(r.opex_mo) : M(r.debt_service_mo));
+      elm.textContent = k === "rev" ? M(sc ? sc.revenue : r.egi_mo)
+        : (k === "exp" ? M(sc ? sc.expenses : r.opex_mo)
+        : M(sc && sc.loan !== undefined ? sc.loan : r.debt_service_mo));
+    });
+    /* per-scenario Key Metrics block (sidebar Scenarios pane) */
+    panel.querySelectorAll("[data-scenm]").forEach(function (elm) {
+      var k = elm.dataset.scenm;
+      if (k === "name") {
+        var chip = panel.querySelector('[data-scenchip="' + scenKey + '"]');
+        elm.textContent = chip ? chip.textContent.trim() : scenKey.replace(/\s*\(.*\)\s*$/, "");
+        return;
+      }
+      if (!sc) { elm.textContent = "—"; return; }
+      if (k === "net") elm.textContent = M(sc.net) + "/mo";
+      else if (k === "coc") elm.textContent = PC(sc.coc_pct);
+      else if (k === "dscr") elm.textContent = (sc.dscr === null || sc.dscr === undefined) ? "—" : (Math.round(sc.dscr * 100) / 100).toFixed(2);
+      else if (k === "cap") elm.textContent = PC(sc.cap_rate_pct);
     });
     var ncfBase = sc ? sc.net : r.cashflow_mo;
     panel.querySelectorAll("[data-ncfdisp]").forEach(function (elm) {
@@ -531,9 +614,35 @@
     });
     panel.querySelectorAll("[data-cfseg]").forEach(function (elm) {
       var tot = Math.max(r.egi_mo || 0, 1);
-      var v = elm.dataset.cfseg === "exp" ? r.opex_mo : (elm.dataset.cfseg === "debt" ? r.debt_service_mo : Math.max(ncfBase || 0, 0));
+      var v = elm.dataset.cfseg === "exp" ? (sc ? sc.expenses : r.opex_mo)
+        : (elm.dataset.cfseg === "debt" ? (sc && sc.loan !== undefined ? sc.loan : r.debt_service_mo) : Math.max(ncfBase || 0, 0));
       elm.style.width = clamp(v / tot * 100, 0, 100) + "%";
     });
+    /* v1.6 standard-numbers: write auto-estimates INTO their fields (flagged), and
+       withdraw them when a loan payment takes over — never touch user-typed values. */
+    function estField(name, flagName, effVal, estOn) {
+      var inp = panel.querySelector('[name="' + name + '"]'); if (!inp) return;
+      var flag = panel.querySelector('[name="' + flagName + '"]');
+      if (estOn) {
+        if (document.activeElement !== inp && !N(inp.value) && effVal > 0) {
+          inp.value = Math.round(effVal);
+          if (flag) flag.value = "1";
+        }
+        inp.classList.toggle("est", !!(flag && flag.value === "1"));
+        inp.title = "Auto-estimate — edit to replace with the real number";
+      } else {
+        if (flag && flag.value === "1" && document.activeElement !== inp) { inp.value = ""; flag.value = ""; }
+        inp.classList.remove("est"); inp.title = "";
+      }
+    }
+    if (strat !== "Fix & Flip") {
+      estField("taxes_mo", "taxes_est", r.taxes_mo || 0, !!r.taxes_est);
+      estField("insurance_mo", "insurance_est", r.insurance_mo || 0, !!r.insurance_est);
+    }
+    /* preset buttons show an active/added state while their card is in the stack */
+    var inUse = {};
+    (s.funding || []).forEach(function (f) { inUse[f.preset || f.type] = 1; });
+    panel.querySelectorAll("[data-preset]").forEach(function (b) { b.classList.toggle("on", !!inUse[b.dataset.preset]); });
     panel.querySelectorAll("[data-yr]").forEach(function (elm) {
       var inp = panel.querySelector('[name="' + elm.dataset.yr + '"]');
       elm.textContent = inp ? (M(N(inp.value) * 12) + "/yr") : "";
@@ -570,20 +679,27 @@
     panel.querySelectorAll(".fcard").forEach(function (d, i) {
       var f = (s.funding || [])[i]; if (!f) return;
       var rp = rowPayment(f);
-      var pay = d.querySelector(".f-pay"); if (pay) pay.textContent = M(rp.pay + rp.esc);
+      var pay = d.querySelector(".f-pay");
+      if (pay) pay.textContent = (f.payment_type === "fixed" && (f.fixed_payment === "" || f.fixed_payment === null || f.fixed_payment === undefined))
+        ? "not set" : M(rp.pay + rp.esc);
       var t = d.querySelector(".f-title");
       if (t) t.textContent = f.loan_type === f.preset ? (f.loan_type || "") : ((f.loan_type || "") + " · " + (f.preset || ""));
     });
-    /* sidebar amortization mini-view: first real loan card, else the property loan */
+    /* sidebar amortization mini-view: first real loan card, else the property loan.
+       v1.6: the schedule is simulated by the card's OWN payment type — an
+       interest-only loan shows interest payments, $0 principal, balance flat. */
     var am = panel.querySelector("[data-amort='side']");
     if (am) {
       var loan = null;
       (s.funding || []).forEach(function (f) { if (!loan && f.type !== "Cash" && f.type !== "Equity" && N(f.amount) > 0) loan = f; });
-      var amt = 0, rate = 0, yrs = 30;
-      if (loan) { amt = N(loan.amount); rate = N(loan.rate); yrs = termMonths(loan) / 12 || 30; }
-      else if (UW.propLoan && N(UW.propLoan.balance) > 0) { amt = N(UW.propLoan.balance); rate = N(UW.propLoan.rate); yrs = 30; }
+      var amt = 0, rate = 0;
+      if (!loan && UW.propLoan && N(UW.propLoan.balance) > 0) {
+        loan = { type: "Conventional", amount: N(UW.propLoan.balance), rate: N(UW.propLoan.rate),
+                 term_value: 30, term_unit: "Years", payment_type: "amortized", taxes_mo: 0, insurance_mo: 0, fixed_payment: "" };
+      }
+      if (loan) { amt = N(loan.amount); rate = N(loan.rate); }
       if (amt > 0) {
-        var sch = amortSchedule(amt, rate, yrs);
+        var sch = loanSchedule(loan);
         var maxPI = 1; sch.rows.slice(0, 15).forEach(function (x) { maxPI = Math.max(maxPI, x.interest + x.principal); });
         var bars = sch.rows.slice(0, 15).map(function (x) {
           return '<div class="am-bar" title="Year ' + x.year + '"><div class="am-i" style="height:' + Math.max(2, x.interest / maxPI * 44) + 'px"></div><div class="am-p" style="height:' + Math.max(2, x.principal / maxPI * 44) + 'px"></div></div>';
@@ -612,12 +728,34 @@
     var scn = panel.querySelector("[data-scenarios]");
     if (scn && r.scenarios) {
       var isFlip = strat === "Fix & Flip";
-      var h = '<table><thead><tr><th>Scenario</th><th>' + (isFlip ? "Sale Price" : "Revenue") + '</th><th>' + (isFlip ? "All-in" : "Expenses") + '</th><th>Net</th></tr></thead><tbody>';
+      var h = '<table><thead><tr><th>Scenario</th><th>' + (isFlip ? "Sale Price" : "Revenue") + '</th><th>' + (isFlip ? "All-in" : "Expenses") + '</th>' + (isFlip ? "" : "<th>Loan Payments</th>") + '<th>Net</th></tr></thead><tbody>';
       Object.keys(r.scenarios).forEach(function (k) {
         var v = r.scenarios[k];
-        h += "<tr><td>" + k + "</td><td>" + M(isFlip ? v.sale : v.revenue) + "</td><td>" + M(isFlip ? v.all_in : v.expenses) + "</td><td><b>" + M(v.net) + "</b></td></tr>";
+        h += "<tr><td>" + k + "</td><td>" + M(isFlip ? v.sale : v.revenue) + "</td><td>" + M(isFlip ? v.all_in : v.expenses) + "</td>"
+          + (isFlip ? "" : "<td>" + M(v.loan || 0) + "</td>") + "<td><b>" + M(v.net) + "</b></td></tr>";
       });
       scn.innerHTML = h + "</tbody></table>";
+    }
+    /* on-screen breakdowns: Monthly Debt Service per line, Cash Needed per component */
+    var dbd = panel.querySelector('[data-breakdown="debt"]');
+    if (dbd) {
+      var dl = (r.debt_lines || []).map(function (l) {
+        return '<div class="srow"><span>' + l.label + '</span><b>' + M(l.payment) + '</b></div>';
+      }).join("");
+      if (N(r.md_payment_mo)) dl += '<div class="srow"><span>Existing mortgage (PITI)</span><b>' + M(r.md_payment_mo) + '</b></div>';
+      dbd.innerHTML = dl ? '<h4 class="det-h">Monthly Debt Service</h4>' + dl : "";
+    }
+    var cbd = panel.querySelector('[data-breakdown="cash"]');
+    if (cbd) {
+      var cl = [];
+      if (strat === "Fix & Flip" && r.gap > 0) cl.push(["Funding gap (cash at closing)", r.gap]);
+      if (N(r.cash_contrib)) cl.push(["Cash contributions", r.cash_contrib]);
+      if (N(r.closing_costs)) cl.push(["Closing costs", r.closing_costs]);
+      if (N(r.points_fees)) cl.push(["Points & fees", r.points_fees]);
+      if (N(r.entry_fee)) cl.push(["Total Entry Fee (existing mortgage)", r.entry_fee]);
+      cbd.innerHTML = cl.length ? '<h4 class="det-h">Cash Needed — breakdown</h4>' + cl.map(function (x) {
+        return '<div class="srow"><span>' + x[0] + '</span><b>' + M(x[1]) + '</b></div>';
+      }).join("") + '<div class="srow tot"><span>Cash Needed</span><b>' + M(r.cash_in) + '</b></div>' : "";
     }
     var det = panel.querySelector("[data-details]");
     if (det) {
@@ -666,7 +804,12 @@
     }
     var ga = panel.querySelector("[data-gapalert]");
     if (ga) {
-      if (r.gap > 0) { ga.style.display = "block"; ga.textContent = "⚠ Funding gap: Total Uses exceed funding added by " + M(r.gap) + " — the gap is counted in Cash Needed."; }
+      if (r.gap > 0) {
+        ga.style.display = "block";
+        ga.textContent = strat === "Fix & Flip"
+          ? "⚠ Funding gap: Total Uses exceed funding added by " + M(r.gap) + " — the gap is counted in Cash Needed."
+          : "⚠ Funding gap: Total Uses exceed funding added by " + M(r.gap) + " — a loan-only gap is NOT counted in Cash Needed; add cash or another funding line to fund it.";
+      }
       else ga.style.display = "none";
     }
   }
@@ -760,7 +903,7 @@
       var v = state[k];
       if (v === null || typeof v === "object") return;
       var e = panel.querySelector('[name="' + k + '"]');
-      if (e && e.type !== "hidden") e.value = v;
+      if (e && (e.type !== "hidden" || e.hasAttribute("data-estflag"))) e.value = v;
     });
     setRows(panel, "rehab_rooms", state.rehab_rooms);
     setRows(panel, "rehab_flats", state.rehab_flats);
@@ -875,41 +1018,84 @@
     recalc(panel);
     return false;
   };
+  /* v1.6 funding model (ReiSearch semantics): presets are ADDITIVE stacked cards,
+     defaults are % of the purchase price. The in-card loan-type dropdown re-applies
+     the same defaults (LOAN_DEFAULTS) — it is no longer a dead control. */
+  var LOAN_DEFAULTS = {
+    "Conventional": { pct: 0.80, rate: 7, tv: 30, unit: "Years", pt: "amortized", points: 0 },
+    "DSCR": { pct: 0.75, rate: 7.5, tv: 30, unit: "Years", pt: "amortized", points: 0 },
+    "Hard Money": { pct: 0.85, rate: 11, tv: 12, unit: "Months", pt: "interest_only", points: 2 },
+    "Private Money": { pct: 0.80, rate: 10, tv: 12, unit: "Months", pt: "interest_only", points: 0 },
+    "Seller Financing": { pct: 0.90, rate: 5, tv: 30, unit: "Years", pt: "amortized", points: 0 },
+    "FHA": { pct: 0.80, rate: 6.5, tv: 30, unit: "Years", pt: "amortized", points: 0 },
+    "VA": { pct: 0.80, rate: 6.5, tv: 30, unit: "Years", pt: "amortized", points: 0 },
+    "USDA": { pct: 0.80, rate: 6.5, tv: 30, unit: "Years", pt: "amortized", points: 0 },
+    "Bridge": { pct: 0.70, rate: 9, tv: 12, unit: "Months", pt: "interest_only", points: 1 },
+    "HELOC": { pct: 0.70, rate: 8, tv: 10, unit: "Years", pt: "interest_only", points: 0 }
+  };
+  function setPtypeUI(cardEl, pt) {
+    cardEl.dataset.ptype = pt;
+    cardEl.querySelectorAll(".f-pt").forEach(function (b) { b.classList.toggle("on", b.dataset.pt === pt); });
+    var fx = cardEl.querySelector(".f-fixed"); if (fx) fx.style.display = pt === "fixed" ? "" : "none";
+  }
+  function subjectToCard(panel) {
+    var pl = UW.propLoan || {};
+    if (panel.dataset.strategy === "Fix & Flip" && N(pl.balance) > 0) {
+      /* ReiSearch Flip behavior: the existing loan becomes a funding card (PITI = fixed payment) */
+      var c = blankCard("Subject-To");
+      c.amount = N(pl.balance); c.rate = N(pl.rate); c.payment_type = "fixed";
+      c.fixed_payment = N(pl.piti); c.loan_type = pl.type || "FHA";
+      return c;
+    }
+    /* Rentals (and Flip with no loan on file): ReiSearch's Subject-To card — blank
+       amount, 0%, Fixed Payment, 1st Position, editable Taxes/Insurance escrow fields. */
+    var c2 = blankCard("Subject-To");
+    c2.amount = ""; c2.rate = 0; c2.payment_type = "fixed"; c2.fixed_payment = "";
+    c2.loan_type = pl.type || "Conventional"; c2.position = "1st Position";
+    return c2;
+  }
+  function applyLoanDefaults(sel) {
+    /* The in-card "Existing Loan Type" dropdown: re-apply that type's defaults to
+       this card, exactly as if its preset had been clicked. */
+    var cardEl = sel.closest(".fcard"); var panel = sel.closest(".uw-panel");
+    var name = sel.value;
+    if (name === "Other") { cardEl.dataset.preset = "Other"; return; }
+    var s = readState(panel); var r = compute(panel.dataset.strategy, s); var price = N(s.purchase_price);
+    function set(cls, v) { var e = cardEl.querySelector(cls); if (e) e.value = v; }
+    if (name === "Cash") {
+      cardEl.dataset.type = "Cash"; cardEl.dataset.preset = "Cash";
+      set(".f-amt", Math.round(r.uses)); set(".f-rate", 0); setPtypeUI(cardEl, "amortized");
+      return;
+    }
+    var d = LOAN_DEFAULTS[name]; if (!d) return;
+    cardEl.dataset.type = name; cardEl.dataset.preset = name;
+    set(".f-amt", Math.round(d.pct * price)); set(".f-rate", d.rate);
+    set(".f-termval", d.tv); set(".f-termunit", d.unit); set(".f-points", d.points || 0);
+    setPtypeUI(cardEl, d.pt);
+  }
   window.uwPreset = function (btn, name) {
     var panel = btn.closest(".uw-panel");
     var s = readState(panel);
     var r = compute(panel.dataset.strategy, s);
     var price = N(s.purchase_price), uses = r.uses;
+    var box = panel.querySelector('[data-rows="funding"]'); if (!box) return false;
     function card(type, amt, rate, tv, unit, ptype, extra) {
       var c = blankCard(type); c.amount = Math.round(amt); c.rate = rate;
       c.term_value = tv; c.term_unit = unit; c.payment_type = ptype;
       if (extra) Object.keys(extra).forEach(function (k) { c[k] = extra[k]; });
       return c;
     }
-    var F = null;
-    if (name === "Cash") F = [card("Cash", uses, 0, "", "Months", "amortized", { loan_type: "Cash" })];
-    else if (name === "Conventional") F = [card("Conventional", 0.8 * price, 7, 30, "Years", "amortized")];
-    else if (name === "DSCR") F = [card("DSCR", 0.75 * price, 7.5, 30, "Years", "amortized")];
-    else if (name === "Hard Money") F = [card("Hard Money", 0.9 * (price + r.rehab), 11, 12, "Months", "interest_only")];
-    else if (name === "Private Money") F = [card("Private Money", price, 10, 12, "Months", "interest_only")];
-    else if (name === "Seller Financing") F = [card("Seller Financing", 0.9 * price, 6, 30, "Years", "amortized")];
+    if (name === "Cash") box.appendChild(fundingCard(card("Cash", uses, 0, "", "Months", "amortized", { loan_type: "Cash" })));
+    else if (name === "Subject-To") box.appendChild(fundingCard(subjectToCard(panel)));
     else if (name === "Custom Stack") {
       var loan = Math.round(0.7 * price);
-      F = [card("Conventional", loan, 7, 30, "Years", "amortized"),
-           card("Cash", Math.max(0, Math.round(uses - loan)), 0, "", "Months", "amortized", { loan_type: "Cash" })];
-    } else if (name === "Subject-To") {
-      if (panel.dataset.strategy === "Fix & Flip") {
-        /* ReiSearch Flip behavior: the existing loan becomes a funding card (PITI = fixed payment) */
-        var pl = UW.propLoan || {};
-        F = [card("Subject-To", N(pl.balance), N(pl.rate), "", "Months", "fixed",
-                  { loan_type: pl.type || "FHA", fixed_payment: N(pl.piti) })];
-      } else {
-        var det = panel.querySelector('details.acc.sub');
-        if (det) { det.open = true; det.scrollIntoView({ behavior: "smooth", block: "center" }); }
-        return false;
-      }
+      box.appendChild(fundingCard(card("Conventional", loan, 7, 30, "Years", "amortized")));
+      box.appendChild(fundingCard(card("Cash", Math.max(0, uses - loan), 0, "", "Months", "amortized", { loan_type: "Cash" })));
+    } else {
+      var d = LOAN_DEFAULTS[name];
+      if (d) box.appendChild(fundingCard(card(name, d.pct * price, d.rate, d.tv, d.unit, d.pt, { points: d.points || 0 })));
     }
-    if (F) { setRows(panel, "funding", F); recalc(panel); }
+    recalc(panel);
     return false;
   };
 
@@ -928,8 +1114,31 @@
       }
       if ((UW.drafts || {})[strat]) setStatus(panel, "Last saved " + UW.drafts[strat]);
       var timer = null;
-      panel.addEventListener("input", function () { clearTimeout(timer); timer = setTimeout(function () { recalc(panel); }, 90); });
-      panel.addEventListener("change", function () { recalc(panel); });
+      panel.addEventListener("input", function (e) {
+        /* v1.6 reactivity fix (D): sync the paired rent/late-fee fields AT INPUT TIME
+           so the recalc that follows reads fresh values — totals used to land one
+           interaction late because readState ran before writeOutputs synced them. */
+        var t = e.target;
+        if (t && t.classList) {
+          if (t.classList.contains("r-rentwk")) {
+            var row = t.closest(".rrow"), mo = row && row.querySelector(".r-rentmo");
+            if (mo) mo.value = Math.round(N(t.value) * 52 / 12 * 100) / 100;
+          } else if (t.classList.contains("r-rentmo")) {
+            var row2 = t.closest(".rrow"), wk = row2 && row2.querySelector(".r-rentwk");
+            if (wk) wk.value = Math.round(N(t.value) * 12 / 52 * 100) / 100;
+          }
+          if (t.name === "late_fees_wk") { var m1 = panel.querySelector('[name="late_fees_mo"]'); if (m1) m1.value = Math.round(N(t.value) * 52 / 12 * 100) / 100; }
+          else if (t.name === "late_fees_mo") { var w1 = panel.querySelector('[name="late_fees_wk"]'); if (w1) w1.value = Math.round(N(t.value) * 12 / 52 * 100) / 100; }
+          if (t.name === "taxes_mo") { var fl = panel.querySelector('[name="taxes_est"]'); if (fl) fl.value = ""; t.classList.remove("est"); }
+          if (t.name === "insurance_mo") { var fl2 = panel.querySelector('[name="insurance_est"]'); if (fl2) fl2.value = ""; t.classList.remove("est"); }
+        }
+        clearTimeout(timer); timer = setTimeout(function () { recalc(panel); }, 90);
+      });
+      panel.addEventListener("change", function (e) {
+        /* v1.6: the in-card loan-type dropdown re-applies that type's defaults */
+        if (e.target && e.target.classList && e.target.classList.contains("f-loantype")) applyLoanDefaults(e.target);
+        recalc(panel);
+      });
       panel.addEventListener("click", function (e) {
         var t = e.target;
         if (t.classList && t.classList.contains("r-del")) {
