@@ -331,3 +331,15 @@ input.est{background:#fffbeb;border-color:#d97706;border-style:dashed}
 .cfbox h4{color:var(--ink)}
 .cfbox .srow{color:var(--ink);border-bottom-color:var(--line)}
 .cfbar{background:#e2e8f0}
+
+/* v1.7a comps tools: search + grid/list toggle, pagination, list view */
+.comptools{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:0 0 10px;flex-wrap:wrap}
+.comptools input[type="search"]{flex:1;min-width:200px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px}
+.viewtoggle .btn{margin-left:6px}
+.pager{display:flex;align-items:center;gap:6px;margin:12px 0;flex-wrap:wrap}
+.pager [data-page-nums] .btn{min-width:34px}
+table.complist{width:100%;border-collapse:collapse;font-size:13px}
+table.complist th,table.complist td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;white-space:nowrap}
+table.complist th[data-sort]{cursor:pointer;user-select:none}
+table.complist tr[data-subject]{background:#eff6ff;font-weight:600}
+[data-demo-loading]{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px 14px;margin:10px 0}

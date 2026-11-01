@@ -12,7 +12,7 @@
 </div>{% endif %}
 {% endmacro %}
 {% macro compcard(c, mode) %}
-<div class="ccard {{ 'pinned' if c.pinned }}" data-cid="{{ c.id }}">
+<div class="ccard {{ 'pinned' if c.pinned }}" data-cid="{{ c.id }}" data-price="{{ c.price if c.price is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}">
  {% if c.photo_url %}<img class="cphoto" src="{{ c.photo_url }}" alt="Comp photo" loading="lazy">{% else %}<div class="cphoto" style="height:150px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px">No photo available</div>{% endif %}
  <div class="cb">
  <div class="score">{{ c.match_score|num }}<small>MATCH</small></div>
@@ -288,6 +288,10 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 </div>
 
 <div class="viewpane {{ 'on' if cview=='sold' }}" data-pane="sold">
+<div class="comptools">
+<input type="search" data-comp-search placeholder="Search comps…" aria-label="Search comps">
+<span class="viewtoggle"><button type="button" class="btn sm blue" data-viewmode="grid">▦ Grid</button><button type="button" class="btn sm sec" data-viewmode="list">☰ List</button></span>
+</div>
 {% if sold_stats %}<div class="statbar">
 <div><div class="lab" data-stat="sold_basis">{{ 'Averages of your ' ~ sold_stats.n ~ ' pinned comps' if sold_stats.basis=='pinned' else 'Averages of top 3 by score — pin comps to choose your own' }}</div><div class="val" data-stat="sold_avg">{{ sold_stats.avg_price|money }}</div><div class="lab">avg sale price</div></div>
 <div><div class="lab">Avg $/sqft</div><div class="val" data-stat="sold_ppsf">{{ ('$' ~ sold_stats.avg_ppsf) if sold_stats.avg_ppsf else '—' }}</div><div class="lab">&nbsp;</div></div>
@@ -295,7 +299,17 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><div class="lab">Reconciled ARV (from these comps)</div><div class="val" data-stat="arv">{{ v.rec.arv|money }}</div><div class="lab">MAO <span data-stat="mao">{{ v.mao|money }}</span></div></div>
 </div>
 <p class="small muted" data-stat="arv_note" style="margin-top:-6px">{{ v.rec.note }}</p>{% endif %}
-{% if sold_view %}<div class="compcards">{{ subjcard('sold') }}{% for c in sold_view %}{{ compcard(c, 'sold') }}{% endfor %}</div>
+{% if sold_view %}<div class="compcards" data-comp-grid>{{ subjcard('sold') }}{% for c in sold_view %}{{ compcard(c, 'sold') }}{% endfor %}</div>
+<div class="pager" data-comp-pager><button type="button" class="btn sm sec" data-page-prev>‹ Previous</button> <span data-page-nums></span> <button type="button" class="btn sm sec" data-page-next>Next ›</button> <span class="small muted" data-comp-showing></span></div>
+<div data-comp-listwrap style="display:none">
+<table class="complist" data-comp-list>
+<thead><tr><th>Address</th><th data-sort="beds">Beds ⇅</th><th data-sort="baths">Baths ⇅</th><th data-sort="sqft">Area ⇅</th><th data-sort="lot">Lot ⇅</th><th data-sort="year">Year ⇅</th><th data-sort="price">Price ⇅</th><th data-sort="distance">Distance ⇅</th><th>Match</th></tr></thead>
+<tbody>
+<tr data-subject="1"><td><b>{{ p.address }}</b> <span class="badge" style="background:#dbeafe;color:#1e40af">SUBJECT</span></td><td>{{ p.beds|num }}</td><td>{{ p.baths|num }}</td><td>{{ p.sqft|num }}</td><td>{{ p.lot_sqft|num }}</td><td>{{ p.year_built or '—' }}</td><td>{{ p.list_price|money }}</td><td>—</td><td>—</td></tr>
+{% for c in sold_view %}<tr data-cid="{{ c.id }}" data-price="{{ c.price or 0 }}" data-beds="{{ c.beds or 0 }}" data-baths="{{ c.baths or 0 }}" data-sqft="{{ c.sqft or 0 }}" data-lot="{{ c.lot_sqft or 0 }}" data-year="{{ c.year_built or 0 }}" data-distance="{{ c.distance_mi if c.distance_mi is not none else 999 }}"><td>{{ c.address }}, {{ c.city }}{% if c.pinned %} 📌{% endif %}</td><td>{{ c.beds|num }}</td><td>{{ c.baths|num }}</td><td>{{ c.sqft|num }}</td><td>{{ (c.lot_sqft|num) if c.lot_sqft else '—' }}</td><td>{{ c.year_built or '—' }}</td><td>{{ c.price|money }}</td><td>{{ c.distance_mi|num(2) }} mi</td><td>{{ c.match_score|num }}</td></tr>{% endfor %}
+</tbody></table>
+<button type="button" class="btn sec" data-viewmore>View More</button>
+</div>
 {% else %}<div class="card"><p class="muted">No sold comps in this filter window yet — widen the radius/date filters above, or pull comps.</p></div>{% endif %}
 {% set exc = comps|selectattr('excluded')|list %}{% if exc %}<p class="small muted" style="margin-top:10px">Excluded: {% for c in exc %}{{ c.address }} <form method="post" style="display:inline" action="{{ url_for('comp_action', cid=c.id, action='exclude') }}"><button class="btn sm sec">restore</button></form> {% endfor %}</p>{% endif %}
 </div>
@@ -361,6 +375,7 @@ function highlightComp(id){
   var c = compById(id);
   if (c) activateView(c.kind === 'sold' ? 'sold' : 'ltr');
   var el = document.querySelector('.ccard[data-cid="' + id + '"]');
+  if (c && c.kind === 'sold' && typeof revealComp === 'function'){ var rv = revealComp(id); if (rv) el = rv; }
   if (el){ el.scrollIntoView({behavior: 'smooth', block: 'center'}); el.classList.add('hl'); setTimeout(function(){ el.classList.remove('hl'); }, 2600); }
   return false;
 }
@@ -446,17 +461,142 @@ function applyPin(cid, j){
   }
   if (j.arv !== null && j.arv !== undefined){ setStat('arv', money(j.arv)); setStat('mao', money(j.mao)); }
   if (j.arv_note) setStat('arv_note', j.arv_note);
+  if (typeof captureOrigStats === 'function') captureOrigStats();
 }
 function togglePin(ev, cid){
   if (ev) ev.preventDefault();
   var fd = new URLSearchParams({ajax: '1', window: '{{ window }}', rmax: '{{ rmax or "" }}'});
   fetch('/comp/' + cid + '/pin', {method: 'POST', headers: {'X-Requested-With': 'fetch'}, body: fd})
     .then(function(r){ return r.json(); })
-    .then(function(j){ applyPin(cid, j); })
+    .then(function(j){ applyPin(cid, j); if (typeof applyCompView === 'function' && soldPaneEl()) applyCompView(); })
     .catch(function(){ /* leave UI as-is on failure */ });
   return false;
 }
-document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW); });
+/* ---- v1.7a: Sold-view pagination + list view + live search (ReiSearch patterns,
+   behavior spec pass 2: 4/page grid with "Showing X-Y of Z", sortable list with
+   subject row + View More, search recomputes pinned averages over visible set) ---- */
+var COMP_PAGE_SIZE = 4, compPage = 1, compMode = 'grid', compExpanded = false;
+var compSort = {key: null, dir: 1};
+var ORIG_STATS = null;
+function soldPaneEl(){ return document.querySelector('.viewpane[data-pane="sold"]'); }
+function soldCardEls(){ var pn = soldPaneEl(); return pn ? Array.prototype.slice.call(pn.querySelectorAll('.ccard[data-cid]')) : []; }
+function compQuery(){ var inp = document.querySelector('[data-comp-search]'); return inp ? inp.value.trim().toLowerCase() : ''; }
+function filteredSoldCards(){ var q = compQuery(); return soldCardEls().filter(function(cd){ return !q || cd.textContent.toLowerCase().indexOf(q) >= 0; }); }
+function captureOrigStats(){
+  var bEl = document.querySelector('[data-stat="sold_basis"]'), aEl = document.querySelector('[data-stat="sold_avg"]'),
+      pEl = document.querySelector('[data-stat="sold_ppsf"]'), dEl = document.querySelector('[data-stat="sold_dom"]');
+  if (bEl && aEl) ORIG_STATS = {basis: bEl.textContent, avg: aEl.textContent, ppsf: pEl ? pEl.textContent : '—', dom: dEl ? dEl.textContent : '—'};
+}
+function refreshCompStats(){
+  if (!compQuery()){
+    if (ORIG_STATS){ setStat('sold_basis', ORIG_STATS.basis); setStat('sold_avg', ORIG_STATS.avg); setStat('sold_ppsf', ORIG_STATS.ppsf); setStat('sold_dom', ORIG_STATS.dom); }
+    return;
+  }
+  var vis = filteredSoldCards();
+  var pinned = vis.filter(function(cd){ return cd.classList.contains('pinned'); });
+  var basis = pinned.length ? pinned : vis;
+  if (!basis.length){ setStat('sold_basis', 'No comps match your search'); setStat('sold_avg', '—'); setStat('sold_ppsf', '—'); setStat('sold_dom', '—'); return; }
+  function avg(attr){ var xs = basis.map(function(cd){ return parseFloat(cd.getAttribute(attr)); }).filter(function(x){ return !isNaN(x); }); return xs.length ? xs.reduce(function(a, b){ return a + b; }, 0) / xs.length : null; }
+  var ap = avg('data-price'), af = avg('data-ppsf'), ad = avg('data-dom');
+  setStat('sold_basis', (pinned.length ? ('Averages of your ' + pinned.length + ' pinned comps') : ('Averages of ' + vis.length + ' matching comps')) + ' — search filter on');
+  setStat('sold_avg', ap === null ? '—' : money(ap));
+  setStat('sold_ppsf', af === null ? '—' : ('$' + (Math.round(af * 100) / 100)));
+  setStat('sold_dom', ad === null ? '—' : String(Math.round(ad)));
+}
+function applyCompView(){
+  var pn = soldPaneEl(); if (!pn) return;
+  var vis = filteredSoldCards();
+  var grid = pn.querySelector('[data-comp-grid]'), pager = pn.querySelector('[data-comp-pager]'),
+      lwrap = pn.querySelector('[data-comp-listwrap]');
+  if (compMode === 'grid'){
+    if (grid) grid.style.display = ''; if (pager) pager.style.display = ''; if (lwrap) lwrap.style.display = 'none';
+    var pages = Math.max(1, Math.ceil(vis.length / COMP_PAGE_SIZE));
+    if (compPage > pages) compPage = pages;
+    if (compPage < 1) compPage = 1;
+    var start = (compPage - 1) * COMP_PAGE_SIZE;
+    soldCardEls().forEach(function(cd){ cd.style.display = 'none'; });
+    vis.slice(start, start + COMP_PAGE_SIZE).forEach(function(cd){ cd.style.display = ''; });
+    var showing = pn.querySelector('[data-comp-showing]');
+    if (showing) showing.textContent = vis.length ? ('Showing ' + (start + 1) + '–' + Math.min(start + COMP_PAGE_SIZE, vis.length) + ' of ' + vis.length + (compQuery() ? ' (search filter on)' : '')) : 'No comps match your search';
+    var nums = pn.querySelector('[data-page-nums]');
+    if (nums){
+      nums.innerHTML = '';
+      for (var i = 1; i <= pages; i++){
+        var btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'btn sm ' + (i === compPage ? 'blue' : 'sec');
+        btn.setAttribute('data-page-num', i); btn.textContent = i;
+        btn.addEventListener('click', (function(n){ return function(){ compPage = n; applyCompView(); }; })(i));
+        nums.appendChild(btn); nums.appendChild(document.createTextNode(' '));
+      }
+    }
+    var pv = pn.querySelector('[data-page-prev]'), nx = pn.querySelector('[data-page-next]');
+    if (pv) pv.disabled = compPage <= 1;
+    if (nx) nx.disabled = compPage >= pages;
+    if (grid) initMinimaps(grid);
+  } else {
+    if (grid) grid.style.display = 'none'; if (pager) pager.style.display = 'none'; if (lwrap) lwrap.style.display = '';
+    var rows = Array.prototype.slice.call(pn.querySelectorAll('[data-comp-list] tbody tr[data-cid]'));
+    var q = compQuery();
+    var match = rows.filter(function(tr){ return !q || tr.textContent.toLowerCase().indexOf(q) >= 0; });
+    rows.forEach(function(tr){ tr.style.display = 'none'; });
+    match.forEach(function(tr, i){ tr.style.display = (compExpanded || i < 5) ? '' : 'none'; });
+    var vm = pn.querySelector('[data-viewmore]');
+    if (vm) vm.style.display = (!compExpanded && match.length > 5) ? '' : 'none';
+  }
+  refreshCompStats();
+}
+function revealComp(cid){
+  var cards = soldCardEls();
+  for (var i = 0; i < cards.length; i++){
+    if (cards[i].getAttribute('data-cid') == String(cid)){
+      if (compMode !== 'grid'){ compMode = 'grid'; syncViewModeButtons(); }
+      var vis = filteredSoldCards(), idx = vis.indexOf(cards[i]);
+      if (idx >= 0) compPage = Math.floor(idx / COMP_PAGE_SIZE) + 1;
+      applyCompView();
+      return cards[i];
+    }
+  }
+  return null;
+}
+function syncViewModeButtons(){
+  document.querySelectorAll('[data-viewmode]').forEach(function(b){
+    var on = b.getAttribute('data-viewmode') === compMode;
+    b.classList.toggle('blue', on); b.classList.toggle('sec', !on);
+  });
+}
+function initCompTools(){
+  var pn = soldPaneEl(); if (!pn || pn.dataset.toolsInit) return; pn.dataset.toolsInit = '1';
+  captureOrigStats();
+  var inp = pn.querySelector('[data-comp-search]');
+  if (inp) inp.addEventListener('input', function(){ compPage = 1; compExpanded = false; applyCompView(); });
+  var pv = pn.querySelector('[data-page-prev]'), nx = pn.querySelector('[data-page-next]');
+  if (pv) pv.addEventListener('click', function(){ if (compPage > 1){ compPage--; applyCompView(); } });
+  if (nx) nx.addEventListener('click', function(){ compPage++; applyCompView(); });
+  document.querySelectorAll('[data-viewmode]').forEach(function(b){
+    b.addEventListener('click', function(){ compMode = b.getAttribute('data-viewmode'); compExpanded = false; syncViewModeButtons(); applyCompView(); });
+  });
+  var vm = pn.querySelector('[data-viewmore]');
+  if (vm) vm.addEventListener('click', function(){ compExpanded = true; applyCompView(); });
+  pn.querySelectorAll('[data-comp-list] th[data-sort]').forEach(function(th){
+    th.style.cursor = 'pointer';
+    th.addEventListener('click', function(){
+      var key = th.getAttribute('data-sort');
+      if (compSort.key === key) compSort.dir *= -1; else compSort = {key: key, dir: 1};
+      var tbody = pn.querySelector('[data-comp-list] tbody');
+      var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr[data-cid]'));
+      rows.sort(function(a, b){
+        var x = parseFloat(a.getAttribute('data-' + key)) || 0, y = parseFloat(b.getAttribute('data-' + key)) || 0;
+        return (x - y) * compSort.dir;
+      });
+      rows.forEach(function(tr){ tbody.appendChild(tr); });
+      compExpanded = true; applyCompView();
+    });
+  });
+  var hl = new URLSearchParams(location.search).get('highlight');
+  if (hl) revealComp(hl);
+  applyCompView();
+}
+document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW); initCompTools(); });
 </script>
 {% endif %}
 
@@ -464,9 +604,10 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 <div class="card"><h2>Demographics — {{ ('ZIP ' ~ p.zip) if dscope=='zip' else (p.city ~ ' (city)') }}</h2>
 {% if demo_error %}<div class="notice err"><b>Last refresh failed.</b> {{ demo_error }}{% if demo %} The data below (pulled {{ p.demo_date or demo.date }}) was <b>not</b> overwritten.{% endif %}
 <form method="post" action="{{ url_for('dismiss_data_error', pid=p.id) }}" style="display:inline;margin-left:8px"><input type="hidden" name="which" value="demo"><button class="btn sm sec">Dismiss</button></form></div>{% endif %}
-{% if not demo %}<p class="muted">US Census ACS data hasn't been loaded for this property yet. (The Census <i>geocoder</i> is keyless; the Census <i>data</i> API now requires a free API key — set <code>CENSUS_API_KEY</code>.)</p>
+{% if not demo %}{% if job and job.kind=='demographics' and job.status=='running' %}<div data-demo-loading><p>⏳ <b>Loading demographics…</b> Pulling US Census ACS data for ZIP {{ p.zip }} from the Census Reporter API (free — no key required). This tab refreshes itself when the data lands, usually in under a minute.</p></div>
+{% else %}<p class="muted">US Census ACS data hasn't been loaded for this property yet. It comes from the Census Reporter API (free, no key required) and normally starts loading on its own the moment you open this tab.</p>
 <form method="post" action="{{ url_for('pull_demographics', pid=p.id) }}"><button class="btn big blue">📊 Load demographics</button></form>
-<p class="small muted">Runs in the background — the result appears on this tab. If the pull fails, you'll see the reason here on this tab, not a silent blank.</p>
+<p class="small muted">Runs in the background — the result appears on this tab. If the pull fails, you'll see the reason here on this tab, not a silent blank.</p>{% endif %}
 {% else %}<p class="small muted">Source: {{ demo.source }} · pulled {{ p.demo_date or demo.date }}</p>
 <div class="scopetabs">
 <a class="btn sm {{ 'blue' if dscope=='zip' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='zip') }}">ZIP {{ p.zip }}</a>

@@ -200,25 +200,24 @@
        inside PITI) and never touches a value the user typed. */
     var propTaxMo = N(UW.propTaxMo), taxesEst = false, insEst = false;
     function estFlag(k) { return String(s[k]) === "1" || s[k] === 1; }
+    /* v1.7 (mirror of app.py): populated, flagged auto-estimates carry NO score
+       penalty — they are labeled data in the field, not missing data (Garland
+       clean-state root-cause: 80 vs ReiSearch 93; flags remain for transparency). */
     if (debtService === 0 && taxesMo === 0) {
       taxesMo = propTaxMo || ((price || arv) ? Math.round((price || arv) * 0.011 / 12) : 0);
       if (taxesMo > 0) {
         taxesEst = true;
-        penalties.push({ points: 6, reason: "Taxes were $0 — auto-estimate applied (" + (propTaxMo ? "county tax record" : "1.1% of price/yr estimate") + "), shown in the field" });
         flags.push("Taxes estimated — verify with county");
       }
     } else if (debtService === 0 && estFlag("taxes_est") && taxesMo > 0) {
       taxesEst = true;
-      penalties.push({ points: 6, reason: "Taxes are an auto-estimate (shown in the field) — verify with county" });
       flags.push("Taxes estimated — verify with county");
     }
     if (debtService === 0 && insMo === 0) {
       insMo = 180; insEst = true;
-      penalties.push({ points: 6, reason: "Insurance was $0 — auto-estimate applied ($180/mo estimate), shown in the field" });
       flags.push("Insurance estimated");
     } else if (debtService === 0 && estFlag("insurance_est") && insMo > 0) {
       insEst = true;
-      penalties.push({ points: 6, reason: "Insurance is an auto-estimate (shown in the field) — verify" });
       flags.push("Insurance estimated");
     }
     var gross = 0, vacLoss = 0, other = 0, roomsN = 1, cleaningIncome = 0, amenityRows = 0;
@@ -745,18 +744,23 @@
       if (N(r.md_payment_mo)) dl += '<div class="srow"><span>Existing mortgage (PITI)</span><b>' + M(r.md_payment_mo) + '</b></div>';
       dbd.innerHTML = dl ? '<h4 class="det-h">Monthly Debt Service</h4>' + dl : "";
     }
+    /* v1.7: Cash Needed ALWAYS shows its derivation — every component line,
+       $0 lines included (a loan-only state must read "$0" WITH the math visible,
+       not as a bare unexplained number). Rendered into the Funding Snapshot
+       (data-breakdown="cash") and the sidebar Overview (data-breakdown="cashside"). */
+    var cashLines = [];
+    if (strat === "Fix & Flip" && r.gap > 0) cashLines.push(["Funding gap (cash at closing)", r.gap]);
+    cashLines.push(["Cash contributions", N(r.cash_contrib)]);
+    cashLines.push(["Points & fees", N(r.points_fees)]);
+    cashLines.push(["Closing costs", N(r.closing_costs)]);
+    cashLines.push(["Entry fee", N(r.entry_fee)]);
+    var cashRowsHtml = cashLines.map(function (x) {
+      return '<div class="srow"><span>' + x[0] + '</span><b>' + M(x[1]) + '</b></div>';
+    }).join("") + '<div class="srow tot"><span>Cash Needed</span><b>' + M(r.cash_in) + '</b></div>';
     var cbd = panel.querySelector('[data-breakdown="cash"]');
-    if (cbd) {
-      var cl = [];
-      if (strat === "Fix & Flip" && r.gap > 0) cl.push(["Funding gap (cash at closing)", r.gap]);
-      if (N(r.cash_contrib)) cl.push(["Cash contributions", r.cash_contrib]);
-      if (N(r.closing_costs)) cl.push(["Closing costs", r.closing_costs]);
-      if (N(r.points_fees)) cl.push(["Points & fees", r.points_fees]);
-      if (N(r.entry_fee)) cl.push(["Total Entry Fee (existing mortgage)", r.entry_fee]);
-      cbd.innerHTML = cl.length ? '<h4 class="det-h">Cash Needed — breakdown</h4>' + cl.map(function (x) {
-        return '<div class="srow"><span>' + x[0] + '</span><b>' + M(x[1]) + '</b></div>';
-      }).join("") + '<div class="srow tot"><span>Cash Needed</span><b>' + M(r.cash_in) + '</b></div>' : "";
-    }
+    if (cbd) cbd.innerHTML = '<h4 class="det-h">Cash Needed — breakdown</h4>' + cashRowsHtml;
+    var csb = panel.querySelector('[data-breakdown="cashside"]');
+    if (csb) csb.innerHTML = cashRowsHtml;
     var det = panel.querySelector("[data-details]");
     if (det) {
       var rows = [];

@@ -722,25 +722,27 @@ def compute_underwriting(strategy, raw_inp, prop):
     def _est_flag(k):
         return str(inp.get(k) or "") in ("1", "True", "true")
     taxes_est = ins_est = False
+    # v1.7 score root-cause (Garland clean state measured 80 vs ReiSearch's 93):
+    # the auto-estimates above used to ALSO subtract 6+6 Deal Score penalty points.
+    # That double-punishes: under the standard-numbers rule the estimate is real,
+    # labeled data sitting in the field — not missing data. ReiSearch's Garland
+    # baseline scores 93 with no such drag. The estimates therefore carry FLAGS
+    # (transparency) but no score penalty; the genuinely-empty-expense penalty
+    # (no utilities/maintenance at all) below is unchanged.
     if debt_service == 0 and taxes_mo == 0:
         taxes_mo = prop_tax_mo or (round((price or arv) * 0.011 / 12) if (price or arv) else 0)
         taxes_est = taxes_mo > 0
         if taxes_est:
-            src = "county tax record" if prop_tax_mo else "1.1% of price/yr estimate"
-            penalties.append({"points": 6, "reason": f"Taxes were $0 — auto-estimate applied ({src}), shown in the field"})
             flags.append("Taxes estimated — verify with county")
     elif debt_service == 0 and _est_flag("taxes_est") and taxes_mo > 0:
         taxes_est = True
-        penalties.append({"points": 6, "reason": "Taxes are an auto-estimate (shown in the field) — verify with county"})
         flags.append("Taxes estimated — verify with county")
     if debt_service == 0 and ins_mo == 0:
         ins_mo = 180
         ins_est = True
-        penalties.append({"points": 6, "reason": "Insurance was $0 — auto-estimate applied ($180/mo estimate), shown in the field"})
         flags.append("Insurance estimated")
     elif debt_service == 0 and _est_flag("insurance_est") and ins_mo > 0:
         ins_est = True
-        penalties.append({"points": 6, "reason": "Insurance is an auto-estimate (shown in the field) — verify"})
         flags.append("Insurance estimated")
     # revenue
     cleaning_income = 0.0
@@ -1853,6 +1855,23 @@ def property_page(pid):
                          "first_year": pts[0]["year"], "last_year": pts[-1]["year"],
                          "first_pop": pts[0]["pop"], "last_pop": pts[-1]["pop"]}
     tab = request.args.get("tab", "overview")
+    # v1.7 demographics auto-load: opening the tab with no cached data starts the
+    # pull itself — the source is the keyless Census Reporter API, so there is no
+    # manual step and no API key to configure. A job already running is left
+    # alone; a failure less than 15 minutes old is NOT auto-retried (the tab then
+    # shows the scoped failure notice + the manual Load button instead of a loop).
+    if request.method == "GET" and tab == "demographics" and not demo:
+        dj = latest_job(pid, "demographics")
+        start_demo = dj is None or dj["status"] != "running"
+        if start_demo and dj is not None and dj["status"] == "error" and dj["finished_at"]:
+            try:
+                fin = datetime.datetime.fromisoformat(str(dj["finished_at"]))
+                if (datetime.datetime.now() - fin).total_seconds() < 900:
+                    start_demo = False
+            except Exception:
+                pass
+        if start_demo:
+            job_demographics(pid)
     # v1.6: job banners are scoped to the tab their job belongs to (a stale Census
     # error must not follow the user across every tab), timestamps are human, and
     # finished/error banners can be dismissed.
@@ -2114,10 +2133,10 @@ def add_comp_lookup(pid):
                 ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
                 source="HomeHarvest (Realtor.com) — added by address lookup",
                 source_url=_s(r.get("property_url")), photo_url=_s(r.get("primary_photo")))
-    _insert_comp(prop, vals)
+    new_cid = _insert_comp(prop, vals)
     flash(f"✓ Comp added from HomeHarvest: {vals['address']}, {vals['city']} — "
           f"{'sold' if kind_choice == 'sold' else 'active listing'} {('$' + format(int(price), ',')) if price else ''}.", "info")
-    return redirect(url_for("property_page", pid=pid, tab="comps", view="sold"))
+    return redirect(url_for("property_page", pid=pid, tab="comps", view="sold", highlight=new_cid))
 
 @app.route("/property/<int:pid>/comps/add-manual", methods=["POST"])
 def add_comp_manual(pid):
@@ -2145,9 +2164,9 @@ def add_comp_manual(pid):
                 lot_sqft=fnum(request.form.get("lot_sqft"), None),
                 ptype=None, source="Manual entry (added by user)",
                 source_url=(request.form.get("source_url") or "").strip() or None, photo_url=None)
-    _insert_comp(prop, vals)
+    new_cid = _insert_comp(prop, vals)
     flash(f"✓ Comp added manually: {addr}, {city} — it counts in pin/average math like a pulled comp.", "info")
-    return redirect(url_for("property_page", pid=pid, tab="comps", view="sold"))
+    return redirect(url_for("property_page", pid=pid, tab="comps", view="sold", highlight=new_cid))
 
 @app.route("/job/<int:jid>")
 def job_status(jid):
