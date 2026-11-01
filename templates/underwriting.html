@@ -330,12 +330,12 @@
 <button type="button" data-stab="scenarios" onclick="return uwSideTab(this,'scenarios')">Scenarios</button>
 <button type="button" data-stab="details" onclick="return uwSideTab(this,'details')">Details</button>
 <button type="button" data-stab="capital" onclick="return uwSideTab(this,'capital')">Capital</button>
+<button type="button" data-stab="insights" onclick="return uwSideTab(this,'insights')">Insights</button>
 </div>
 <div class="sidepane on" data-spane="overview">
 {% if strat=='Co-Living' %}
 <div class="scorebox"><span>Deal Score</span><b data-out="score">—</b><small data-out="score_label"></small></div>
-<div class="srow"><span>Net Cash Flow</span><b><span data-out="cashflow_mo">$0</span>/mo</b></div>
-<div class="srow"><span>Net Cash Flow (annual)</span><b data-out="cashflow_y1">$0</b></div>
+<div class="srow"><span>Net Cash Flow</span><span class="ncfcell"><b><span data-ncfdisp>$0</span><span data-ncfunit>/mo</span></b><span class="moyrtoggle"><button type="button" class="on" onclick="return uwNcfMode(this,'mo')">Mo</button><button type="button" onclick="return uwNcfMode(this,'yr')">Yr</button></span></span></div>
 <div class="srow"><span>Revenue</span><b data-out="egi_mo">$0</b></div>
 <div class="srow"><span>Expenses</span><b data-out="opex_mo">$0</b></div>
 <div class="srow"><span>Loan Payments</span><b data-out="debt_service_mo">$0</b></div>
@@ -345,25 +345,34 @@
 <div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
 {% else %}
 <div class="scorebox"><span>Deal Score</span><b data-out="score">—</b><small data-out="score_label"></small></div>
-<div class="srow"><span>Net Profit</span><b data-out="profit">$0</b></div>
-<div class="srow"><span>Profit % of sale price</span><b data-out="margin_pct">—</b></div>
+<div class="srow"><span>Net Profit</span><b data-out="profit_full">$0</b></div>
 <div class="srow"><span>Sale Price</span><b data-out="sale_price_out">$0</b></div>
 <div class="srow"><span>All-in Cost</span><b data-out="all_in">$0</b></div>
 <div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
 <div class="srow"><span>ROI</span><b data-out="roi">—</b></div>
 <div class="srow"><span>Annualized ROI</span><b data-out="annualized_roi">—</b></div>
 <div class="srow"><span>Profit Margin</span><b data-out="margin_pct">—</b></div>
-<div class="srow"><span>70% Rule — max offer</span><b data-out="rule70_mao">$0</b></div>
-<div class="srow"><span></span><b class="small" data-out="rule70_note"></b></div>
+<div class="srow"><span>70% Rule</span><b data-out="rule70_full">$0</b></div>
 {% endif %}
 </div>
 <div class="sidepane" data-spane="visual"><div data-visual="main"></div><h4>Expense breakdown</h4><div data-visual="exp"></div></div>
-<div class="sidepane" data-spane="scenarios"><div data-scenarios></div><p class="small muted">Key metrics shown are the Base Case (Overview tab).</p></div>
+<div class="sidepane" data-spane="scenarios"><div data-scenarios></div><h4>Key Metrics (Base Case)</h4>
+{% if strat=='Co-Living' %}
+<div class="srow"><span>Net Cash Flow</span><b><span data-out="cashflow_mo">$0</span>/mo</b></div>
+<div class="srow"><span>Cash-on-Cash</span><b data-out="coc_pct">—</b></div>
+<div class="srow"><span>DSCR</span><b data-out="dscr">—</b></div>
+<div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
+{% else %}
+<div class="srow"><span>Net Profit</span><b data-out="profit">$0</b></div>
+<div class="srow"><span>ROI</span><b data-out="roi">—</b></div>
+<div class="srow"><span>Profit Margin</span><b data-out="margin_pct">—</b></div>
+{% endif %}
+</div>
 <div class="sidepane" data-spane="details"><div class="gapalert" data-gapalert style="display:none"></div><div data-details></div></div>
 <div class="sidepane" data-spane="capital">
 {% if strat=='Co-Living' %}
 <div class="srow"><span>Total Project Cost</span><b data-out="total_project">$0</b></div>
-<div class="srow"><span>Refinance Proceeds (75% of ARV, gross)</span><b data-out="refi_proceeds">$0</b></div>
+<div class="srow"><span>Refinance Proceeds</span><b data-out="refi_proceeds">$0</b></div>
 <div class="srow"><span>Remaining in Deal</span><b data-out="remaining_in_deal">$0</b></div>
 <div class="srow"><span>Net Cash Flow</span><b><span data-out="cashflow_mo">$0</span>/mo</b></div>
 <div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
@@ -381,16 +390,13 @@
 <div class="srow"><span>Total Return</span><b data-out="profit">$0</b></div>
 {% endif %}
 </div>
+<div class="sidepane" data-spane="insights"><p class="muted">Coming Soon</p></div>
 </div>
 {% else %}
 <div class="sidecard"><h3>Deal Analysis Summary</h3>
 <div class="srow"><span>Cash Outlay</span><b data-out="cash_in">$0</b></div>
-<div class="srow"><span>Income (effective, /mo)</span><b data-out="egi_mo">$0</b></div>
-<div class="srow"><span>Expenses (/mo, incl. loan payments)</span><b data-out="expenses_total">$0</b></div>
-<div class="srow tot"><span>Net Cash Flow</span><b><span data-out="cashflow_mo">$0</span>/mo</b></div>
-<div class="srow"><span>NOI</span><b data-out="noi_mo">$0</b></div>
-<div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
-<div class="srow"><span>DSCR</span><b data-out="dscr">—</b></div>
+<div class="srow"><span>Income</span><b data-out="egi_mo">$0</b></div>
+<div class="srow"><span>Expenses</span><b data-out="expenses_total">$0</b></div>
 </div>
 {% endif %}
 <div class="sidecard"><h3>Loan Amortization</h3>

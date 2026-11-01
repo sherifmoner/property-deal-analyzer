@@ -1,4 +1,4 @@
-/* Property Deal Analyzer v1.3 — reactive underwriting engine.
+/* Property Deal Analyzer v1.4 — reactive underwriting engine.
    Mirrors compute_underwriting() in app.py formula-for-formula. No Calculate button:
    every keystroke recomputes section totals, the sidebar outcome, and the Co-Living
    bottom summary in place. Saving a scenario posts the form (rows serialized to the
@@ -101,10 +101,10 @@
         var proj = price + rehab2 + appliances + furnishing;
         return { sale: sale2, all_in: proj + hold2, net: n2 - proj - hold2 };
       }
-      var scen = { "Downside (-10% sale price)": flip(sale * 0.9, rehab, holdingTotal),
-        "Base": flip(sale, rehab, holdingTotal),
-        "Upside (+10% sale price)": flip(sale * 1.1, rehab, holdingTotal),
-        "Overrun (rehab +20%, +3 mo hold)": flip(sale, rehab * 1.2, holdingMo * (hMonths + 3)) };
+      var scen = { "Downside (-10%)": flip(sale * 0.9, rehab, holdingTotal),
+        "Base Case (0%)": flip(sale, rehab, holdingTotal),
+        "Upside (+10%)": flip(sale * 1.1, rehab, holdingTotal),
+        "Overrun (rehab +20%, +3 mo)": flip(sale, rehab * 1.2, holdingMo * (hMonths + 3)) };
       function cs2(x, t) { return t ? clamp((x / t) * 100, 0, 100) : 0; }
       var parts = { "Profit margin (50%)": Math.round(0.5 * cs2((margin || 0) / 100, 0.30) * 10) / 10,
                     "ROI on cash (50%)": Math.round(0.5 * cs2((roi || 0) / 100, 0.50) * 10) / 10 };
@@ -179,8 +179,8 @@
       var e2 = noVac ? gross + other : (gross - vacLoss) * mult + other;
       return { revenue: e2, expenses: opex + debtService, net: e2 - opex - debtService };
     }
-    var scen2 = { "Downside (-10% revenue)": scenR(0.9), "Base": scenR(1.0), "Upside (+10% revenue)": scenR(1.1) };
-    if (strat === "Co-Living") scen2["Fully booked (0% vacancy)"] = scenR(1.0, true);
+    var scen2 = { "Downside (-10%)": scenR(0.9), "Base Case (0%)": scenR(1.0), "Upside (+10%)": scenR(1.1) };
+    if (strat === "Co-Living") scen2["Fully Booked (0% vacancy)"] = scenR(1.0, true);
     var sc = scoreRental(metrics, penalties);
     var refiGross = arv ? Math.round(0.75 * arv) : 0;
     var refiNet = Math.max(0, refiGross - debtAmt);
@@ -343,7 +343,8 @@
       breakeven_line: "Break-even occupancy: " + PC(r.breakeven_pct) + " — that share of gross rent must be collected to cover expenses + loan payments.",
       holding_desc: (s.holding_period || 0) + " " + (s.holding_unit || "Months") + " × " + M(N(s.holding_mo)) + "/mo ≈ " + M(r.holding_cost) + " total holding costs",
       md_monthly_payment_label: N(s.md_monthly_payment) ? (M(N(s.md_monthly_payment)) + "/mo") : "",
-      rule70_note: r.rule70_mao !== undefined ? (N(s.purchase_price) <= r.rule70_mao ? "Purchase price is at/under the 70% max offer ✓" : "Purchase price is ABOVE the 70% max offer") : "",
+      profit_full: strat === "Fix & Flip" ? (M(r.profit) + (r.margin_pct != null ? " (" + PC(r.margin_pct) + " of sale price)" : "")) : "",
+      rule70_full: r.rule70_mao !== undefined ? (M(r.rule70_mao - N(s.purchase_price)) + " vs max offer " + M(r.rule70_mao)) : "",
       rehab_range: (function () {
         var lv = UW.levels[s.rehab_level || "cosmetic"] || UW.levels.cosmetic;
         var sq = N(s.postreno_sqft) || UW.sqft || 0;
@@ -354,6 +355,12 @@
       var key = elm.dataset.out;
       var txt = (key in special) ? special[key] : fmtFor(key, r, s);
       if (elm.tagName === "INPUT") elm.value = txt; else elm.textContent = txt;
+    });
+    panel.querySelectorAll("[data-ncfdisp]").forEach(function (elm) {
+      elm.textContent = M(panel.dataset.ncfMode === "yr" ? r.cashflow_y1 : r.cashflow_mo);
+    });
+    panel.querySelectorAll("[data-ncfunit]").forEach(function (elm) {
+      elm.textContent = panel.dataset.ncfMode === "yr" ? "/yr" : "/mo";
     });
     panel.querySelectorAll("[data-yr]").forEach(function (elm) {
       var inp = panel.querySelector('[name="' + elm.dataset.yr + '"]');
@@ -403,21 +410,46 @@
     var det = panel.querySelector("[data-details]");
     if (det) {
       var rows = [];
-      rows.push(["Deal Score", r.score + " (" + (r.label || "") + ")"]);
-      Object.keys(r.score_parts || {}).forEach(function (k) { rows.push(["· " + k, r.score_parts[k]]); });
-      (r.penalties || []).forEach(function (p) { rows.push(["· Penalty −" + p.points, p.reason]); });
+      function H(t) { rows.push(["H", t]); }
+      function R(a, b) { rows.push(["R", a, b]); }
+      H("Deal Score");
+      R("Deal Score", r.score + " (" + (r.label || "") + ")");
+      Object.keys(r.score_parts || {}).forEach(function (k) { R("· " + k, r.score_parts[k]); });
+      (r.penalties || []).forEach(function (p) { R("· Penalty −" + p.points, p.reason); });
       if (strat === "Fix & Flip") {
-        rows.push(["Sale Price", M(r.sale_price)], ["Commission", M(r.commission_amt)], ["Seller closing", M(r.closing_amt)],
-          ["Net Sale Proceeds", M(r.net_proceeds)], ["All-in Cost", M(r.all_in)], ["Net Profit", M(r.profit)],
-          ["ROI", PC(r.roi)], ["70% Rule max offer", M(r.rule70_mao)]);
+        H("Sale & Exit");
+        R("Sale Price", M(r.sale_price)); R("Commission", M(r.commission_amt));
+        R("Seller Closing Costs", M(r.closing_amt)); R("Net Sale Proceeds", M(r.net_proceeds));
+        H("Costs");
+        R("Purchase Price", M(r.purchase_price)); R("Rehab", M(r.rehab));
+        R("Holding Costs", M(r.holding_cost)); R("All-in Cost", M(r.all_in));
+        H("Cash & Capital");
+        R("Total Uses", M(r.uses)); R("Funding Added", M(r.funded)); R("Cash Needed", M(r.cash_in));
+        H("Return Metrics");
+        R("Net Profit", M(r.profit)); R("ROI", PC(r.roi)); R("Annualized ROI", PC(r.annualized_roi));
+        R("Profit Margin", PC(r.margin_pct)); R("70% Rule Max Offer", M(r.rule70_mao));
       } else {
-        rows.push(["Scheduled (gross) rent", M(r.gross_mo)], ["Vacancy loss", "−" + M(r.vacancy_loss_mo)], ["Other income", M(r.other_income_mo)],
-          ["Effective Gross Income", M(r.egi_mo)], ["Operating Expenses", M(r.opex_mo)], ["Loan Payments", M(r.debt_service_mo)],
-          ["Net Cash Flow", M(r.cashflow_mo) + "/mo"], ["Break-Even Occupancy", PC(r.breakeven_pct)]);
+        H("Revenue");
+        R("Scheduled Rent", M(r.gross_mo)); R("Other Income", M(r.other_income_mo));
+        R("Vacancy Loss", "−" + M(r.vacancy_loss_mo)); R("Effective Gross Income", M(r.egi_mo));
+        H("Operating Expenses");
+        Object.keys(r.opex_cats || {}).forEach(function (k) { R("· " + k, M(r.opex_cats[k])); });
+        R("Total Operating Expenses", M(r.opex_mo));
+        H("Loan Payments");
+        R("Loan Payments", M(r.debt_service_mo));
+        H("Cash & Capital");
+        R("Total Uses", M(r.uses)); R("Funding Added", M(r.funded)); R("Cash Needed", M(r.cash_in));
+        H("Return Metrics");
+        R("Net Cash Flow", M(r.cashflow_mo) + "/mo"); R("Cash-on-Cash", PC(r.coc_pct));
+        R("DSCR", (r.dscr === null || r.dscr === undefined) ? "—" : (Math.round(r.dscr * 100) / 100).toFixed(2));
+        R("Cap Rate", PC(r.cap_rate_pct));
+        H("Break-Even");
+        R("Break-Even Occupancy", PC(r.breakeven_pct));
       }
-      rows.push(["Total Uses", M(r.uses)], ["Funding Added", M(r.funded)], ["Cash Needed", M(r.cash_in)]);
-      det.innerHTML = rows.map(function (x) { return '<div class="srow"><span>' + x[0] + '</span><b>' + x[1] + '</b></div>'; }).join("") +
-        ((r.flags && r.flags.length) ? '<p class="small muted">Flags: ' + r.flags.join("; ") + "</p>" : "");
+      det.innerHTML = rows.map(function (x) {
+        return x[0] === "H" ? '<h4 class="det-h">' + x[1] + "</h4>"
+          : '<div class="srow"><span>' + x[1] + "</span><b>" + x[2] + "</b></div>";
+      }).join("") + ((r.flags && r.flags.length) ? '<p class="small muted">Flags: ' + r.flags.join("; ") + "</p>" : "");
     }
     var ga = panel.querySelector("[data-gapalert]");
     if (ga) {
@@ -477,6 +509,13 @@
     var panel = btn.closest(".uw-panel");
     panel.querySelectorAll(".sidetabs button").forEach(function (b) { b.classList.toggle("on", b === btn); });
     panel.querySelectorAll(".sidepane").forEach(function (p) { p.classList.toggle("on", p.dataset.spane === name); });
+    return false;
+  };
+  window.uwNcfMode = function (btn, mode) {
+    var panel = btn.closest(".uw-panel");
+    panel.dataset.ncfMode = mode;
+    panel.querySelectorAll(".moyrtoggle button").forEach(function (b) { b.classList.toggle("on", b === btn); });
+    recalc(panel);
     return false;
   };
   window.uwAddRow = function (btn, kind) {

@@ -159,6 +159,12 @@ details.acc.sub{margin-top:10px;background:#f8fafc}
 .sidetabs button.on{background:var(--accent2);color:#fff}
 .sidepane{display:none}
 .sidepane.on{display:block}
+.ncfcell{display:flex;align-items:center}
+.moyrtoggle{display:inline-flex;gap:2px;margin-left:8px}
+.moyrtoggle button{border:0;background:#1d3850;color:#dbe7f2;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer}
+.moyrtoggle button.on{background:var(--accent2);color:#fff}
+.det-h{margin:12px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#9db8cf}
+.det-h:first-child{margin-top:0}
 .sidecard .srow{border-bottom-color:#24405c;color:#dbe7f2}
 .sidecard table{color:#dbe7f2;font-size:12px}
 .sidecard th{background:#17334d;color:#9db8cf}

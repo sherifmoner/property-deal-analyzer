@@ -103,6 +103,61 @@ python3 -m venv .venv            # first time only (a venv already exists here)
 
 Every number carries a source + date. Missing data shows "Not found" — nothing is invented.
 
+## v1.4 — Underwriting Overview parity pass (2026-11-01)
+
+Sherif's order: the underwriting **sidebar outcome panel must match ReiSearch
+exactly**. Presentation-only pass against `research/reisearch-uw-spec.md` — no
+calculation math changed (the v1.3-verified reactive engine is untouched;
+regression checks below re-prove it).
+
+**Sidebar (Co-Living + Fix & Flip):**
+- Tab bar is now ReiSearch's full set: Overview | Visual | Scenarios | Details |
+  Capital | **Insights** (Insights shows ReiSearch's "Coming Soon" placeholder).
+- **Overview Co-Living:** Net Cash Flow is one row with ReiSearch's **Mo/Yr
+  toggle** (was a separate "Net Cash Flow (annual)" row). Field order: Deal
+  Score, Net Cash Flow, Revenue, Expenses, Loan Payments, Cash Needed,
+  Cash-on-Cash, DSCR, Cap Rate.
+- **Overview Flip:** Net Profit now reads "$X (Y% of sale price)" in one row
+  (the duplicate "Profit % of sale price" row is gone; Profit Margin keeps its
+  own row). The 70% Rule is one row in ReiSearch's format — "−$80,778 vs max
+  offer $249,222" (variance vs asking + max offer) — replacing the max-offer
+  row plus note line.
+- **Scenarios:** ReiSearch names (Downside (-10%) | Base Case (0%) | Upside
+  (+10%) | Fully Booked (0% vacancy) / Overrun (rehab +20%, +3 mo)) and a real
+  **Key Metrics (Base Case)** block under the table.
+- **Details:** grouped disclosure sections in ReiSearch's structure — Deal
+  Score | Revenue | Operating Expenses (with category rows) | Loan Payments |
+  Cash & Capital | Return Metrics (now incl. CoC / DSCR / Cap Rate) |
+  Break-Even; Flip gets Deal Score | Sale & Exit | Costs | Cash & Capital |
+  Return Metrics. Funding-gap alert unchanged.
+- **Capital:** "Refinance Proceeds" label trimmed to ReiSearch's wording.
+
+**Sidebar (Short / Mid / Long Term):** ReiSearch's sparse **Deal Analysis
+Summary** only — Cash Outlay | Income | Expenses. The extra Net Cash Flow /
+NOI / Cap Rate / DSCR rows the app used to add there are removed (those
+metrics still live in saved-scenario results and the cross-strategy table).
+
+**Verified by a browser click-through of the shipped zip (2026-11-01,
+Playwright/Chromium, fresh install on port 5054 — 29/29 checks passed, zero
+uncaught JS errors; screenshots in `~/workspace/reisearch-clone/research/
+v14-shots/`, script `research/gate_v14.py`):** for all 5 strategies the sidebar
+field set, order, and labels were asserted against the spec; sidebar tabs
+switch in place (URL + JS marker survive the full tour). Garland as the page
+loads — Co-Living Overview: Score **63 (Workable)**, Net Cash Flow **$1,510/mo**
+(toggle → **$18,114/yr**), Revenue **$2,785**, Expenses **$1,275**, Loan
+Payments **$0**, Cash Needed **$428,900**, CoC **4.2%**, DSCR **1.50**, Cap
+Rate **4.5%**. Flip Overview: Score **11 (Weak)**, Net Profit **$5,849 (1.4%
+of sale price)**, Sale Price **$406,032**, All-in **$367,700**, Cash Needed
+**$70,700**, ROI **8.3%**, Annualized ROI **16.5%**, Margin **1.4%**, 70% Rule
+**−$80,778 vs max offer $249,222**. Sparse summaries — STR: $379,300 /
+$3,240 / $876; MTR + LTR: $379,300 / $1,900 / $525 (Cash Outlay / Income /
+Expenses). Math regressions re-checked exact: +$300/mo utilities → Net CF
+$1,510 → $1,210; LTR Subject-To $20,000 entry + $1,700 PITI → Cash Needed
+$379,300 → $399,300, debt service $1,700/mo; Flip estimator with midpoint
+applied reproduces v1.3's numbers exactly (Net Profit −$11,891, All-in
+$385,440, 70% max offer $231,482). Garland's 3 saved scenarios intact; the
+shipped `analyzer.db` is byte-identical to the live one (md5-verified).
+
 ## v1.3 — Sherif's parity corrections (2026-11-01)
 
 Built from a live, logged-in inspection of ReiSearch's property page (spec:

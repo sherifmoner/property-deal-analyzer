@@ -521,10 +521,10 @@ def compute_underwriting(strategy, raw_inp, prop):
             n2 = sale2 * (1 - comm_pct / 100 - close_pct / 100)
             return {"sale": round(sale2), "all_in": round(price + rehab2 + appliances + furnishing + hold2),
                     "net": round(n2 - (price + rehab2 + appliances + furnishing) - hold2)}
-        scen = {"Downside (-10% sale price)": _flip(sale * 0.9, rehab, holding_total),
-                "Base": _flip(sale, rehab, holding_total),
-                "Upside (+10% sale price)": _flip(sale * 1.1, rehab, holding_total),
-                "Overrun (rehab +20%, +3 mo hold)": _flip(sale, rehab * 1.2, holding_mo * (h_months + 3))}
+        scen = {"Downside (-10%)": _flip(sale * 0.9, rehab, holding_total),
+                "Base Case (0%)": _flip(sale, rehab, holding_total),
+                "Upside (+10%)": _flip(sale * 1.1, rehab, holding_total),
+                "Overrun (rehab +20%, +3 mo)": _flip(sale, rehab * 1.2, holding_mo * (h_months + 3))}
         # Flip Deal Score: ReiSearch shows one for flips; scale = profit margin (50%, target 30%)
         # + ROI (50%, target 50%), labeled as our scale in Details.
         def cs(x, t): return max(0.0, min(100.0, (x / t) * 100)) if t else 0.0
@@ -614,9 +614,9 @@ def compute_underwriting(strategy, raw_inp, prop):
     def _scen(mult, no_vac=False):
         e2 = gross + other if no_vac else (gross - vac_loss) * mult + other
         return {"revenue": round(e2), "expenses": round(opex + debt_service), "net": round(e2 - opex - debt_service)}
-    scen = {"Downside (-10% revenue)": _scen(0.9), "Base": _scen(1.0), "Upside (+10% revenue)": _scen(1.1)}
+    scen = {"Downside (-10%)": _scen(0.9), "Base Case (0%)": _scen(1.0), "Upside (+10%)": _scen(1.1)}
     if strategy == "Co-Living":
-        scen["Fully booked (0% vacancy)"] = _scen(1.0, no_vac=True)
+        scen["Fully Booked (0% vacancy)"] = _scen(1.0, no_vac=True)
     sc = score_rental(metrics, penalties)
     refi_gross = round(0.75 * arv) if arv else 0
     refi_net = max(0, refi_gross - debt_amt)
