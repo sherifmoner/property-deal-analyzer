@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, property_id INTEGER, kind TEXT,
  status TEXT DEFAULT 'running', started_at TEXT, finished_at TEXT, message TEXT, detail TEXT,
  created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS property_notes(id INTEGER PRIMARY KEY, property_id INTEGER,
+ author TEXT, text TEXT, created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS property_trades(id INTEGER PRIMARY KEY, property_id INTEGER,
+ trade TEXT, UNIQUE(property_id, trade));
 """
 
 DOC_SLOTS = [
@@ -110,6 +114,16 @@ def init_db():
     if "lot_sqft" not in ccols: d.execute("ALTER TABLE comps ADD COLUMN lot_sqft REAL")
     jcols = [r[1] for r in d.execute("PRAGMA table_info(jobs)")]
     if "dismissed" not in jcols: d.execute("ALTER TABLE jobs ADD COLUMN dismissed INTEGER DEFAULT 0")
+    # v1.7b: overview deal-structure extras + seller finance + disposition extras
+    for col in ("cash_to_seller", "total_entry_fee", "closing_costs_paid_by", "purchase_deposit",
+                "sf_loan_amount", "sf_amort_years", "sf_amort_unit", "sf_rate", "sf_payment",
+                "sf_balloon", "dispo_exit_method", "dispo_buyer_deposit", "dispo_day_type"):
+        if col not in cols: d.execute(f"ALTER TABLE properties ADD COLUMN {col} TEXT")
+    # v1.7b: per-trade assignments gain visit/quote status + property-local contact snapshots
+    acols = [r[1] for r in d.execute("PRAGMA table_info(assignments)")]
+    for col in ("visit_status", "quote_status", "contact_company", "contact_name",
+                "contact_phone", "contact_email"):
+        if col not in acols: d.execute(f"ALTER TABLE assignments ADD COLUMN {col} TEXT")
     d.commit(); d.close()
 
 # Schema creation must happen at import time, not only under __main__: production
@@ -1722,7 +1736,12 @@ EDITABLE = ["status","stage","deal_method","list_price","property_type","beds","
  "offers_deadline","loan_balance","loan_type","loan_rate","loan_piti","dispo_asking","dispo_bin","dispo_min",
  "dispo_inspection_days","offer_review","est_zillow","est_realtor","est_redfin","est_county","notes",
  "skiptrace_notes","skiptrace_status","tax_market","tax_assessed","tax_taxable","tax_amount","tax_exemptions",
- "tax_millage","tax_year","sales_history"]
+ "tax_millage","tax_year","sales_history",
+ "cash_to_seller","total_entry_fee","closing_costs_paid_by","purchase_deposit",
+ "sf_loan_amount","sf_amort_years","sf_amort_unit","sf_rate","sf_payment","sf_balloon",
+ "dispo_exit_method","dispo_buyer_deposit","dispo_day_type"]
+
+DEFAULT_TRADES = ["Plumbing", "Roofing", "Electrical", "HVAC", "General", "Foundation", "Pest Control"]
 
 @app.route("/")
 def dashboard():
@@ -1781,7 +1800,18 @@ def property_page(pid):
                 sets.append(f"{f}=?"); args.append(v if v != "" else None)
         if sets:
             args.append(pid); d.execute(f"UPDATE properties SET {','.join(sets)} WHERE id=?", args); d.commit()
-            p = get_prop(pid); flash("Saved.")
+            p = get_prop(pid)
+            # v1.7b: the Overview's inline autosave posts the same form via fetch —
+            # answer with JSON so the page can show its "Last saved" indicator
+            # without a full reload. The classic Save-button POST keeps the
+            # flash + re-render path below, byte-for-byte the old behavior.
+            if request.form.get("ajax") == "1":
+                return jsonify(ok=True, saved_at=datetime.datetime.now().strftime("%I:%M %p"))
+            flash("Saved.")
+            # Post/Redirect/Get: a browser reload after a classic save must
+            # never resubmit the (now stale) form and clobber newer autosaved
+            # edits — redirect to the same tab instead of re-rendering here.
+            return redirect(url_for("property_page", pid=pid, tab=request.args.get("tab", "overview")))
     comps = d.execute("SELECT * FROM comps WHERE property_id=? ORDER BY excluded, pinned DESC, match_score DESC", (pid,)).fetchall()
     liens = d.execute("SELECT * FROM liens WHERE property_id=?", (pid,)).fetchall()
     docs = d.execute("SELECT * FROM documents WHERE property_id=? ORDER BY category, slot", (pid,)).fetchall()
@@ -1855,6 +1885,54 @@ def property_page(pid):
                          "first_year": pts[0]["year"], "last_year": pts[-1]["year"],
                          "first_pop": pts[0]["pop"], "last_pop": pts[-1]["pop"]}
     tab = request.args.get("tab", "overview")
+    # ---- v1.7b Overview: timestamped notes feed (audit 1.11) ----
+    # The legacy single `notes` textarea text migrates in as the feed's first
+    # entry the first time the Overview opens with an empty feed — the text is
+    # copied, never deleted, so no data can be lost by the restructure.
+    prop_notes = []
+    if tab == "overview":
+        rows = d.execute("SELECT * FROM property_notes WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
+        if not rows and p["notes"]:
+            d.execute("INSERT INTO property_notes(property_id,author,text,created_at) VALUES(?,?,?,?)",
+                      (pid, "Imported note", p["notes"], p["created_at"]))
+            d.commit()
+            rows = d.execute("SELECT * FROM property_notes WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
+        for r in rows:
+            nd = dict(r)
+            try:
+                nd["when"] = datetime.datetime.fromisoformat(str(r["created_at"])).strftime("%b %d, %Y · %I:%M %p")
+            except Exception:
+                nd["when"] = str(r["created_at"] or "")
+            prop_notes.append(nd)
+    # ---- v1.7b: Market Value headline (audit 1.3) — mean of the listing-site
+    # estimates on file, exactly ReiSearch's formula; county only as fallback.
+    est3 = [p[k] for k in ("est_zillow", "est_realtor", "est_redfin") if p[k]]
+    if est3:
+        market_value = round(sum(est3) / len(est3)); mv_basis = f"average of {len(est3)} estimate(s) on file"
+    elif p["est_county"]:
+        market_value = round(p["est_county"]); mv_basis = "county appraiser estimate"
+    else:
+        market_value, mv_basis = None, ""
+    try:
+        added_pretty = datetime.datetime.fromisoformat(str(p["created_at"])[:19]).strftime("%b %d, %Y")
+    except Exception:
+        added_pretty = str(p["created_at"] or "")[:10]
+    # ---- v1.7b Contractors: per-property per-trade rows (ReiSearch pass 2) ----
+    # Computed only for the Contractors tab — the only tab that renders them.
+    trades_rows = []
+    dir_trades = []
+    if tab == "contractors":
+        custom_trades = [r["trade"] for r in d.execute(
+            "SELECT trade FROM property_trades WHERE property_id=? ORDER BY trade", (pid,))]
+        trade_names = list(DEFAULT_TRADES)
+        for t in custom_trades + [a["trade"] for a in assigns if a["trade"]]:
+            if t and t not in trade_names: trade_names.append(t)
+        for t in trade_names:
+            latest = None
+            for a in assigns:  # assigns are unordered; the highest id for the trade wins
+                if a["trade"] == t and (latest is None or a["id"] > latest["id"]): latest = a
+            trades_rows.append({"trade": t, "a": latest})
+        dir_trades = sorted({c["trade"] for c in contractors if c["trade"]})
     # v1.7 demographics auto-load: opening the tab with no cached data starts the
     # pull itself — the source is the keyless Census Reporter API, so there is no
     # manual step and no API key to configure. A job already running is left
@@ -1959,6 +2037,9 @@ def property_page(pid):
     flip_pool = [c for c in sold_view if c["pinned"] and c["kind"] == "sold"] or \
         sorted([c for c in sold_view if c["kind"] == "sold"], key=lambda c: -(c["match_score"] or 0))[:3]
     flip_prices = [c["price"] for c in flip_pool if c["price"]]
+    # ---- v1.7b comp filters popover vocabularies (Sold view) ----
+    sold_years = sorted({c["event_date"][:4] for c in sold_view if c["event_date"]}, reverse=True)
+    sold_zips = sorted({c["zip"] for c in sold_view if c["zip"]})
     return render_template("property.html", p=p, comps=comps, sold=sold, rents=rents, liens=liens, docs=docs,
                            assigns=assigns, contractors=contractors, scenarios=scenarios, plans=plans,
                            v=v, market=market, demo=demo, demo_error=demo_error, amenities_error=amenities_error,
@@ -1970,6 +2051,9 @@ def property_page(pid):
                            strategies=strategies, uw_fresh=uw_fresh, uw_saved=uw_saved, uw_current=uw_current,
                            uw_draft_meta=uw_draft_meta,
                            flip_pool=flip_pool, comp_weights=comp_weights(),
+                           prop_notes=prop_notes, market_value=market_value, mv_basis=mv_basis,
+                           added_pretty=added_pretty, trades_rows=trades_rows, dir_trades=dir_trades,
+                           sold_years=sold_years, sold_zips=sold_zips,
                            flip_range=(min(flip_prices), max(flip_prices)) if flip_prices else None)
 
 @app.route("/property/<int:pid>/amenities/refresh", methods=["POST"])
@@ -2372,9 +2456,52 @@ def del_contractor(cid):
 
 @app.route("/property/<int:pid>/assign", methods=["POST"])
 def assign(pid):
-    db().execute("INSERT INTO assignments(property_id,contractor_id,trade,walkthrough,quote,notes) VALUES(?,?,?,?,?,?)",
+    db().execute("""INSERT INTO assignments(property_id,contractor_id,trade,walkthrough,quote,notes,
+                    visit_status,quote_status) VALUES(?,?,?,?,?,?,?,?)""",
                  (pid, request.form.get("contractor_id") or None, request.form.get("trade"),
-                  request.form.get("walkthrough"), fnum(request.form.get("quote")), request.form.get("notes")))
+                  request.form.get("walkthrough"), fnum(request.form.get("quote")), request.form.get("notes"),
+                  request.form.get("visit_status") or "Contractor needed",
+                  request.form.get("quote_status") or "Not requested"))
+    db().commit(); return redirect(url_for("property_page", pid=pid, tab="contractors"))
+
+# ------------------------------------------------- v1.7b: notes feed + per-trade contractors
+@app.route("/property/<int:pid>/notes/add", methods=["POST"])
+def add_note(pid):
+    get_prop(pid)
+    text = (request.form.get("text") or "").strip()
+    if text:
+        db().execute("INSERT INTO property_notes(property_id,author,text) VALUES(?,?,?)",
+                     (pid, (request.form.get("author") or "You").strip() or "You", text))
+        db().commit()
+    return redirect(url_for("property_page", pid=pid, tab="overview"))
+
+@app.route("/property/<int:pid>/trades/add", methods=["POST"])
+def add_trade(pid):
+    get_prop(pid)
+    t = (request.form.get("trade_name") or "").strip()
+    if t:
+        db().execute("INSERT OR IGNORE INTO property_trades(property_id,trade) VALUES(?,?)", (pid, t))
+        db().commit()
+    return redirect(url_for("property_page", pid=pid, tab="contractors"))
+
+@app.route("/property/<int:pid>/contractors/new-contact", methods=["POST"])
+def assign_new_contact(pid):
+    """ReiSearch's 'New Contact' assign path: the contact is saved ON THIS
+    PROPERTY (a snapshot on the assignment row) — it does not create a
+    directory entry or an account for the contractor."""
+    get_prop(pid)
+    company = (request.form.get("company") or "").strip()
+    if not company:
+        flash("Company is required for a new contact.")
+        return redirect(url_for("property_page", pid=pid, tab="contractors"))
+    db().execute("""INSERT INTO assignments(property_id,contractor_id,trade,walkthrough,quote,notes,
+                    visit_status,quote_status,contact_company,contact_name,contact_phone,contact_email)
+                    VALUES(?,NULL,?,?,?,?,?,?,?,?,?,?)""",
+                 (pid, request.form.get("trade"), request.form.get("walkthrough"),
+                  fnum(request.form.get("quote")), request.form.get("notes"),
+                  request.form.get("visit_status") or "Contractor needed",
+                  request.form.get("quote_status") or "Not requested",
+                  company, request.form.get("name"), request.form.get("phone"), request.form.get("email")))
     db().commit(); return redirect(url_for("property_page", pid=pid, tab="contractors"))
 
 @app.route("/property/<int:pid>/floorplan", methods=["POST"])

@@ -1,9 +1,9 @@
 {% extends "base.html" %}{% block body %}
 <h1>Dashboard</h1><p class="muted">Property queue and recent analyses. No tokens, ever.</p>
 <div class="grid3">
-<div class="card"><h2>{{ counts.get('Draft',0) }} Drafts</h2><p class="muted">Being analyzed</p></div>
-<div class="card"><h2>{{ counts.get('Shared',0) }} Shared</h2><p class="muted">Shared with the team</p></div>
-<div class="card"><h2>{{ counts.get('Published',0) }} Published</h2><p class="muted">Live on the dispo board</p></div></div>
+<div class="card dstat"><h2><span class="stat-num">{{ counts.get('Draft',0) }}</span> Drafts</h2><p class="muted">Being analyzed</p></div>
+<div class="card dstat"><h2><span class="stat-num">{{ counts.get('Shared',0) }}</span> Shared</h2><p class="muted">Shared with the team</p></div>
+<div class="card dstat"><h2><span class="stat-num">{{ counts.get('Published',0) }}</span> Published</h2><p class="muted">Live on the dispo board</p></div></div>
 <div class="card"><h2>Add &amp; Comp a Property</h2>
 <form method="post" action="{{ url_for('add_property') }}"><div class="rowflex">
 <div style="flex:3"><input name="address" placeholder="110 E Garland Ct, Tampa, FL 33613" required></div>
@@ -11,7 +11,7 @@
 <div style="flex:0"><button class="btn">Add Property →</button></div></div></form>
 <p class="small muted">Geocoded via ArcGIS (primary — Nominatim misses some streets), flood zone via FEMA NFHL.</p></div>
 <div class="grid2"><div class="card"><h2>Recent properties</h2>
-{% for p in props %}<p style="margin:6px 0"><a href="{{ url_for('property_page', pid=p.id) }}"><b>{{ p.address }}</b></a><br>
+{% for p in props %}<p class="prow" style="margin:6px 0"><a href="{{ url_for('property_page', pid=p.id) }}"><b>{{ p.address }}</b></a><br>
 <span class="small muted">{{ p.deal_method }} · {{ p.status }} · list {{ p.list_price|money }} · flood {{ p.flood_zone or 'Not found' }}</span></p>
 {% else %}<p class="muted">None yet — add your first property above.</p>{% endfor %}</div>
 <div><div class="card"><h2>Recent underwriting</h2>

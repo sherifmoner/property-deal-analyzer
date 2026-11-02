@@ -12,7 +12,7 @@
 </div>{% endif %}
 {% endmacro %}
 {% macro compcard(c, mode) %}
-<div class="ccard {{ 'pinned' if c.pinned }}" data-cid="{{ c.id }}" data-price="{{ c.price if c.price is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}">
+<div class="ccard {{ 'pinned' if c.pinned }}" data-cid="{{ c.id }}" data-price="{{ c.price if c.price is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}" data-beds="{{ c.beds if c.beds is not none else '' }}" data-baths="{{ c.baths if c.baths is not none else '' }}" data-sqft="{{ c.sqft if c.sqft is not none else '' }}" data-lot="{{ c.lot_sqft if ('lot_sqft' in c.keys() and c.lot_sqft is not none) else '' }}" data-year="{{ c.year_built or '' }}" data-dist="{{ c.distance_mi if c.distance_mi is not none else '' }}" data-ysold="{{ (c.event_date or '')[:4] }}" data-kind="{{ c.kind }}" data-ptype="{{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }}" data-zip="{{ c.zip or '' }}">
  {% if c.photo_url %}<img class="cphoto" src="{{ c.photo_url }}" alt="Comp photo" loading="lazy">{% else %}<div class="cphoto" style="height:150px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px">No photo available</div>{% endif %}
  <div class="cb">
  <div class="score">{{ c.match_score|num }}<small>MATCH</small></div>
@@ -60,7 +60,8 @@
 {% endmacro %}
 {% if photos %}
 <div class="gallery">
- <img class="cover" src="{{ photos[0] }}" alt="Property photo">
+ <div class="coverwrap"><img class="cover" src="{{ photos[0] }}" alt="Property photo">
+ <span class="photobadge price">{{ p.list_price|money }}</span><span class="photobadge method">{{ p.deal_method }}</span></div>
  {% if photos|length > 1 %}<img class="thumb" src="{{ photos[1] }}" alt="Property photo">{% endif %}
  {% if photos|length > 2 %}<div class="more" id="galopen"><img class="thumb" src="{{ photos[2] }}" alt="Property photo">{% if photos|length > 3 %}<span>+{{ photos|length - 3 }} more</span>{% endif %}</div>{% endif %}
 </div>
@@ -83,6 +84,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 · <a target="_blank" href="https://www.zillow.com/homes/{{ ((p.street or p.address) ~ ' ' ~ p.city ~ ' ' ~ p.state ~ ' ' ~ p.zip)|replace(',', '')|replace(' ', '-') }}_rb/">Zillow</a>
 · <a target="_blank" href="https://www.realtor.com/realestateandhomes-search/{{ (p.street or p.address)|replace(' ', '-') }}_{{ p.city|replace(' ', '-') }}_{{ p.state }}_{{ p.zip }}">Realtor</a>
 · <a target="_blank" href="https://www.redfin.com/search?query={{ p.address|urlencode }}">Redfin</a></p>
+<p class="small muted" data-added-line style="margin-top:-6px">Added {{ added_pretty }}</p>
 
 {% if job %}
 <div class="jobbanner {{ job.status }}" id="jobbanner">
@@ -112,9 +114,18 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 </div>
 
 {% if tab=='overview' %}
-<form method="post">
-<div class="grid2">
-<div class="card"><h2>Property Details</h2>
+<form method="post" id="ovform">
+<div class="ovgrid" data-ovgrid>
+<div data-ovcol="notes"><div class="card" data-notes-card><h2>Notes <span class="autopill" data-last-saved hidden>Last saved</span></h2>
+<div class="notecomposer">
+<textarea data-note-text rows="3" placeholder="Write a note for this property…"></textarea>
+<p style="margin:6px 0 0"><button type="button" class="btn sm" data-note-add>＋ Add note</button>
+<span class="small muted">Notes are timestamped and kept per property.</span></p></div>
+<div data-notes-feed>
+{% for n in prop_notes %}<div class="noteitem" data-note><div class="notehead"><b>{{ n.author or 'You' }}</b><span class="small muted">{{ n.when }}</span></div><p>{{ n.text }}</p></div>
+{% else %}<p class="muted small" data-notes-empty>No notes yet — add the first one above.</p>{% endfor %}
+</div></div></div>
+<div data-ovcol="details"><div class="card"><h2>Property Details</h2>
 <div class="kv">
 <div><span>Type</span><b>{{ p.property_type or 'Not found' }}</b></div>
 <div><span>Beds</span><b>{{ p.beds|num }}</b></div><div><span>Baths</span><b>{{ p.baths|num }}</b></div>
@@ -150,6 +161,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>Occupancy now</label><input name="occupancy_now" value="{{ p.occupancy_now or '' }}"></div>
 <div><label>Occupancy at closing</label><input name="occupancy_closing" value="{{ p.occupancy_closing or '' }}"></div></div>
 <label>Legal description</label><textarea name="legal_desc" rows="2">{{ p.legal_desc or '' }}</textarea>
+<div class="mvheadline" data-mv-headline>Market Value: {% if market_value %}{{ market_value|money }}{% else %}Not found{% endif %}{% if mv_basis %}<span class="small muted"> ({{ mv_basis }})</span>{% endif %}</div>
 <h3>Market Value estimates <span class="small muted">(source + date stamped; blank = Not found)</span></h3>
 <div class="rowflex">
 <div><label>Zillow $</label><input name="est_zillow" value="{{ p.est_zillow if p.est_zillow is not none else '' }}"></div>
@@ -157,10 +169,9 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>Redfin $</label><input name="est_redfin" value="{{ p.est_redfin if p.est_redfin is not none else '' }}"></div>
 <div><label>County appraiser $</label><input name="est_county" value="{{ p.est_county if p.est_county is not none else '' }}"></div></div>
 <p class="small muted">Estimate date: {{ p.est_date or 'Not found' }} — the Realtor estimate fills automatically from the property's listing when comps are pulled; other values only from a checked source, never invented by the app.</p>
-<label>Notes</label><textarea name="notes" rows="3">{{ p.notes or '' }}</textarea>
-</div>
+</div></div>
 
-<div><div class="card"><h2>Deal Structure</h2>
+<div data-ovcol="deal"><div class="card"><h2>Deal Structure</h2>
 <div class="rowflex">
 <div><label>List price (MLS) $</label><input name="list_price" value="{{ p.list_price if p.list_price is not none else '' }}"></div>
 <div><label>As-is value $</label><input name="as_is_value" value="{{ p.as_is_value if p.as_is_value is not none else '' }}"></div>
@@ -169,6 +180,11 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>Repair estimate $</label><input name="repairs" value="{{ p.repairs if p.repairs is not none else '' }}"></div>
 <div><label>Purchase price $</label><input name="purchase_price" value="{{ p.purchase_price if p.purchase_price is not none else '' }}"></div>
 <div><label>Purchase method</label><select name="deal_method">{% for m in ['Cash','Subject To','Hybrid','Seller Finance','Stack'] %}<option {% if p.deal_method==m %}selected{% endif %}>{{ m }}</option>{% endfor %}</select></div></div>
+<div class="rowflex">
+<div><label>Cash to Seller $</label><input name="cash_to_seller" value="{{ p.cash_to_seller if p.cash_to_seller is not none else '' }}"></div>
+<div><label>Total Entry Fee $</label><input name="total_entry_fee" value="{{ p.total_entry_fee if p.total_entry_fee is not none else '' }}"></div></div>
+<div class="maorow" data-mao-row><span>Max Offer (MAO)</span><b>{{ v.mao|money }}</b><a href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">Open underwriting →</a></div>
+<p class="small muted" style="margin-top:2px">MAO = 70% of ARV − repairs. Read-only here — the formula lives in Underwriting.</p>
 <div class="rowflex">
 <div><label>Inspection period</label><input name="inspection_days" value="{{ p.inspection_days if p.inspection_days is not none else '' }}"></div>
 <div><label>Unit</label><input name="inspection_unit" value="{{ p.inspection_unit or 'calendar days' }}"></div>
@@ -192,23 +208,40 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div class="rowflex">
 <div><label>Closing date</label><input name="closing_date" value="{{ p.closing_date or '' }}"></div>
 <div><label>Offers deadline</label><input name="offers_deadline" value="{{ p.offers_deadline or '' }}"></div></div>
-{% if p.deal_method in ('Subject To','Hybrid','Stack') %}
-<h3>Bank Loan Information (Subject To)</h3>
+<div class="rowflex">
+<div><label>Closing costs paid by</label><input name="closing_costs_paid_by" value="{{ p.closing_costs_paid_by or '' }}"></div>
+<div><label>Purchase deposit $</label><input name="purchase_deposit" value="{{ p.purchase_deposit if p.purchase_deposit is not none else '' }}"></div></div>
+<p><button class="btn big">💾 Save property</button>
+<span class="small muted">Fields also save automatically as you edit — watch for “Last saved” by the Notes card.</span></p>
+</div></div>
+<div data-ovcol="info"><div class="card"><h2>Seller Finance</h2>
+<div class="rowflex">
+<div><label>Loan amount $</label><input name="sf_loan_amount" value="{{ p.sf_loan_amount if p.sf_loan_amount is not none else '' }}"></div>
+<div><label>Interest rate %</label><input name="sf_rate" value="{{ p.sf_rate if p.sf_rate is not none else '' }}"></div></div>
+<div class="rowflex">
+<div><label>Amortization</label><input name="sf_amort_years" value="{{ p.sf_amort_years if p.sf_amort_years is not none else '' }}"></div>
+<div><label>Amort. unit</label><select name="sf_amort_unit">{% for u in ['Years','Months'] %}<option {% if p.sf_amort_unit==u %}selected{% endif %}>{{ u }}</option>{% endfor %}</select></div></div>
+<div class="rowflex">
+<div><label>Monthly payment $</label><input name="sf_payment" value="{{ p.sf_payment if p.sf_payment is not none else '' }}"></div>
+<div><label>Balloon amount $</label><input name="sf_balloon" value="{{ p.sf_balloon if p.sf_balloon is not none else '' }}"></div></div>
+<p class="small muted">The seller-financed terms agreed for this property (the Underwriting Seller Financing preset models new offers).</p>
+</div>
+<div class="card"><h2>Bank Loan Information</h2>
 <div class="rowflex">
 <div><label>Loan balance $</label><input name="loan_balance" value="{{ p.loan_balance if p.loan_balance is not none else '' }}"></div>
 <div><label>Loan type</label><input name="loan_type" value="{{ p.loan_type or '' }}"></div>
 <div><label>Rate %</label><input name="loan_rate" value="{{ p.loan_rate if p.loan_rate is not none else '' }}"></div>
 <div><label>PITI $/mo</label><input name="loan_piti" value="{{ p.loan_piti if p.loan_piti is not none else '' }}"></div></div>
-{% endif %}
-<p><button class="btn big">💾 Save property</button></p>
+<p class="small muted">The existing loan on the property (feeds the Subject-To underwriting).</p>
+</div></div>
 </div></form>
 
+<div class="grid2">
 <div class="card"><h2>Liens</h2>
 {% for l in liens %}<p class="small">{{ l.lien_type }} — {{ l.amount|money }}{% if l.payment %} · {{ l.payment|money }}/mo{% endif %}{% if l.rate %} · {{ l.rate }}%{% endif %}{% if l.maturity %} · matures {{ l.maturity }}{% endif %}
 <form method="post" action="{{ url_for('del_lien', lid=l.id) }}" style="display:inline"><button class="btn sm danger">✕</button></form></p>
 {% else %}<p class="muted small">No liens recorded.</p>{% endfor %}
 </div>
-</div></div>
 
 <div class="card"><h2>Add a lien</h2>
 <form method="post" action="{{ url_for('add_lien', pid=p.id) }}"><div class="rowflex">
@@ -216,6 +249,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>Amount $</label><input name="amount"></div><div><label>Payment $/mo</label><input name="payment"></div>
 <div><label>Rate %</label><input name="rate"></div><div><label>Maturity</label><input name="maturity"></div>
 <div style="flex:0"><button class="btn sec">Add</button></div></div></form></div>
+</div>
 
 <div class="card"><h2>Disposition <span class="small muted">(private until published; marketplace view hides street address)</span></h2>
 <form method="post"><div class="rowflex">
@@ -224,9 +258,48 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>Min offer $</label><input name="dispo_min" value="{{ p.dispo_min if p.dispo_min is not none else '' }}"></div>
 <div><label>End-buyer inspection days</label><input name="dispo_inspection_days" value="{{ p.dispo_inspection_days if p.dispo_inspection_days is not none else '' }}"></div>
 <div><label>Offer review</label><input name="offer_review" value="{{ p.offer_review or 'Highest & Best' }}"></div></div>
+<div class="rowflex">
+<div><label>Exit method</label><select name="dispo_exit_method">{% for s in ['','Wholesale','Wholetail','Fix & Flip','Buy & Hold','List with Agent'] %}<option value="{{ s }}" {% if p.dispo_exit_method==s %}selected{% endif %}>{{ s or '—' }}</option>{% endfor %}</select></div>
+<div><label>Buyer deposit $</label><input name="dispo_buyer_deposit" value="{{ p.dispo_buyer_deposit if p.dispo_buyer_deposit is not none else '' }}"></div>
+<div><label>Day type (inspection)</label><select name="dispo_day_type">{% for s in ['calendar','business'] %}<option {% if p.dispo_day_type==s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></div></div>
 <p><button class="btn sec">Save disposition</button></p></form>
 <p class="small muted">Buyer matching: run this property's price/beds/city against your buy boxes (Settings → Buy Boxes). Documented buyer-pool matching imports from GHL exports via Settings import.</p></div>
 
+<script>
+/* v1.7b Overview: inline autosave (ReiSearch's "Last saved" behavior) + the
+   timestamped notes feed composer. The classic Save button keeps working —
+   both paths post the same form fields to the same handler. */
+(function(){
+  var form = document.getElementById('ovform');
+  var pill = document.querySelector('[data-last-saved]');
+  if (form){
+    var t = null;
+    function save(){
+      var fd = new FormData(form); fd.append('ajax', '1');
+      if (pill){ pill.hidden = false; pill.textContent = 'Saving…'; }
+      fetch(location.href, {method: 'POST', body: fd, headers: {'X-Requested-With': 'fetch'}})
+        .then(function(r){ return r.json(); })
+        .then(function(j){ if (pill) pill.textContent = 'Last saved ' + (j.saved_at || 'just now'); })
+        .catch(function(){ if (pill) pill.textContent = 'Auto-save failed — use the Save button'; });
+    }
+    form.addEventListener('change', function(e){
+      if (e.target.closest && e.target.closest('[data-notes-card]')) return;
+      clearTimeout(t); t = setTimeout(save, 700);
+    });
+  }
+  var addBtn = document.querySelector('[data-note-add]'), txt = document.querySelector('[data-note-text]');
+  if (addBtn && txt){
+    addBtn.addEventListener('click', function(){
+      var v = txt.value.trim(); if (!v) return;
+      addBtn.disabled = true;
+      var fd = new FormData(); fd.append('text', v); fd.append('author', 'You');
+      fetch('{{ url_for('add_note', pid=p.id) }}', {method: 'POST', body: fd})
+        .then(function(){ location.reload(); })
+        .catch(function(){ addBtn.disabled = false; });
+    });
+  }
+})();
+</script>
 {% endif %}
 
 {% if tab=='comps' %}
@@ -290,7 +363,33 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div class="viewpane {{ 'on' if cview=='sold' }}" data-pane="sold">
 <div class="comptools">
 <input type="search" data-comp-search placeholder="Search comps…" aria-label="Search comps">
+<button type="button" class="btn sm sec" data-filters-btn>⚙ Filters <span data-filters-count hidden></span></button>
 <span class="viewtoggle"><button type="button" class="btn sm blue" data-viewmode="grid">▦ Grid</button><button type="button" class="btn sm sec" data-viewmode="list">☰ List</button></span>
+</div>
+<div class="filterpanel" data-filter-panel hidden>
+<div class="fgroups">
+<fieldset data-fgroup="market"><legend>Market &amp; location <span class="fcount" data-fcount-for="market">0 selected</span></legend>
+<label>Distance</label><div class="fradios">{% for dv, dl in [('', 'Any distance'), ('1', '<1 mi'), ('2', '<2 mi'), ('3', '<3 mi'), ('5', '<5 mi'), ('10', '<10 mi')] %}<label class="fradio"><input type="radio" name="f_dist" value="{{ dv }}" {% if not dv %}checked{% endif %}> {{ dl }}</label>{% endfor %}</div>
+<div class="rowflex">
+<div><label>Years sold</label><select data-f="fyear"><option value="">Any year</option>{% for y in sold_years %}<option value="{{ y }}">{{ y }}</option>{% endfor %}<option value="before2020">Before 2020</option></select></div>
+<div><label>ZIP code</label><select data-f="fzip"><option value="">Any ZIP</option>{% for z in sold_zips %}<option value="{{ z }}">{{ z }}</option>{% endfor %}</select></div>
+<div><label>Sale status</label><select data-f="fstatus"><option value="">Any</option><option value="sold">Sold</option><option value="active">Active listing</option></select></div></div>
+</fieldset>
+<fieldset data-fgroup="details"><legend>Property details <span class="fcount" data-fcount-for="details">0 selected</span></legend>
+<div class="frow2"><span>Beds</span><input type="number" data-f="beds_min" placeholder="Min"><input type="number" data-f="beds_max" placeholder="Max"></div>
+<div class="frow2"><span>Baths</span><input type="number" step="any" data-f="baths_min" placeholder="Min"><input type="number" step="any" data-f="baths_max" placeholder="Max"></div>
+<div class="frow2"><span>Sqft</span><input type="number" data-f="sqft_min" placeholder="Min"><input type="number" data-f="sqft_max" placeholder="Max"></div>
+<div class="frow2"><span>Lot sqft</span><input type="number" data-f="lot_min" placeholder="Min"><input type="number" data-f="lot_max" placeholder="Max"></div>
+<div class="frow2"><span>Year built</span><input type="number" data-f="year_min" placeholder="Min"><input type="number" data-f="year_max" placeholder="Max"></div>
+<div class="frow2"><span>Type</span><select data-f="ftype"><option value="">Any type</option>{% for t in ['Single Family','Condo','Townhouse'] %}<option>{{ t }}</option>{% endfor %}</select></div>
+</fieldset>
+<fieldset data-fgroup="price"><legend>Price &amp; rooms <span class="fcount" data-fcount-for="price">0 selected</span></legend>
+<div class="frow2"><span>Sale price $</span><input type="number" data-f="price_min" placeholder="Min"><input type="number" data-f="price_max" placeholder="Max"></div>
+<div class="frow2"><span>$/sqft</span><input type="number" step="any" data-f="ppsf_min" placeholder="Min"><input type="number" step="any" data-f="ppsf_max" placeholder="Max"></div>
+<div class="frow2"><span>Days on market</span><input type="number" data-f="dom_min" placeholder="Min"><input type="number" data-f="dom_max" placeholder="Max"></div>
+</fieldset>
+</div>
+<div class="fp-actions"><button type="button" class="btn sm sec" data-filters-clear>Clear all</button> <button type="button" class="btn sm" data-filters-apply>Apply filters</button></div>
 </div>
 {% if sold_stats %}<div class="statbar">
 <div><div class="lab" data-stat="sold_basis">{{ 'Averages of your ' ~ sold_stats.n ~ ' pinned comps' if sold_stats.basis=='pinned' else 'Averages of top 3 by score — pin comps to choose your own' }}</div><div class="val" data-stat="sold_avg">{{ sold_stats.avg_price|money }}</div><div class="lab">avg sale price</div></div>
@@ -306,7 +405,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <thead><tr><th>Address</th><th data-sort="beds">Beds ⇅</th><th data-sort="baths">Baths ⇅</th><th data-sort="sqft">Area ⇅</th><th data-sort="lot">Lot ⇅</th><th data-sort="year">Year ⇅</th><th data-sort="price">Price ⇅</th><th data-sort="distance">Distance ⇅</th><th>Match</th></tr></thead>
 <tbody>
 <tr data-subject="1"><td><b>{{ p.address }}</b> <span class="badge" style="background:#dbeafe;color:#1e40af">SUBJECT</span></td><td>{{ p.beds|num }}</td><td>{{ p.baths|num }}</td><td>{{ p.sqft|num }}</td><td>{{ p.lot_sqft|num }}</td><td>{{ p.year_built or '—' }}</td><td>{{ p.list_price|money }}</td><td>—</td><td>—</td></tr>
-{% for c in sold_view %}<tr data-cid="{{ c.id }}" data-price="{{ c.price or 0 }}" data-beds="{{ c.beds or 0 }}" data-baths="{{ c.baths or 0 }}" data-sqft="{{ c.sqft or 0 }}" data-lot="{{ c.lot_sqft or 0 }}" data-year="{{ c.year_built or 0 }}" data-distance="{{ c.distance_mi if c.distance_mi is not none else 999 }}"><td>{{ c.address }}, {{ c.city }}{% if c.pinned %} 📌{% endif %}</td><td>{{ c.beds|num }}</td><td>{{ c.baths|num }}</td><td>{{ c.sqft|num }}</td><td>{{ (c.lot_sqft|num) if c.lot_sqft else '—' }}</td><td>{{ c.year_built or '—' }}</td><td>{{ c.price|money }}</td><td>{{ c.distance_mi|num(2) }} mi</td><td>{{ c.match_score|num }}</td></tr>{% endfor %}
+{% for c in sold_view %}<tr data-cid="{{ c.id }}" data-price="{{ c.price or 0 }}" data-beds="{{ c.beds or 0 }}" data-baths="{{ c.baths or 0 }}" data-sqft="{{ c.sqft or 0 }}" data-lot="{{ c.lot_sqft or 0 }}" data-year="{{ c.year_built or 0 }}" data-distance="{{ c.distance_mi if c.distance_mi is not none else 999 }}" data-dist="{{ c.distance_mi if c.distance_mi is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}" data-ysold="{{ (c.event_date or '')[:4] }}" data-kind="{{ c.kind }}" data-ptype="{{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }}" data-zip="{{ c.zip or '' }}"><td>{{ c.address }}, {{ c.city }}{% if c.pinned %} 📌{% endif %}</td><td>{{ c.beds|num }}</td><td>{{ c.baths|num }}</td><td>{{ c.sqft|num }}</td><td>{{ (c.lot_sqft|num) if c.lot_sqft else '—' }}</td><td>{{ c.year_built or '—' }}</td><td>{{ c.price|money }}</td><td>{{ c.distance_mi|num(2) }} mi</td><td>{{ c.match_score|num }}</td></tr>{% endfor %}
 </tbody></table>
 <button type="button" class="btn sec" data-viewmore>View More</button>
 </div>
@@ -481,14 +580,14 @@ var ORIG_STATS = null;
 function soldPaneEl(){ return document.querySelector('.viewpane[data-pane="sold"]'); }
 function soldCardEls(){ var pn = soldPaneEl(); return pn ? Array.prototype.slice.call(pn.querySelectorAll('.ccard[data-cid]')) : []; }
 function compQuery(){ var inp = document.querySelector('[data-comp-search]'); return inp ? inp.value.trim().toLowerCase() : ''; }
-function filteredSoldCards(){ var q = compQuery(); return soldCardEls().filter(function(cd){ return !q || cd.textContent.toLowerCase().indexOf(q) >= 0; }); }
+function filteredSoldCards(){ var q = compQuery(); return soldCardEls().filter(function(cd){ return (!q || cd.textContent.toLowerCase().indexOf(q) >= 0) && passesFilters(cd); }); }
 function captureOrigStats(){
   var bEl = document.querySelector('[data-stat="sold_basis"]'), aEl = document.querySelector('[data-stat="sold_avg"]'),
       pEl = document.querySelector('[data-stat="sold_ppsf"]'), dEl = document.querySelector('[data-stat="sold_dom"]');
   if (bEl && aEl) ORIG_STATS = {basis: bEl.textContent, avg: aEl.textContent, ppsf: pEl ? pEl.textContent : '—', dom: dEl ? dEl.textContent : '—'};
 }
 function refreshCompStats(){
-  if (!compQuery()){
+  if (!compQuery() && !COMP_FILTERS.active){
     if (ORIG_STATS){ setStat('sold_basis', ORIG_STATS.basis); setStat('sold_avg', ORIG_STATS.avg); setStat('sold_ppsf', ORIG_STATS.ppsf); setStat('sold_dom', ORIG_STATS.dom); }
     return;
   }
@@ -498,10 +597,67 @@ function refreshCompStats(){
   if (!basis.length){ setStat('sold_basis', 'No comps match your search'); setStat('sold_avg', '—'); setStat('sold_ppsf', '—'); setStat('sold_dom', '—'); return; }
   function avg(attr){ var xs = basis.map(function(cd){ return parseFloat(cd.getAttribute(attr)); }).filter(function(x){ return !isNaN(x); }); return xs.length ? xs.reduce(function(a, b){ return a + b; }, 0) / xs.length : null; }
   var ap = avg('data-price'), af = avg('data-ppsf'), ad = avg('data-dom');
-  setStat('sold_basis', (pinned.length ? ('Averages of your ' + pinned.length + ' pinned comps') : ('Averages of ' + vis.length + ' matching comps')) + ' — search filter on');
+  setStat('sold_basis', (pinned.length ? ('Averages of your ' + pinned.length + ' pinned comps') : ('Averages of ' + vis.length + ' matching comps')) + (compQuery() ? ' — search filter on' : ' — comp filters on'));
   setStat('sold_avg', ap === null ? '—' : money(ap));
   setStat('sold_ppsf', af === null ? '—' : ('$' + (Math.round(af * 100) / 100)));
   setStat('sold_dom', ad === null ? '—' : String(Math.round(ad)));
+}
+/* ---- v1.7b: Sold-view filters popover (ReiSearch pass 2 — 3 groups with
+   per-group selected counters, Clear all / Apply). Client-side over the
+   rendered set, exactly like search: applying re-filters the cards + list
+   rows, and pagination counts + the averages lines follow the filtered set.
+   A comp with no stored value for a filtered field does not pass that filter
+   (never guessed). ---- */
+var COMP_FILTERS = {active: false, dist: null, year: '', zip: '', status: '', ptype: '', ranges: {}};
+function numAttr(el, name){ var v = el.getAttribute(name); return (v === null || v === '') ? null : parseFloat(v); }
+function rangeOk(v, r){ if (!r) return true; if (v === null) return false; if (r.min !== null && v < r.min) return false; if (r.max !== null && v > r.max) return false; return true; }
+function passesFilters(el){
+  var F = COMP_FILTERS; if (!F.active) return true;
+  if (F.dist !== null){ var d = numAttr(el, 'data-dist'); if (d === null || d > F.dist) return false; }
+  if (F.year){ var y = el.getAttribute('data-ysold') || ''; if (F.year === 'before2020'){ if (!y || parseInt(y, 10) >= 2020) return false; } else if (y !== F.year) return false; }
+  if (F.zip && (el.getAttribute('data-zip') || '') !== F.zip) return false;
+  if (F.status && (el.getAttribute('data-kind') || '') !== F.status) return false;
+  if (F.ptype && (el.getAttribute('data-ptype') || 'Single Family') !== F.ptype) return false;
+  var map = {beds: 'data-beds', baths: 'data-baths', sqft: 'data-sqft', lot: 'data-lot', year: 'data-year', price: 'data-price', ppsf: 'data-ppsf', dom: 'data-dom'};
+  for (var k in map){ if (!rangeOk(numAttr(el, map[k]), F.ranges[k])) return false; }
+  return true;
+}
+function readFilterPanel(pn){
+  function fv(name){ var e = pn.querySelector('[data-f="' + name + '"]'); return e ? e.value.trim() : ''; }
+  function rng(name){ var mn = fv(name + '_min'), mx = fv(name + '_max'); return (mn === '' && mx === '') ? null : {min: mn === '' ? null : parseFloat(mn), max: mx === '' ? null : parseFloat(mx)}; }
+  var distEl = pn.querySelector('input[name="f_dist"]:checked');
+  var F = {active: false, dist: (distEl && distEl.value !== '') ? parseFloat(distEl.value) : null,
+           year: fv('fyear'), zip: fv('fzip'), status: fv('fstatus'), ptype: fv('ftype'), ranges: {}};
+  ['beds', 'baths', 'sqft', 'lot', 'year', 'price', 'ppsf', 'dom'].forEach(function(k){ F.ranges[k] = rng(k); });
+  var counts = {market: (F.dist !== null ? 1 : 0) + (F.year ? 1 : 0) + (F.zip ? 1 : 0) + (F.status ? 1 : 0),
+                details: (F.ranges.beds ? 1 : 0) + (F.ranges.baths ? 1 : 0) + (F.ranges.sqft ? 1 : 0) + (F.ranges.lot ? 1 : 0) + (F.ranges.year ? 1 : 0) + (F.ptype ? 1 : 0),
+                price: (F.ranges.price ? 1 : 0) + (F.ranges.ppsf ? 1 : 0) + (F.ranges.dom ? 1 : 0)};
+  F.active = (counts.market + counts.details + counts.price) > 0;
+  return {F: F, counts: counts};
+}
+function paintFilterCounts(pn, counts){
+  ['market', 'details', 'price'].forEach(function(g){
+    var e = pn.querySelector('[data-fcount-for="' + g + '"]'); if (e) e.textContent = counts[g] + ' selected';
+  });
+  var total = counts.market + counts.details + counts.price;
+  var badge = document.querySelector('[data-filters-count]');
+  if (badge){ badge.textContent = total; badge.hidden = total === 0; }
+}
+function initCompFilters(pn){
+  var btn = pn.querySelector('[data-filters-btn]'), panel = pn.querySelector('[data-filter-panel]');
+  if (!btn || !panel || btn.dataset.finit) return; btn.dataset.finit = '1';
+  btn.addEventListener('click', function(){ panel.hidden = !panel.hidden; });
+  panel.querySelector('[data-filters-apply]').addEventListener('click', function(){
+    var r = readFilterPanel(pn); COMP_FILTERS = r.F; paintFilterCounts(pn, r.counts);
+    compPage = 1; compExpanded = false; applyCompView();
+  });
+  panel.querySelector('[data-filters-clear]').addEventListener('click', function(){
+    panel.querySelectorAll('input[data-f], select[data-f]').forEach(function(e){ e.value = ''; });
+    var d0 = panel.querySelector('input[name="f_dist"][value=""]'); if (d0) d0.checked = true;
+    COMP_FILTERS = {active: false, dist: null, year: '', zip: '', status: '', ptype: '', ranges: {}};
+    paintFilterCounts(pn, {market: 0, details: 0, price: 0});
+    compPage = 1; compExpanded = false; applyCompView();
+  });
 }
 function applyCompView(){
   var pn = soldPaneEl(); if (!pn) return;
@@ -517,7 +673,7 @@ function applyCompView(){
     soldCardEls().forEach(function(cd){ cd.style.display = 'none'; });
     vis.slice(start, start + COMP_PAGE_SIZE).forEach(function(cd){ cd.style.display = ''; });
     var showing = pn.querySelector('[data-comp-showing]');
-    if (showing) showing.textContent = vis.length ? ('Showing ' + (start + 1) + '–' + Math.min(start + COMP_PAGE_SIZE, vis.length) + ' of ' + vis.length + (compQuery() ? ' (search filter on)' : '')) : 'No comps match your search';
+    if (showing) showing.textContent = vis.length ? ('Showing ' + (start + 1) + '–' + Math.min(start + COMP_PAGE_SIZE, vis.length) + ' of ' + vis.length + (compQuery() ? ' (search filter on)' : (COMP_FILTERS.active ? ' (comp filters on)' : ''))) : 'No comps match your search';
     var nums = pn.querySelector('[data-page-nums]');
     if (nums){
       nums.innerHTML = '';
@@ -537,7 +693,7 @@ function applyCompView(){
     if (grid) grid.style.display = 'none'; if (pager) pager.style.display = 'none'; if (lwrap) lwrap.style.display = '';
     var rows = Array.prototype.slice.call(pn.querySelectorAll('[data-comp-list] tbody tr[data-cid]'));
     var q = compQuery();
-    var match = rows.filter(function(tr){ return !q || tr.textContent.toLowerCase().indexOf(q) >= 0; });
+    var match = rows.filter(function(tr){ return (!q || tr.textContent.toLowerCase().indexOf(q) >= 0) && passesFilters(tr); });
     rows.forEach(function(tr){ tr.style.display = 'none'; });
     match.forEach(function(tr, i){ tr.style.display = (compExpanded || i < 5) ? '' : 'none'; });
     var vm = pn.querySelector('[data-viewmore]');
@@ -567,6 +723,7 @@ function syncViewModeButtons(){
 function initCompTools(){
   var pn = soldPaneEl(); if (!pn || pn.dataset.toolsInit) return; pn.dataset.toolsInit = '1';
   captureOrigStats();
+  initCompFilters(pn);
   var inp = pn.querySelector('[data-comp-search]');
   if (inp) inp.addEventListener('input', function(){ compPage = 1; compExpanded = false; applyCompView(); });
   var pv = pn.querySelector('[data-page-prev]'), nx = pn.querySelector('[data-page-next]');
@@ -695,18 +852,88 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% endif %}
 
 {% if tab=='contractors' %}
-<div class="card"><h2>Contractors on this property</h2>
-<table><tr><th>Trade</th><th>Contractor</th><th>Walkthrough</th><th>Quote</th><th>Notes</th></tr>
-{% for a in assigns %}<tr><td>{{ a.trade }}</td><td>{{ a.name or '' }} {{ a.company or '' }}</td><td>{{ a.walkthrough or '—' }}</td><td>{{ a.quote|money }}</td><td class="small">{{ a.notes or '' }}</td></tr>
-{% else %}<tr><td colspan="5" class="muted">None assigned yet.</td></tr>{% endfor %}</table>
-<h3>Assign a contractor</h3>
-<form method="post" action="{{ url_for('assign', pid=p.id) }}"><div class="rowflex">
-<div><label>Contractor</label><select name="contractor_id">{% for c in contractors %}<option value="{{ c.id }}">{{ c.trade }} — {{ c.name }} ({{ c.company or '' }})</option>{% endfor %}</select></div>
-<div><label>Trade</label><input name="trade" placeholder="Roofing"></div>
-<div><label>Walkthrough date</label><input name="walkthrough" placeholder="2026-11-05"></div>
-<div><label>Quote $</label><input name="quote"></div></div>
-<label>Notes</label><input name="notes"><p><button class="btn">Assign</button></p></form>
-<p class="small muted">Manage the contractor database on the <a href="{{ url_for('contractors_page') }}">Contractors page</a> (add your HouseAble contractors there once — they appear here for every property).</p></div>
+<div class="card"><h2>Contractors — trade specialists for this property</h2>
+<table data-trades-table><tr><th>Trade</th><th>Contractor</th><th>Next Walkthrough</th><th>Visit Status</th><th>Quote</th><th></th></tr>
+{% for t in trades_rows %}{% set a = t.a %}<tr data-trade-row="{{ t.trade }}"><td><b>{{ t.trade }}</b></td>
+<td>{% if a %}{% if a.contractor_id %}{{ a.name or '' }}{% if a.company %} — {{ a.company }}{% endif %}{% else %}{{ a.contact_company or '' }}{% if a.contact_name %} ({{ a.contact_name }}){% endif %}{% endif %}{% else %}<span class="muted">No contractor assigned</span>{% endif %}</td>
+<td>{{ a.walkthrough if a and a.walkthrough else '—' }}</td>
+<td>{{ (a.visit_status if a and a.visit_status else 'Contractor needed') }}</td>
+<td>{% if a and a.quote %}{{ a.quote|money }} · {% endif %}{{ (a.quote_status if a and a.quote_status else 'Not requested') if a else 'Not requested' }}</td>
+<td><button type="button" class="btn sm" data-assign-open data-trade="{{ t.trade }}">Assign</button></td></tr>{% endfor %}
+</table>
+<form method="post" action="{{ url_for('add_trade', pid=p.id) }}" class="rowflex" style="margin-top:12px">
+<div style="max-width:280px"><label>Add a trade</label><input name="trade_name" placeholder="e.g. Solar, Landscaping"></div>
+<div style="flex:0"><button class="btn sec">Add Trade</button></div></form>
+<p class="small muted">Assign a contractor to each trade to track walkthroughs and quotes. The directory lives on the <a href="{{ url_for('contractors_page') }}">Contractors page</a>; a New Contact is saved on this property only.</p></div>
+
+<div class="assignmodal" data-assign-modal hidden>
+<div class="assigncard">
+<button type="button" class="x" data-modal-close title="Close">✕</button>
+<h3 style="margin-top:0">Assign Contractor — <span data-modal-trade></span></h3>
+<div class="modaltabs"><button type="button" class="on" data-mtab="dir">From My Network</button><button type="button" data-mtab="new">New Contact</button></div>
+<form method="post" action="{{ url_for('assign', pid=p.id) }}" data-pane="dir">
+<input type="hidden" name="trade" data-trade-input>
+<label>Search by name or company…</label><input data-dir-search placeholder="Start typing to filter the directory">
+<label>Directory trade filter</label><select data-dir-tradefilter><option value="">All trades</option>{% for t in dir_trades %}<option>{{ t }}</option>{% endfor %}</select>
+<div class="dirlist">
+{% for c in contractors %}<label class="diritem" data-dir-item data-trade-val="{{ c.trade or '' }}" data-search="{{ ((c.name or '') ~ ' ' ~ (c.company or '') ~ ' ' ~ (c.trade or ''))|lower }}"><input type="radio" name="contractor_id" value="{{ c.id }}" required> <b>{{ c.name }}</b>{% if c.company %} — {{ c.company }}{% endif %} <span class="muted small">({{ c.trade or 'Trade not set' }}{% if c.phone %} · {{ c.phone }}{% endif %})</span></label>
+{% else %}<p class="muted">The directory is empty — add contractors on the Contractors page, or use New Contact.</p>{% endfor %}
+</div>
+<div class="rowflex">
+<div><label>Next walkthrough</label><input name="walkthrough" placeholder="2026-11-05"></div>
+<div><label>Visit status</label><select name="visit_status">{% for s in ['Contractor needed','Scheduled','Visited','Completed'] %}<option>{{ s }}</option>{% endfor %}</select></div>
+<div><label>Quote $</label><input name="quote"></div>
+<div><label>Quote status</label><select name="quote_status">{% for s in ['Not requested','Requested','Received'] %}<option>{{ s }}</option>{% endfor %}</select></div></div>
+<label>Notes</label><input name="notes">
+<p><button class="btn" data-assign-submit>Assign contractor</button></p></form>
+<form method="post" action="{{ url_for('assign_new_contact', pid=p.id) }}" data-pane="new" hidden>
+<input type="hidden" name="trade" data-trade-input>
+<div class="rowflex">
+<div><label>Company *</label><input name="company" required></div>
+<div><label>Contact name</label><input name="name"></div></div>
+<div class="rowflex">
+<div><label>Phone</label><input name="phone"></div>
+<div><label>Email</label><input name="email"></div>
+<div><label>Next walkthrough</label><input name="walkthrough" placeholder="2026-11-05"></div></div>
+<p class="small muted">This contact will be saved on this property only. It won't create an account or invite the contractor.</p>
+<p><button class="btn" data-new-submit>Save &amp; assign</button></p></form>
+</div></div>
+<script>
+/* v1.7b: per-trade Assign dialog (ReiSearch pass 2) — directory picker with
+   live search + trade filter, or a property-local New Contact. */
+(function(){
+  var modal = document.querySelector('[data-assign-modal]'); if (!modal) return;
+  var tradeSpan = modal.querySelector('[data-modal-trade]');
+  function setTrade(t){
+    tradeSpan.textContent = t;
+    modal.querySelectorAll('[data-trade-input]').forEach(function(i){ i.value = t; });
+    var tf = modal.querySelector('[data-dir-tradefilter]'); if (tf) tf.value = '';
+    filterDir();
+  }
+  function filterDir(){
+    var q = (modal.querySelector('[data-dir-search]').value || '').toLowerCase();
+    var tf = modal.querySelector('[data-dir-tradefilter]').value || '';
+    modal.querySelectorAll('[data-dir-item]').forEach(function(it){
+      var okQ = !q || it.getAttribute('data-search').indexOf(q) >= 0;
+      var okT = !tf || it.getAttribute('data-trade-val') === tf;
+      it.style.display = (okQ && okT) ? '' : 'none';
+    });
+  }
+  document.querySelectorAll('[data-assign-open]').forEach(function(btn){
+    btn.addEventListener('click', function(){ setTrade(btn.getAttribute('data-trade')); modal.hidden = false; });
+  });
+  modal.querySelector('[data-modal-close]').addEventListener('click', function(){ modal.hidden = true; });
+  modal.addEventListener('click', function(e){ if (e.target === modal) modal.hidden = true; });
+  modal.querySelector('[data-dir-search]').addEventListener('input', filterDir);
+  modal.querySelector('[data-dir-tradefilter]').addEventListener('change', filterDir);
+  modal.querySelectorAll('[data-mtab]').forEach(function(tab){
+    tab.addEventListener('click', function(){
+      modal.querySelectorAll('[data-mtab]').forEach(function(x){ x.classList.toggle('on', x === tab); });
+      modal.querySelectorAll('form[data-pane]').forEach(function(f){ f.hidden = f.getAttribute('data-pane') !== tab.getAttribute('data-mtab'); });
+    });
+  });
+})();
+</script>
 {% endif %}
 
 {% if tab=='market' %}
