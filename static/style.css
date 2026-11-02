@@ -401,3 +401,28 @@ table.complist tr[data-subject]{background:#eff6ff;font-weight:600}
 .propgrid .pc{border-radius:14px;box-shadow:var(--shadow-soft)}
 .propgrid .pc:hover{box-shadow:0 3px 12px rgba(15,34,51,.12)}
 .pc-price{font-weight:800;color:var(--orange);font-size:14px}
+
+/* ===== v2.0 polish (P0-5): motion + states only — no layout changes.
+   ReiSearch color language kept: white cards, green/blue actions, amber pins.
+   Reference: shadcn/ui interaction tokens (~/workspace/ui) — ease-out
+   transitions, visible focus rings, subtle hover lift on cards/buttons. */
+.btn, .vpill, .segbar button, .sidetabs button, .chip, .preset, .ptype button,
+details.acc > summary, .ccard, .card, .sidecard, input, select, textarea {
+  transition: background-color .18s ease, border-color .18s ease,
+              box-shadow .18s ease, transform .18s ease, opacity .18s ease;
+}
+.btn:hover { transform: translateY(-1px); box-shadow: 0 3px 10px rgba(23,34,46,.18); }
+.btn:active { transform: translateY(0); box-shadow: none; }
+.ccard:hover { box-shadow: 0 6px 18px rgba(23,34,46,.12); transform: translateY(-2px); }
+.ccard.pinned:hover { box-shadow: 0 6px 18px rgba(245,158,11,.35); }
+.vpill:hover, .segbar button:hover, .sidetabs button:hover, .chip:hover { filter: brightness(1.06); }
+details.acc > summary:hover { background: #f8fafc; }
+input:focus-visible, select:focus-visible, textarea:focus-visible,
+button:focus-visible, a:focus-visible {
+  outline: 2px solid var(--accent2); outline-offset: 1px;
+}
+@keyframes pdaFade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.viewpane.on, .uw-panel.on, .sidepane.on { animation: pdaFade .22s ease; }
+@media (prefers-reduced-motion: reduce) {
+  .btn, .ccard, .viewpane.on, .uw-panel.on, .sidepane.on { transition: none; animation: none; transform: none; }
+}

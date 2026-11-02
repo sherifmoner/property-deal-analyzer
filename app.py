@@ -506,14 +506,20 @@ def _row_payment(f):
                 (fnum(f.get("taxes_mo"), 0) or 0) + (fnum(f.get("insurance_mo"), 0) or 0))
     amt = fnum(f.get("amount"), 0) or 0
     if amt <= 0: return 0.0, 0.0
-    elif pt == "interest_only":
+    esc = (fnum(f.get("taxes_mo"), 0) or 0) + (fnum(f.get("insurance_mo"), 0) or 0)
+    if pt in ("amortized", "principal_only") and not months:
+        # v2.0 (P0-3, mirrors uw.js): no term typed -> NO payment. The old
+        # else-branch priced a term-less Amortized card as interest-only
+        # (_loan_payment with 0 years), so the term field looked dead.
+        return 0.0, esc
+    if pt == "interest_only":
         pay = amt * rate / 100 / 12
     elif pt == "principal_only":
         # ReiSearch: Principal Only = monthly interest + straight-line principal (balance / amort months)
-        pay = amt * rate / 100 / 12 + (amt / months if months else 0.0)
+        pay = amt * rate / 100 / 12 + amt / months
     else:
-        pay = _loan_payment(amt, rate, months / 12 if months else 0)
-    return pay, (fnum(f.get("taxes_mo"), 0) or 0) + (fnum(f.get("insurance_mo"), 0) or 0)
+        pay = _loan_payment(amt, rate, months / 12)
+    return pay, esc
 
 def _paydown_y1(f):
     """Year-1 principal paydown for one funding card, by payment type.
@@ -533,8 +539,10 @@ def _paydown_y1(f):
         return min(amt, amt / months * 12) if months else 0.0
     if pt == "fixed":
         pay = fnum(f.get("fixed_payment"), 0) or 0
+    elif not months:
+        return 0.0  # v2.0: Amortized with no term -> no payment -> no paydown
     else:
-        pay = _loan_payment(amt, rate, months / 12 if months else 0)
+        pay = _loan_payment(amt, rate, months / 12)
     if pay <= 0: return 0.0
     r = rate / 100 / 12; bal = amt; prin = 0.0
     for _ in range(12):
@@ -1089,19 +1097,12 @@ def _norm_ptype(raw):
     return None
 
 # ---------------------------------------------------------------- comps pull (HomeHarvest)
-def pull_comps(prop, radius_mi=1.0, past_days=365):
-    """ZIP-mode query + post-filter on ZIP and coordinates. NEVER raw full-address mode (mis-resolves).
-    Pulls sold comps + rental comps, the subject's own listing photos, fills blank subject
-    facts from its listing row, and auto-pins the top 3 sold comps (ReiSearch default) when
-    the user has not pinned any yet. Returns counts per kind. Raises on total failure so the
-    job layer can surface the reason — partial failures are reported in 'warnings'."""
-    from homeharvest import scrape_property
-    d = db(); today = datetime.date.today().isoformat()
-    warnings = []
-    sold = scrape_property(location=prop["zip"], listing_type="sold", past_days=past_days)
-    added = updated = 0; n_sold = 0
-    subj = {"sqft": prop["sqft"], "beds": prop["beds"], "baths": prop["baths"], "year_built": prop["year_built"], "lot_sqft": prop["lot_sqft"]}
-    for _, r in sold.iterrows():
+def _merge_sold_frame(d, prop, df, radius_mi, subj):
+    """Merge one HomeHarvest sold frame into the comps table (ZIP + radius
+    post-filter; never address mode). Returns (added, updated, usable)."""
+    added = updated = n = 0
+    if df is None: return added, updated, n
+    for _, r in df.iterrows():
         if str(r.get("zip_code")) != str(prop["zip"]): continue
         lat, lon = r.get("latitude"), r.get("longitude")
         if lat is None or lon is None or (isinstance(lat, float) and math.isnan(lat)): continue
@@ -1111,7 +1112,7 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         if not addr: continue
         price = fnum(r.get("sold_price")); sqft = fnum(r.get("sqft"))
         if not price: continue  # a "sold" row with no price is not a usable comp
-        n_sold += 1
+        n += 1
         vals = dict(kind="sold", address=addr, city=_s(r.get("city")) or prop["city"],
                     zip=_s(r.get("zip_code")), price=price,
                     ppsf=(price / sqft) if price and sqft else fnum(r.get("price_per_sqft")),
@@ -1133,41 +1134,88 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex["id"])); updated += 1
         else:
             d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
+    return added, updated, n
+
+def _merge_rent_frame(d, prop, df, radius_mi, subj):
+    """Merge one HomeHarvest for_rent frame. Returns (added, usable)."""
+    added = n = 0
+    if df is None: return added, n
+    for _, r in df.iterrows():
+        if str(r.get("zip_code")) != str(prop["zip"]): continue
+        lat, lon = r.get("latitude"), r.get("longitude")
+        if lat is None or lon is None or (isinstance(lat, float) and math.isnan(lat)): continue
+        dist = haversine_mi(prop["lat"], prop["lon"], float(lat), float(lon))
+        if dist is None or dist > radius_mi: continue
+        addr = _s(r.get("street")).strip(); price = fnum(r.get("list_price"))
+        if not addr or not price: continue
+        sqft = fnum(r.get("sqft"))
+        vals = dict(kind="rent", address=addr, city=_s(r.get("city")) or prop["city"],
+                    zip=_s(r.get("zip_code")), price=price,
+                    ppsf=(price / sqft) if sqft else None,
+                    beds=fnum(r.get("beds")), baths=fnum(r.get("full_baths")), sqft=sqft,
+                    year_built=int(r["year_built"]) if fnum(r.get("year_built")) else None,
+                    event_date=None, dom=fnum(r.get("days_on_mls")),
+                    lat=float(lat), lon=float(lon), distance_mi=dist,
+                    lot_sqft=fnum(r.get("lot_sqft")),
+                    ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
+                    source="HomeHarvest (Realtor.com rentals)", source_url=_s(r.get("property_url")),
+                    photo_url=_s(r.get("primary_photo")))
+        vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
+                                                 "baths": vals["baths"], "year_built": vals["year_built"],
+                                                 "lot_sqft": vals["lot_sqft"]})
+        ex = d.execute("SELECT id FROM comps WHERE property_id=? AND kind='rent' AND address=? AND price=?",
+                       (prop["id"], addr, price)).fetchone()
+        cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
+        if ex:
+            d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex["id"]))
+        else:
+            d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
+        n += 1
+    return added, n
+
+def comp_tier(subj, c):
+    """Sherif's match-first tiers for SOLD comps (2026-11-02, P0-1).
+    Tier 1: beds == subject AND baths == subject AND sqft within +/-20%.
+    Tier 2: (beds within +/-1 OR baths within +/-1) AND sqft within +/-35%.
+    Tier 3: everything else. A comp with missing specs is never promoted on a
+    guess — unknown specs land in Tier 3 (not found != matched)."""
+    sb, sba, ssq = subj.get("beds"), subj.get("baths"), subj.get("sqft")
+    b, ba, sq = c.get("beds"), c.get("baths"), c.get("sqft")
+    if sb is None or sba is None or not ssq: return 3
+    if b == sb and ba == sba and sq and ssq * 0.8 <= sq <= ssq * 1.2: return 1
+    if sq and ssq * 0.65 <= sq <= ssq * 1.35 and \
+            ((b is not None and abs(b - sb) <= 1) or (ba is not None and abs(ba - sba) <= 1)): return 2
+    return 3
+
+def rent_match_group(subj, c):
+    """Rental match group for the LTR / Co-Living views (P0-2):
+    0 = exact beds+baths match, 1 = beds or baths within +/-1 (near),
+    2 = the rest or unknown specs."""
+    sb, sba = subj.get("beds"), subj.get("baths")
+    b, ba = c.get("beds"), c.get("baths")
+    if sb is None or sba is None: return 2
+    if b == sb and ba == sba: return 0
+    if (b is not None and abs(b - sb) <= 1) or (ba is not None and abs(ba - sba) <= 1): return 1
+    return 2
+
+def pull_comps(prop, radius_mi=1.0, past_days=365):
+    """ZIP-mode query + post-filter on ZIP and coordinates. NEVER raw full-address mode (mis-resolves).
+    Pulls sold comps + rental comps, the subject's own listing photos, fills blank subject
+    facts from its listing row, and auto-pins the top 3 sold comps (ReiSearch default) when
+    the user has not pinned any yet. Returns counts per kind. Raises on total failure so the
+    job layer can surface the reason — partial failures are reported in 'warnings'."""
+    from homeharvest import scrape_property
+    d = db(); today = datetime.date.today().isoformat()
+    warnings = []
+    sold = scrape_property(location=prop["zip"], listing_type="sold", past_days=past_days)
+    subj = {"sqft": prop["sqft"], "beds": prop["beds"], "baths": prop["baths"], "year_built": prop["year_built"], "lot_sqft": prop["lot_sqft"]}
+    added, updated, n_sold = _merge_sold_frame(d, prop, sold, radius_mi, subj)
     # rentals (LTR / Co-Living / Affordable views all read this set)
     n_rent = 0; rent_df = None
     try:
         rent_df = scrape_property(location=prop["zip"], listing_type="for_rent", past_days=90)
-        for _, r in rent_df.iterrows():
-            if str(r.get("zip_code")) != str(prop["zip"]): continue
-            lat, lon = r.get("latitude"), r.get("longitude")
-            if lat is None or lon is None or (isinstance(lat, float) and math.isnan(lat)): continue
-            dist = haversine_mi(prop["lat"], prop["lon"], float(lat), float(lon))
-            if dist is None or dist > radius_mi: continue
-            addr = _s(r.get("street")).strip(); price = fnum(r.get("list_price"))
-            if not addr or not price: continue
-            sqft = fnum(r.get("sqft"))
-            vals = dict(kind="rent", address=addr, city=_s(r.get("city")) or prop["city"],
-                        zip=_s(r.get("zip_code")), price=price,
-                        ppsf=(price / sqft) if sqft else None,
-                        beds=fnum(r.get("beds")), baths=fnum(r.get("full_baths")), sqft=sqft,
-                        year_built=int(r["year_built"]) if fnum(r.get("year_built")) else None,
-                        event_date=None, dom=fnum(r.get("days_on_mls")),
-                        lat=float(lat), lon=float(lon), distance_mi=dist,
-                        lot_sqft=fnum(r.get("lot_sqft")),
-                        ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
-                        source="HomeHarvest (Realtor.com rentals)", source_url=_s(r.get("property_url")),
-                        photo_url=_s(r.get("primary_photo")))
-            vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
-                                                     "baths": vals["baths"], "year_built": vals["year_built"],
-                                                     "lot_sqft": vals["lot_sqft"]})
-            ex = d.execute("SELECT id FROM comps WHERE property_id=? AND kind='rent' AND address=? AND price=?",
-                           (prop["id"], addr, price)).fetchone()
-            cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
-            if ex:
-                d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex["id"]))
-            else:
-                d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
-            n_rent += 1
+        a2, n_rent = _merge_rent_frame(d, prop, rent_df, radius_mi, subj)
+        added += a2
     except Exception as e:
         warnings.append(f"rental comps failed ({e})")
         app.logger.warning(f"rent pull failed: {e}")
@@ -1219,13 +1267,55 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         if fills:
             d.execute(f"UPDATE properties SET {','.join(k+'=?' for k in fills)} WHERE id=?",
                       (*fills.values(), prop["id"])); d.commit()
-    # --- ReiSearch default: top 3 sold by match score auto-pinned (only if user pinned none) ---
+    # --- P0-1/P0-2 widening (Sherif 2026-11-02): the match-first views need a
+    # real matched set. If the stored sold set holds <10 Tier-1 matches, run ONE
+    # widened sold scrape (2x radius, min 2 mi; 730 days) and merge it; if the
+    # rental set is thin (<11 stored or <5 exact/near matches), run ONE widened
+    # rental scrape (2x radius, min 2 mi; past_days 365). Widening only ADDS
+    # real listings — views never pad with mismatches. ---
+    prop2 = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
+    subj2 = {"sqft": prop2["sqft"], "beds": prop2["beds"], "baths": prop2["baths"],
+             "year_built": prop2["year_built"], "lot_sqft": prop2["lot_sqft"]}
+    def _tier1_count():
+        rows = d.execute("SELECT beds,baths,sqft FROM comps WHERE property_id=? AND kind='sold' AND excluded=0",
+                         (prop["id"],)).fetchall()
+        return sum(1 for r in rows if comp_tier(subj2, dict(r)) == 1)
+    t1 = _tier1_count()
+    if t1 < 10:
+        try:
+            wide = scrape_property(location=prop["zip"], listing_type="sold", past_days=730)
+            a3, u3, _ = _merge_sold_frame(d, prop2, wide, max(radius_mi * 2, 2.0), subj2)
+            added += a3; updated += u3; d.commit()
+            t1b = _tier1_count()
+            warnings.append(f"sold set widened to {max(radius_mi * 2, 2.0):g} mi / 730 days to find Tier-1 matches ({t1} -> {t1b} found)")
+        except Exception as e:
+            warnings.append(f"sold widening scrape failed ({e})")
+    def _rent_match_counts():
+        rows = d.execute("SELECT beds,baths FROM comps WHERE property_id=? AND kind='rent'",
+                         (prop["id"],)).fetchall()
+        ex_ = sum(1 for r in rows if rent_match_group(subj2, dict(r)) == 0)
+        near = sum(1 for r in rows if rent_match_group(subj2, dict(r)) == 1)
+        return len(rows), ex_, near
+    rn, rex, rnear = _rent_match_counts()
+    if rn < 11 or (rex + rnear) < 5:
+        try:
+            wide_r = scrape_property(location=prop["zip"], listing_type="for_rent", past_days=365)
+            a4, _ = _merge_rent_frame(d, prop2, wide_r, max(radius_mi * 2, 2.0), subj2)
+            added += a4; d.commit()
+            rn2, rex2, rnear2 = _rent_match_counts()
+            warnings.append(f"rental set widened to {max(radius_mi * 2, 2.0):g} mi / 365 days for matched rentals ({rn} -> {rn2} listings; {rex2} exact + {rnear2} near beds/baths matches)")
+        except Exception as e:
+            warnings.append(f"rental widening scrape failed ({e})")
+    # --- Auto-pin (only if user pinned none): top 3 by TIER first (P0-1: Tier 1
+    # only when >=3 exist), then match score, then distance. ---
     pinned_now = d.execute("SELECT COUNT(*) c FROM comps WHERE property_id=? AND kind='sold' AND pinned=1",
                            (prop["id"],)).fetchone()["c"]
     if not pinned_now:
-        top3 = d.execute("""SELECT id FROM comps WHERE property_id=? AND kind='sold' AND excluded=0
-                            ORDER BY match_score DESC LIMIT 3""", (prop["id"],)).fetchall()
-        for t in top3: d.execute("UPDATE comps SET pinned=1 WHERE id=?", (t["id"],))
+        rows = [dict(r) for r in d.execute(
+            "SELECT * FROM comps WHERE property_id=? AND kind='sold' AND excluded=0", (prop["id"],)).fetchall()]
+        rows.sort(key=lambda c: (comp_tier(subj2, c), -(c["match_score"] or 0),
+                                 c["distance_mi"] if c["distance_mi"] is not None else 9e9))
+        for t in rows[:3]: d.execute("UPDATE comps SET pinned=1 WHERE id=?", (t["id"],))
         d.commit()
     total_sold = d.execute("SELECT COUNT(*) c FROM comps WHERE property_id=? AND kind='sold' AND excluded=0",
                            (prop["id"],)).fetchone()["c"]
@@ -3078,6 +3168,21 @@ def property_page(pid):
     actives = [c for c in comps if c["kind"] == "active" and not c["excluded"]]
     sold_view = [c for c in (sold + actives) if in_radius(c) and (not c["event_date"] or c["event_date"] >= cutoff)]
     rents_view = [c for c in rents if in_radius(c)]
+    # P0-1/P0-2 (Sherif 2026-11-02): MATCH-FIRST ordering. Sold: tier asc, then
+    # pinned, then the weights score, then distance — the weights dialog still
+    # orders WITHIN a tier, it no longer outranks a better beds/baths/sqft
+    # match. Rentals: exact beds/baths matches first, then near, then the rest.
+    _subj = {"beds": p["beds"], "baths": p["baths"], "sqft": p["sqft"]}
+    sold_view.sort(key=lambda c: (comp_tier(_subj, dict(c)), -(c["pinned"] or 0),
+                                  -(c["match_score"] or 0),
+                                  c["distance_mi"] if c["distance_mi"] is not None else 9e9))
+    rents_view.sort(key=lambda c: (rent_match_group(_subj, dict(c)), -(c["match_score"] or 0),
+                                   c["distance_mi"] if c["distance_mi"] is not None else 9e9))
+    rent_match = {"exact": 0, "near": 0, "total": len(rents_view)}
+    for c in rents_view:
+        _g = rent_match_group(_subj, dict(c))
+        if _g == 0: rent_match["exact"] += 1
+        elif _g == 1: rent_match["near"] += 1
     sold_stats = pinned_sold_stats(sold_view)
     # v2.0: whole-filtered-set averages (the sold set the user is looking at —
     # window + radius applied) beside the pinned/top-3 line.
@@ -3139,8 +3244,9 @@ def property_page(pid):
         else:
             uw_current[strat] = latest if latest is not None else fresh
     # pinned (or top-3) sold comps for the Flip Sale & Exit table
+    # Fallback pool = first 3 of the tier-ordered sold view (P0-1: Tier 1 first).
     flip_pool = [c for c in sold_view if c["pinned"] and c["kind"] == "sold"] or \
-        sorted([c for c in sold_view if c["kind"] == "sold"], key=lambda c: -(c["match_score"] or 0))[:3]
+        [c for c in sold_view if c["kind"] == "sold"][:3]
     flip_prices = [c["price"] for c in flip_pool if c["price"]]
     # ---- v1.7b comp filters popover vocabularies (Sold view) ----
     sold_years = sorted({c["event_date"][:4] for c in sold_view if c["event_date"]}, reverse=True)
@@ -3152,6 +3258,7 @@ def property_page(pid):
                            trend_svg=trend_svg, tab=tab, amort=amort, amenities=amenities,
                            photos=photos, job=banner_job, steps=steps,
                            cview=cview, window=window, rmax=rmax, sold_view=sold_view, rents_view=rents_view,
+                           rent_match=rent_match,
                            sold_stats=sold_stats, set_stats=set_stats, sold_older_n=sold_older_n,
                            ltr=ltr, coli=coli, med_rent=med_rent, afford_view=afford_view,
                            breakdowns=breakdowns, room_est=room_est,
@@ -3529,8 +3636,13 @@ def amortize(pid):
     p = get_prop(pid)
     principal = fnum(request.form.get("loan_amount"), 0) or 0
     rate = fnum(request.form.get("rate"), 0) or 0
-    yrs = fnum(request.form.get("amort_years"), 30) or 30
-    term = fnum(request.form.get("loan_years"), yrs) or yrs
+    yrs = fnum(request.form.get("amort_years"), 0) or 0
+    term = fnum(request.form.get("loan_years"), 0) or 0
+    if principal <= 0 or rate <= 0 or yrs <= 0 or term <= 0:
+        # v2.0 (Sherif clarification): compute ONLY from numbers the user typed.
+        # The old `or 30` defaults invented a 30-year term on blank fields.
+        flash("Enter the loan amount, rate, amortization and loan term — the calculator uses only the numbers you type.", "warn")
+        return redirect(url_for("property_page", pid=pid, tab="underwriting"))
     res = amortization(principal, rate, yrs, term)
     if request.form.get("add_to_stack"):
         sc = db().execute("SELECT * FROM scenarios WHERE property_id=? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()

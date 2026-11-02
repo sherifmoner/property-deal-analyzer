@@ -451,7 +451,8 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><span>Source</span><b style="font-size:12px">{{ coli.source }} · {{ coli.date }}</b></div></div>
 <p class="small muted">This benchmark pre-fills the Co-Living underwriting rent per room from ZIP room-rent stats. It is an estimate from whole-house rents, not live PadSplit listings (no free PadSplit feed exists).</p>
 {% else %}<p class="muted">Not found — not enough rental comps with bedroom counts to estimate a per-room rent yet. Pull comps (with a wider radius if needed) and this benchmark will appear.</p>{% endif %}</div>
-{% if rents_view %}<div class="compcards">{{ subjcard('coliving') }}{% for c in rents_view %}{{ compcard(c, 'coliving') }}{% endfor %}</div>
+{% if rents_view %}<p class="small muted" data-match-note>Subject match ({{ p.beds|num }} bd / {{ p.baths|num }} ba): <b>{{ rent_match.exact }} exact</b> beds/baths matches · <b>{{ rent_match.near }}</b> near (beds or baths within ±1) · {{ rent_match.total }} rental listings shown, best matches first. Room rents in this view are per-room estimates from these whole-house listings (see the ZIP benchmark above).{% if not rent_match.exact %} No exact beds/baths-match rentals exist in the free listing sources for this subject — nothing was padded or invented to fill the view.{% endif %}</p>
+<div class="compcards">{{ subjcard('coliving') }}{% for c in rents_view %}{{ compcard(c, 'coliving') }}{% endfor %}</div>
 {% else %}<div class="card"><p class="muted">No rental comps yet — pull comps above.</p></div>{% endif %}
 </div>
 
@@ -476,7 +477,8 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 
 <div class="viewpane {{ 'on' if cview=='ltr' }}" data-pane="ltr">
 {{ ltrstatbar() }}
-{% if rents_view %}<div class="compcards">{{ subjcard('rent') }}{% for c in rents_view %}{{ compcard(c, 'rent') }}{% endfor %}</div>
+{% if rents_view %}<p class="small muted" data-match-note>Subject match ({{ p.beds|num }} bd / {{ p.baths|num }} ba): <b>{{ rent_match.exact }} exact</b> beds/baths matches · <b>{{ rent_match.near }}</b> near (beds or baths within ±1) · {{ rent_match.total }} rental listings shown, best matches first.{% if not rent_match.exact %} No exact beds/baths-match rentals exist in the free listing sources for this subject — the near matches below are real listings, not presented as exact matches.{% endif %}</p>
+<div class="compcards">{{ subjcard('rent') }}{% for c in rents_view %}{{ compcard(c, 'rent') }}{% endfor %}</div>
 {% else %}<div class="card"><p class="muted">No rental comps yet — pull comps above.</p></div>{% endif %}
 </div>
 

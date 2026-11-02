@@ -25,6 +25,13 @@
        (Subject-To cards have a blank amount by design; blank cards start at 0). */
     if (pt === "fixed") return { pay: N(f.fixed_payment), esc: N(f.taxes_mo) + N(f.insurance_mo) };
     var amt = N(f.amount); if (amt <= 0) return { pay: 0, esc: 0 };
+    /* v2.0 (P0-3 root cause): an Amortized/Principal-Only card with NO term
+       typed silently priced as interest-only (loanPayment's yrs<=0 fallback),
+       so the term field looked dead and a loan number existed that the user
+       never agreed to. Now: no term -> payment "not set", $0 debt — the same
+       honest state as a blank Fixed payment. No term is ever invented. */
+    if ((pt === "amortized" || pt === "principal_only") && !months)
+      return { pay: 0, esc: N(f.taxes_mo) + N(f.insurance_mo), notset: true };
     if (pt === "interest_only") pay = amt * rate / 100 / 12;
     else if (pt === "principal_only") pay = amt * rate / 100 / 12 + (months ? amt / months : 0); // ReiSearch: interest + straight-line principal
     else pay = loanPayment(amt, rate, months / 12);
@@ -39,7 +46,8 @@
     var rate = N(f.rate), months = termMonths(f), pt = f.payment_type || "amortized";
     if (pt === "interest_only") return 0;
     if (pt === "principal_only") return months ? Math.min(amt, amt / months * 12) : 0;
-    var pay = pt === "fixed" ? N(f.fixed_payment) : loanPayment(amt, rate, (months || 360) / 12);
+    if (pt === "amortized" && !months) return 0; /* v2.0: no term -> no payment -> no paydown (never invent 360) */
+    var pay = pt === "fixed" ? N(f.fixed_payment) : loanPayment(amt, rate, months / 12);
     if (pay <= 0) return 0;
     var r = rate / 100 / 12, bal = amt, prin = 0;
     for (var i = 0; i < 12 && bal > 0; i++) { var p = Math.min(Math.max(pay - bal * r, 0), bal); prin += p; bal -= p; }
@@ -48,8 +56,13 @@
   function loanSchedule(f) {
     /* Full schedule simulated by the card's OWN payment type (mirrors the sidebar
        view): IO = interest only, $0 principal, balance flat. */
-    var amt = N(f.amount), rate = N(f.rate), months = termMonths(f) || 360;
-    var pt = f.payment_type || "amortized";
+    var amt = N(f.amount), rate = N(f.rate), pt = f.payment_type || "amortized";
+    /* v2.0: an Amortized/Principal-Only card with no term has NO schedule —
+       the old || 360 invented a 30-year term the user never entered. (Fixed
+       cards keep a display horizon only; their payment is the user's amount.) */
+    if ((pt === "amortized" || pt === "principal_only") && !termMonths(f) && amt > 0)
+      return { payment: 0, rows: [], notset: true };
+    var months = termMonths(f) || 360;
     var rp = rowPayment(f);
     var r = rate / 100 / 12, bal = amt, rows = [];
     var pmtAm = loanPayment(amt, rate, months / 12);
@@ -697,25 +710,27 @@
       var f = (s.funding || [])[i]; if (!f) return;
       var rp = rowPayment(f);
       var pay = d.querySelector(".f-pay");
-      if (pay) pay.textContent = (f.payment_type === "fixed" && (f.fixed_payment === "" || f.fixed_payment === null || f.fixed_payment === undefined))
+      if (pay) pay.textContent = (rp.notset || (f.payment_type === "fixed" && (f.fixed_payment === "" || f.fixed_payment === null || f.fixed_payment === undefined)))
         ? "not set" : M(rp.pay + rp.esc);
       var t = d.querySelector(".f-title");
       if (t) t.textContent = f.loan_type === f.preset ? (f.loan_type || "") : ((f.loan_type || "") + " · " + (f.preset || ""));
     });
-    /* sidebar amortization mini-view: first real loan card, else the property loan.
+    /* sidebar amortization mini-view: the first real loan card ONLY.
        v1.6: the schedule is simulated by the card's OWN payment type — an
-       interest-only loan shows interest payments, $0 principal, balance flat. */
+       interest-only loan shows interest payments, $0 principal, balance flat.
+       v2.0 (Sherif clarification): the old fallback invented a Conventional
+       loan from the property's stored loan fields with a HARDCODED 30-year
+       term when no card qualified — removed. No card (or a card with no term)
+       -> no schedule, only the empty-state note. */
     var am = panel.querySelector("[data-amort='side']");
     if (am) {
       var loan = null;
       (s.funding || []).forEach(function (f) { if (!loan && f.type !== "Cash" && f.type !== "Equity" && N(f.amount) > 0) loan = f; });
       var amt = 0, rate = 0;
-      if (!loan && UW.propLoan && N(UW.propLoan.balance) > 0) {
-        loan = { type: "Conventional", amount: N(UW.propLoan.balance), rate: N(UW.propLoan.rate),
-                 term_value: 30, term_unit: "Years", payment_type: "amortized", taxes_mo: 0, insurance_mo: 0, fixed_payment: "" };
-      }
       if (loan) { amt = N(loan.amount); rate = N(loan.rate); }
-      if (amt > 0) {
+      if (amt > 0 && loanSchedule(loan).notset) {
+        am.innerHTML = '<p class="small muted">This loan has no term yet — enter the term (years) on its Funding card to see its amortization here.</p>';
+      } else if (amt > 0) {
         var sch = loanSchedule(loan);
         var maxPI = 1; sch.rows.slice(0, 15).forEach(function (x) { maxPI = Math.max(maxPI, x.interest + x.principal); });
         var bars = sch.rows.slice(0, 15).map(function (x) {

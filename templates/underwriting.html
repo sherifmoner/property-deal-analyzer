@@ -470,10 +470,10 @@
 
 <div class="card" id="amortcard"><h2>Amortization calculator</h2>
 <form method="post" action="{{ url_for('amortize', pid=p.id) }}"><div class="rowflex">
-<div><label>Loan amount $</label><input type="number" step="any" name="loan_amount" value="{{ p.loan_balance or 300000 }}"></div>
-<div><label>Rate %</label><input type="number" step="any" name="rate" value="{{ p.loan_rate or 6.5 }}"></div>
-<div><label>Amortization (yrs)</label><input type="number" step="any" name="amort_years" value="30"></div>
-<div><label>Loan term (yrs, balloon)</label><input type="number" step="any" name="loan_years" value="30"></div>
+<div><label>Loan amount $</label><input type="number" step="any" name="loan_amount" value="" placeholder="Amount you enter"></div>
+<div><label>Rate %</label><input type="number" step="any" name="rate" value="" placeholder="Rate you enter"></div>
+<div><label>Amortization (yrs)</label><input type="number" step="any" name="amort_years" value="" placeholder="Years you enter"></div>
+<div><label>Loan term (yrs, balloon)</label><input type="number" step="any" name="loan_years" value="" placeholder="Years you enter"></div>
 <div><label>Add to funding stack</label><input type="checkbox" name="add_to_stack"></div>
 <div style="flex:0"><button class="btn sec">Calculate</button></div></div></form>
 <p class="small muted">Produces the annual interest/principal/balance table on the next screen.</p></div>
