@@ -1443,13 +1443,21 @@ def _geo_block(geo_params, year=ACS_YEAR):
 
 # ------------------------------------------------ Census Reporter (PRIMARY, keyless)
 CR_TABLES = "B01003,B01001,B19001,B19013,B02001,B03003,B25003,B25064,B25077,B23025"
+# v2.1: PIN the Census Reporter release. "latest" is NOT one vintage across
+# scopes: it resolves to ACS 2024 5-year for ZCTAs but ACS 2024 1-year for
+# places (verified live 2026-11-02: Tampa place "latest" = pop 414,575 /
+# MHI $84,114 / MHV $494,400, while acs2024_5yr = 401,618 / $75,475 /
+# $420,400). Pinning acs2024_5yr keeps ZIP and city like-for-like under the
+# one "ACS 2024 5-year" label the page prints. (acs2023_5yr is NOT served by
+# Census Reporter: it 404s "isn't supported".)
+CR_RELEASE = "acs2024_5yr"
 
-def _cr_fetch(geo_id, release="latest", tables=CR_TABLES):
+def _cr_fetch(geo_id, release=CR_RELEASE, tables=CR_TABLES):
     """Census Reporter API (NO key): one call -> flat {B01003_001E: value} dict in
-    api.census.gov naming + the release label. Latest-release responses are cached
+    api.census.gov naming + the release label. Pinned-release responses are cached
     server-side per geography in settings (30 days) so repeat opens are instant."""
     ck = f"crvals_{release}_{geo_id}"
-    if release == "latest":
+    if release == CR_RELEASE:
         try:
             cached = json.loads(get_setting(ck) or "{}")
             if cached.get("vals") and cached.get("date") and \
@@ -1468,7 +1476,7 @@ def _cr_fetch(geo_id, release="latest", tables=CR_TABLES):
         for code, v in ((blk or {}).get("estimate") or {}).items():
             m = re.match(r"^(B\d{5})(\d{3})$", str(code))
             if m: vals[f"{m.group(1)}_{m.group(2)}E"] = v
-    if vals and release == "latest":
+    if vals and release == CR_RELEASE:
         try: set_setting(ck, json.dumps({"vals": vals, "rel": rel,
                                          "date": datetime.date.today().isoformat()}))
         except Exception: pass
@@ -1509,7 +1517,7 @@ def _pop_trend(zip_code):
     return _growth_series(pts)
 
 def _pop_trend_cr(geo_id):
-    """Population trend from Census Reporter releases: ACS 2014 / 2019 5-year + latest."""
+    """Population trend from Census Reporter releases: ACS 2014 / 2019 5-year + pinned CR_RELEASE."""
     pts = []
     for release, yr in (("acs2014_5yr", 2014), ("acs2019_5yr", 2019)):
         try:
@@ -2560,8 +2568,9 @@ def census_demographics(zip_code, city=None, state=None, address=None):
     if blk:
         blk["pop_trend"] = _pop_trend_cr(zip_geo)
         if len(blk["pop_trend"]) < 2 and _census_key():
-            # Census Reporter's public API serves the latest release only (older
-            # releases 403) — vintage trend falls back to the keyed direct API.
+            # Census Reporter's public API serves named 5-year releases
+            # (acs2014_5yr / acs2019_5yr / acs2024_5yr verified) but NOT
+            # acs2023_5yr — vintage trend falls back to the keyed direct API.
             blk["pop_trend"] = _pop_trend(zip_code)
         prev_vals = {}
         try:
