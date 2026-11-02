@@ -1193,6 +1193,13 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             srow = find_subject_row(deep, prop)
         except Exception as e:
             warnings.append(f"deep subject lookup failed ({e})")
+    if srow is None:
+        # v2.0 honest state: no listing row for this address in ANY free frame
+        # (including the 10-year deep sold scrape) — specs/photos stay blank
+        # because no source has them, and the job message says so instead of
+        # the property silently opening with empty specs.
+        warnings.append("no listing row found for this address in free sources (HomeHarvest) — "
+                        "specs and photos could not be auto-filled")
     if srow is not None:
         photos = extract_photos(srow)
         fills = {}
@@ -1318,7 +1325,7 @@ def _block_from_vals(v, name=None):
     if pop is None: return None
     own, rent = _acs_num(v, "B25003_002E") or 0, _acs_num(v, "B25003_003E") or 0
     un, lf = _acs_num(v, "B23025_005E"), _acs_num(v, "B23025_003E")
-    blk = {"name": v.get("NAME") or name, "population": pop,
+    blk = {"name": v.get("NAME") or name, "population": int(pop) if pop is not None else None,
            "median_home_value": _acs_num(v, "B25077_001E"), "median_rent": _acs_num(v, "B25064_001E"),
            "median_income": _acs_num(v, "B19013_001E"),
            "owner_pct": round(own / (own + rent) * 100, 1) if (own + rent) else None,
@@ -1452,9 +1459,983 @@ def census_geographies(address):
     except Exception:
         return None
 
+def _place_key(name):
+    """Normalize a Census place name for the bundled Gazetteer table:
+    lowercase, periods dropped, trailing city/town/village/CDP suffix dropped,
+    'st' -> 'saint'. Byte-identical to the generator that built _FL_PLACES."""
+    toks = str(name or "").lower().replace(".", " ").split()
+    while toks and toks[-1] in ("city", "town", "village", "cdp"):
+        toks.pop()
+    return " ".join("saint" if t == "st" else t for t in toks)
+
+# Bundled Florida Census place FIPS (place code only; state FIPS 12 prepends at
+# use). Source: US Census Bureau 2024 Gazetteer place file (public, official) —
+# embedded so city-scope demographics resolve OFFLINE and deterministically:
+# the keyless Census Geocoder is unreachable from some networks and the
+# place-list fallback needs a Census API key this app does not require.
+_FL_PLACES = {
+    "acacia villas": "00075",
+    "alachua": "00375",
+    "alafaya": "00410",
+    "alford": "00625",
+    "allentown": "00800",
+    "altamonte springs": "00950",
+    "altha": "01000",
+    "altoona": "01050",
+    "alturas": "01100",
+    "alva": "01125",
+    "andrews": "01353",
+    "anna maria": "01475",
+    "apalachicola": "01625",
+    "apollo beach": "01675",
+    "apopka": "01700",
+    "arcadia": "01750",
+    "archer": "01775",
+    "aripeka": "01875",
+    "asbury lake": "02187",
+    "astatula": "02250",
+    "astor": "02275",
+    "atlantic beach": "02400",
+    "atlantis": "02500",
+    "auburndale": "02550",
+    "aucilla": "02575",
+    "avalon": "02660",
+    "ave maria": "02677",
+    "aventura": "02681",
+    "avon park": "02750",
+    "azalea park": "02850",
+    "babson park": "02900",
+    "bagdad": "02925",
+    "bal harbour": "03275",
+    "baldwin": "03250",
+    "balm": "03375",
+    "bardmoor": "03480",
+    "bartow": "03675",
+    "bascom": "03725",
+    "bay harbor islands": "03975",
+    "bay hill": "04070",
+    "bay lake": "04150",
+    "bay pines": "04200",
+    "bayonet point": "04162",
+    "bayport": "04250",
+    "bayshore gardens": "04350",
+    "beacon square": "04650",
+    "bear creek": "04735",
+    "bee ridge": "04925",
+    "bell": "04975",
+    "bellair-meadowbrook terrace": "05025",
+    "belle glade": "05200",
+    "belle isle": "05300",
+    "belleair": "05075",
+    "belleair beach": "05100",
+    "belleair bluffs": "05125",
+    "belleair shore": "05150",
+    "belleview": "05375",
+    "bellview": "05462",
+    "berkshire lakes": "05806",
+    "berrydale": "05825",
+    "beverly beach": "06100",
+    "beverly hills": "06125",
+    "big coppitt key": "06350",
+    "big pine key": "06425",
+    "biscayne gardens": "06575",
+    "biscayne park": "06600",
+    "bithlo": "06625",
+    "black diamond": "06667",
+    "black hammock": "06670",
+    "bloomingdale": "06875",
+    "blountstown": "06925",
+    "boca raton": "07300",
+    "bokeelia": "07375",
+    "bonifay": "07450",
+    "bonita springs": "07525",
+    "boulevard gardens": "07687",
+    "bowling green": "07775",
+    "boynton beach": "07875",
+    "bradenton": "07950",
+    "bradenton beach": "07975",
+    "bradfordville": "08075",
+    "bradley junction": "08125",
+    "brandon": "08150",
+    "branford": "08175",
+    "brent": "08300",
+    "briny breezes": "08575",
+    "bristol": "08600",
+    "broadview park": "08650",
+    "bronson": "08700",
+    "brooker": "08725",
+    "brookridge": "08762",
+    "brooksville": "08800",
+    "brownsdale": "08925",
+    "brownsville": "09000",
+    "buckhead ridge": "09315",
+    "buckingham": "09350",
+    "buenaventura lakes": "09415",
+    "bunnell": "09550",
+    "burnt store marina": "09612",
+    "bushnell": "09625",
+    "butler beach": "09630",
+    "cabana colony": "09655",
+    "callahan": "09700",
+    "callaway": "09725",
+    "campbell": "09875",
+    "campbellton": "09900",
+    "canal point": "10100",
+    "cape canaveral": "10250",
+    "cape coral": "10275",
+    "capitola": "10350",
+    "captiva": "10425",
+    "carrabelle": "10725",
+    "carrollwood": "10825",
+    "caryville": "10975",
+    "casselberry": "11050",
+    "cedar grove": "11150",
+    "cedar key": "11225",
+    "celebration": "11285",
+    "center hill": "11325",
+    "century": "11362",
+    "chaires": "11525",
+    "charleston park": "11597",
+    "charlotte harbor": "11625",
+    "charlotte park": "11650",
+    "chattahoochee": "11800",
+    "cheval": "11912",
+    "chiefland": "11925",
+    "chipley": "11975",
+    "chokoloskee": "12150",
+    "christmas": "12250",
+    "chuluota": "12275",
+    "chumuckla": "12300",
+    "cinco bayou": "12325",
+    "citrus hills": "12412",
+    "citrus park": "12425",
+    "citrus springs": "12450",
+    "clarcona": "12675",
+    "clearwater": "12875",
+    "clermont": "12925",
+    "cleveland": "12950",
+    "clewiston": "13000",
+    "cloud lake": "13050",
+    "cobbtown": "13125",
+    "cocoa": "13150",
+    "cocoa beach": "13175",
+    "cocoa west": "13225",
+    "coconut creek": "13275",
+    "coleman": "13400",
+    "combee settlement": "13775",
+    "connerton": "13965",
+    "conway": "14050",
+    "cooper": "14125",
+    "coral gables": "14250",
+    "coral springs": "14400",
+    "coral terrace": "14412",
+    "cortez": "14700",
+    "cottondale": "14850",
+    "country club": "14895",
+    "country walk": "15055",
+    "crawfordville": "15300",
+    "crescent": "15375",
+    "crescent beach": "15325",
+    "crestview": "15475",
+    "crooked lake park": "15515",
+    "cross": "15575",
+    "crystal lake": "15725",
+    "crystal river": "15775",
+    "crystal springs": "15800",
+    "cudjoe key": "15862",
+    "cutler bay": "15968",
+    "cypress gardens": "16050",
+    "cypress lake": "16062",
+    "cypress quarters": "16100",
+    "dade": "16125",
+    "dade city north": "16175",
+    "dania beach": "16335",
+    "davenport": "16450",
+    "davie": "16475",
+    "day": "16500",
+    "daytona beach": "16525",
+    "daytona beach shores": "16550",
+    "de leon springs": "16975",
+    "debary": "16675",
+    "deerfield beach": "16725",
+    "defuniak springs": "16800",
+    "deland": "16875",
+    "deland southwest": "16937",
+    "delray beach": "17100",
+    "deltona": "17200",
+    "desoto acres": "17273",
+    "desoto lakes": "17300",
+    "destin": "17325",
+    "dickerson": "17450",
+    "dixonville": "17710",
+    "doctor phillips": "17725",
+    "doral": "17935",
+    "dover": "18075",
+    "duck key": "18425",
+    "dundee": "18550",
+    "dunedin": "18575",
+    "dunnellon": "18675",
+    "eagle lake": "18875",
+    "east bronson": "19025",
+    "east lake": "19206",
+    "east lake-orient park": "19212",
+    "east milton": "19275",
+    "east palatka": "19350",
+    "east williston": "19575",
+    "eastpoint": "19400",
+    "eatonville": "19650",
+    "ebro": "19725",
+    "edgewater": "19825",
+    "edgewood": "19900",
+    "eglin afb": "20050",
+    "egypt lake-leto": "20108",
+    "el portal": "20650",
+    "elfers": "20275",
+    "ellenton": "20375",
+    "englewood": "20825",
+    "ensley": "20925",
+    "estero": "21150",
+    "esto": "21250",
+    "eustis": "21350",
+    "everglades": "21425",
+    "fairview shores": "21750",
+    "fanning springs": "21850",
+    "feather sound": "21945",
+    "fellsmere": "22100",
+    "fern park": "22250",
+    "fernandina beach": "22175",
+    "ferndale": "22225",
+    "ferry pass": "22275",
+    "fidelis": "22325",
+    "fish hawk": "22387",
+    "fisher island": "22375",
+    "five points": "22475",
+    "flagler beach": "22550",
+    "flagler estates": "22560",
+    "fleming island": "22660",
+    "floral": "22775",
+    "florida": "22975",
+    "florida gulf coast university": "23005",
+    "florida ridge": "23050",
+    "floridatown": "23125",
+    "forest": "23375",
+    "fort braden": "23680",
+    "fort denaud": "23730",
+    "fort green": "23850",
+    "fort green springs": "23875",
+    "fort lauderdale": "24000",
+    "fort meade": "24100",
+    "fort myers": "24125",
+    "fort myers beach": "24150",
+    "fort myers shores": "24175",
+    "fort pierce": "24300",
+    "fort pierce north": "24337",
+    "fort pierce south": "24387",
+    "fort walton beach": "24475",
+    "fort white": "24500",
+    "fountainebleau": "24562",
+    "four corners": "24581",
+    "franklin park": "24710",
+    "freeport": "24825",
+    "frostproof": "24900",
+    "fruit cove": "24925",
+    "fruitland park": "24975",
+    "fruitville": "25000",
+    "fuller heights": "25025",
+    "fussels corner": "25125",
+    "gainesville": "25175",
+    "garcon point": "25392",
+    "garden grove": "25475",
+    "gardner": "25550",
+    "gateway": "25655",
+    "geneva": "25750",
+    "gibsonton": "25900",
+    "gifford": "25925",
+    "gladeview": "25987",
+    "glen ridge": "26050",
+    "glen saint mary": "26075",
+    "glencoe": "26000",
+    "glenvar heights": "26100",
+    "golden beach": "26250",
+    "golden gate": "26300",
+    "goldenrod": "26475",
+    "golf": "26550",
+    "gonzalez": "26700",
+    "goodland": "26775",
+    "gotha": "26900",
+    "goulding": "26925",
+    "goulds": "26950",
+    "graceville": "27000",
+    "grand ridge": "27175",
+    "grant-valkaria": "27256",
+    "green cove springs": "27400",
+    "greenacres": "27322",
+    "greenbriar": "27360",
+    "greensboro": "27550",
+    "greenville": "27575",
+    "greenwood": "27600",
+    "grenelefe": "27635",
+    "gretna": "27650",
+    "grove": "27775",
+    "groveland": "27800",
+    "gulf breeze": "28000",
+    "gulf gate": "28045",
+    "gulf stream": "28275",
+    "gulfport": "28175",
+    "gun club estates": "28305",
+    "haines": "28400",
+    "hallandale beach": "28452",
+    "hampton": "28575",
+    "harbor bluffs": "28650",
+    "harbour heights": "28800",
+    "harlem": "28925",
+    "harlem heights": "28937",
+    "harold": "29000",
+    "hastings": "29100",
+    "havana": "29150",
+    "haverhill": "29200",
+    "hawthorne": "29275",
+    "heathrow": "29320",
+    "heritage bay": "29381",
+    "heritage pines": "29385",
+    "hernando": "29425",
+    "hernando beach": "29437",
+    "hialeah": "30000",
+    "hialeah gardens": "30025",
+    "high point": "30494",
+    "high springs": "30525",
+    "highland": "30225",
+    "highland beach": "30200",
+    "highland park": "30325",
+    "hill 'n dale": "30800",
+    "hillcrest heights": "30700",
+    "hilliard": "30750",
+    "hillsboro beach": "30850",
+    "hillsboro pines": "30858",
+    "hobe sound": "30975",
+    "holden heights": "31025",
+    "holden lakes": "31030",
+    "holiday": "31075",
+    "holley": "31275",
+    "holly hill": "31350",
+    "hollywood": "32000",
+    "holmes beach": "32150",
+    "homeland": "32250",
+    "homestead": "32275",
+    "homestead base": "32325",
+    "homosassa": "32375",
+    "homosassa springs": "32400",
+    "horizon west": "32610",
+    "horseshoe beach": "32650",
+    "hosford": "32675",
+    "howey-in-the-hills": "32775",
+    "hudson": "32825",
+    "hunters creek": "32967",
+    "hurlburt field": "32975",
+    "hutchinson island south": "32993",
+    "hypoluxo": "33150",
+    "immokalee": "33250",
+    "indialantic": "33375",
+    "indian creek": "33425",
+    "indian harbour beach": "33450",
+    "indian lake estates": "33500",
+    "indian river estates": "33585",
+    "indian river shores": "33600",
+    "indian rocks beach": "33625",
+    "indian shores": "33675",
+    "indiantown": "33700",
+    "inglis": "33800",
+    "interlachen": "33900",
+    "inverness": "33950",
+    "inverness highlands north": "33958",
+    "inverness highlands south": "33966",
+    "inwood": "34000",
+    "iona": "34012",
+    "islamorada, village of islands": "34132",
+    "island walk": "34185",
+    "istachatta": "34275",
+    "ives estates": "34400",
+    "jacksonville": "35000",
+    "jacksonville beach": "35050",
+    "jacob": "35200",
+    "jan phyl": "35300",
+    "jasmine estates": "35350",
+    "jasper": "35375",
+    "jay": "35425",
+    "jennings": "35525",
+    "jensen beach": "35550",
+    "june park": "35800",
+    "juno beach": "35850",
+    "juno ridge": "35862",
+    "jupiter": "35875",
+    "jupiter farms": "35890",
+    "jupiter inlet colony": "35900",
+    "jupiter island": "35925",
+    "kathleen": "35950",
+    "kendale lakes": "36062",
+    "kendall": "36100",
+    "kendall west": "36121",
+    "kenneth": "36175",
+    "kensington park": "36200",
+    "kenwood estates": "36220",
+    "key biscayne": "36300",
+    "key colony beach": "36325",
+    "key largo": "36375",
+    "key vista": "36535",
+    "key west": "36550",
+    "keystone": "36462",
+    "keystone heights": "36475",
+    "kissimmee": "36950",
+    "la crosse": "37300",
+    "labelle": "37225",
+    "lacoochee": "37275",
+    "lady lake": "37375",
+    "laguna beach": "37500",
+    "lake": "37775",
+    "lake alfred": "37525",
+    "lake belvedere estates": "37542",
+    "lake buena vista": "37625",
+    "lake butler": "37648",
+    "lake clarke shores": "37800",
+    "lake hamilton": "37975",
+    "lake harbor": "38000",
+    "lake hart": "38012",
+    "lake helen": "38025",
+    "lake kathryn": "38162",
+    "lake kerr": "38238",
+    "lake lindsey": "38275",
+    "lake lorraine": "38287",
+    "lake mack-forest hills": "38332",
+    "lake magdalene": "38350",
+    "lake mary": "38425",
+    "lake mary jane": "38430",
+    "lake mystic": "38519",
+    "lake panasoffkee": "38575",
+    "lake park": "38600",
+    "lake placid": "38625",
+    "lake sarasota": "38690",
+    "lake wales": "38950",
+    "lake worth beach": "39081",
+    "lakeland": "38250",
+    "lakeland highlands": "38262",
+    "lakeside": "38813",
+    "lakewood park": "39062",
+    "lakewood ranch": "39067",
+    "lamont": "39100",
+    "land o' lakes": "39200",
+    "lantana": "39375",
+    "largo": "39425",
+    "lauderdale lakes": "39525",
+    "lauderdale-by-the-sea": "39475",
+    "lauderhill": "39550",
+    "laurel": "39600",
+    "laurel hill": "39650",
+    "lawtey": "39700",
+    "layton": "39725",
+    "lazy lake": "39750",
+    "lealman": "39775",
+    "lecanto": "39825",
+    "lee": "39850",
+    "leesburg": "39875",
+    "lehigh acres": "39925",
+    "leisure": "39950",
+    "lely": "39987",
+    "lely resort": "40037",
+    "lemon grove": "40100",
+    "liberty triangle": "40387",
+    "lighthouse point": "40450",
+    "limestone": "40525",
+    "limestone creek": "40562",
+    "lisbon": "40750",
+    "live oak": "40875",
+    "lloyd": "40950",
+    "lochmoor waterway estates": "40985",
+    "lockhart": "41025",
+    "longboat key": "41150",
+    "longwood": "41250",
+    "loughman": "41400",
+    "lower grand lagoon": "41562",
+    "loxahatchee groves": "41577",
+    "lutz": "41775",
+    "lynn haven": "41825",
+    "macclenny": "41950",
+    "madeira beach": "42400",
+    "madison": "42425",
+    "maitland": "42575",
+    "malabar": "42625",
+    "malone": "42650",
+    "manalapan": "42700",
+    "manasota key": "42750",
+    "manatee road": "42787",
+    "mango": "42850",
+    "mangonia park": "42900",
+    "marathon": "43000",
+    "marco island": "43083",
+    "marco shores-hammock bay": "43090",
+    "margate": "43125",
+    "marianna": "43175",
+    "marineland": "43250",
+    "marion oaks": "43300",
+    "mary esther": "43375",
+    "masaryktown": "43400",
+    "mascotte": "43425",
+    "matlacha": "43475",
+    "matlacha isles-matlacha shores": "43484",
+    "mayo": "43575",
+    "mcgregor": "42090",
+    "mcintosh": "42150",
+    "meadow oaks": "43785",
+    "meadow woods": "43800",
+    "medley": "43900",
+    "medulla": "43925",
+    "melbourne": "43975",
+    "melbourne beach": "44000",
+    "memphis": "44175",
+    "merritt island": "44275",
+    "mexico beach": "44300",
+    "miami": "45000",
+    "miami beach": "45025",
+    "miami gardens": "45060",
+    "miami lakes": "45100",
+    "miami shores": "45175",
+    "miami springs": "45200",
+    "micanopy": "45225",
+    "micco": "45275",
+    "miccosukee": "45300",
+    "middleburg": "45350",
+    "midway": "45425",
+    "milton": "45750",
+    "mims": "45775",
+    "minneola": "45900",
+    "miramar": "45975",
+    "miramar beach": "46000",
+    "molino": "46225",
+    "monticello": "46500",
+    "montura": "46520",
+    "montverde": "46525",
+    "moon lake": "46540",
+    "moore haven": "46550",
+    "morriston": "46725",
+    "mount carmel": "47000",
+    "mount dora": "47050",
+    "mount plymouth": "47125",
+    "mulat": "47175",
+    "mulberry": "47200",
+    "munson": "47300",
+    "myrtle grove": "47550",
+    "naples": "47625",
+    "naples manor": "47650",
+    "naples park": "47675",
+    "naranja": "47700",
+    "nassau village-ratliff": "47787",
+    "navarre": "48050",
+    "navarre beach": "48055",
+    "neptune beach": "48100",
+    "new port richey": "48500",
+    "new port richey east": "48525",
+    "new smyrna beach": "48625",
+    "newberry": "48200",
+    "niceville": "48750",
+    "nobleton": "48825",
+    "nocatee": "48850",
+    "nokomis": "48875",
+    "noma": "48900",
+    "north bay": "49225",
+    "north brooksville": "49237",
+    "north deland": "49275",
+    "north fort myers": "49350",
+    "north key largo": "49406",
+    "north lauderdale": "49425",
+    "north merritt island": "49435",
+    "north miami": "49450",
+    "north miami beach": "49475",
+    "north palm beach": "49600",
+    "north port": "49675",
+    "north redington beach": "49725",
+    "north river shores": "49750",
+    "north sarasota": "49787",
+    "north weeki wachee": "49905",
+    "northdale": "49260",
+    "oak hill": "50450",
+    "oak ridge": "50638",
+    "oakland": "50525",
+    "oakland park": "50575",
+    "oakleaf plantation": "50630",
+    "ocala": "50750",
+    "ocala estates": "50756",
+    "ocean": "50925",
+    "ocean breeze": "50875",
+    "ocean ridge": "50950",
+    "ocklawaha": "51050",
+    "ocoee": "51075",
+    "odessa": "51100",
+    "ojus": "51125",
+    "okahumpka": "51150",
+    "okeechobee": "51200",
+    "old miakka": "51342",
+    "oldsmar": "51350",
+    "olga": "51400",
+    "olympia heights": "51475",
+    "on top of the world": "51587",
+    "ona": "51500",
+    "opa-locka": "51650",
+    "orange": "51825",
+    "orange park": "52125",
+    "orangetree": "52162",
+    "orchid": "52175",
+    "oriole beach": "52250",
+    "orlando": "53000",
+    "orlovista": "53100",
+    "ormond beach": "53150",
+    "ormond-by-the-sea": "53200",
+    "osprey": "53425",
+    "otter creek": "53500",
+    "oviedo": "53575",
+    "pace": "53725",
+    "page park": "53775",
+    "pahokee": "53800",
+    "paisley": "53850",
+    "palatka": "53875",
+    "palm": "54175",
+    "palm bay": "54000",
+    "palm beach": "54025",
+    "palm beach gardens": "54075",
+    "palm beach shores": "54150",
+    "palm coast": "54200",
+    "palm harbor": "54350",
+    "palm river-clair mel": "54387",
+    "palm shores": "54425",
+    "palm springs": "54450",
+    "palm springs north": "54500",
+    "palm valley": "54525",
+    "palmer ranch": "54238",
+    "palmetto": "54250",
+    "palmetto bay": "54275",
+    "palmetto estates": "54300",
+    "palmona park": "54357",
+    "panacea": "54625",
+    "panama": "54700",
+    "panama city beach": "54725",
+    "paradise heights": "54912",
+    "parker": "55075",
+    "parkland": "55125",
+    "pasadena hills": "55305",
+    "patrick afb": "55375",
+    "paxton": "55475",
+    "pea ridge": "55532",
+    "pebble creek": "55540",
+    "pelican bay": "55650",
+    "pelican marsh": "55680",
+    "pembroke park": "55750",
+    "pembroke pines": "55775",
+    "penney farms": "55875",
+    "pensacola": "55925",
+    "pensacola station": "56004",
+    "perry": "56150",
+    "pierson": "56425",
+    "pine air": "56475",
+    "pine castle": "56500",
+    "pine hills": "56825",
+    "pine island": "56840",
+    "pine island center": "56850",
+    "pine lakes": "56865",
+    "pine level": "56955",
+    "pine manor": "57025",
+    "pine ridge": "57058",
+    "pinecraft": "56525",
+    "pinecrest": "56625",
+    "pineland": "56875",
+    "pinellas park": "56975",
+    "pinewood": "57250",
+    "pioneer": "57320",
+    "pittman": "57380",
+    "plant": "57550",
+    "plantation": "57425",
+    "plantation island": "57492",
+    "plantation mobile home park": "57518",
+    "poinciana": "57900",
+    "point baker": "57908",
+    "polk": "57950",
+    "pomona park": "58025",
+    "pompano beach": "58050",
+    "ponce de leon": "58175",
+    "ponce inlet": "58200",
+    "port charlotte": "58350",
+    "port labelle": "58420",
+    "port orange": "58575",
+    "port richey": "58600",
+    "port saint joe": "58675",
+    "port saint john": "58700",
+    "port saint lucie": "58715",
+    "port salerno": "58727",
+    "pretty bayou": "58962",
+    "princeton": "58975",
+    "progress": "59050",
+    "punta gorda": "59200",
+    "punta rassa": "59250",
+    "quail ridge": "59311",
+    "quincy": "59325",
+    "raiford": "59400",
+    "rainbow lakes estates": "59450",
+    "rainbow park": "59466",
+    "rainbow springs": "59470",
+    "raleigh": "59475",
+    "reddick": "59675",
+    "redington beach": "59725",
+    "redington shores": "59750",
+    "richmond heights": "60225",
+    "richmond west": "60230",
+    "ridge manor": "60325",
+    "ridge wood heights": "60475",
+    "ridgecrest": "60275",
+    "rio": "60550",
+    "rio pinar": "60562",
+    "river park": "60785",
+    "river ridge": "60835",
+    "riverview": "60950",
+    "riviera beach": "60975",
+    "rockledge": "61500",
+    "roeville": "61615",
+    "roosevelt gardens": "61807",
+    "roseland": "61875",
+    "rotonda": "61937",
+    "royal palm beach": "62100",
+    "royal palm estates": "62118",
+    "ruskin": "62275",
+    "safety harbor": "62425",
+    "saint augustine": "62500",
+    "saint augustine beach": "62525",
+    "saint augustine shores": "62550",
+    "saint augustine south": "62562",
+    "saint cloud": "62625",
+    "saint george island": "62650",
+    "saint james": "62675",
+    "saint leo": "62775",
+    "saint lucie": "62800",
+    "saint marks": "62825",
+    "saint pete beach": "62885",
+    "saint petersburg": "63000",
+    "samoset": "63225",
+    "samsula-spruce creek": "63362",
+    "san antonio": "63375",
+    "san carlos park": "63425",
+    "san castle": "63435",
+    "sanford": "63650",
+    "sanibel": "63700",
+    "sarasota": "64175",
+    "sarasota springs": "64325",
+    "satellite beach": "64400",
+    "sawgrass": "64525",
+    "schall circle": "64547",
+    "scottsmoor": "64625",
+    "sea ranch lakes": "64725",
+    "sebastian": "64825",
+    "sebring": "64875",
+    "seffner": "64925",
+    "seminole": "64975",
+    "seminole manor": "65100",
+    "seville": "65200",
+    "sewall's point": "65225",
+    "shady hills": "65385",
+    "shalimar": "65425",
+    "sharpes": "65525",
+    "siesta key": "66000",
+    "silver lake": "66062",
+    "silver springs": "66125",
+    "silver springs shores": "66175",
+    "silver springs shores east": "66179",
+    "sky lake": "66425",
+    "sneads": "66725",
+    "solana": "66875",
+    "sopchoppy": "66925",
+    "sorrento": "66975",
+    "south apopka": "67163",
+    "south bay": "67175",
+    "south beach": "67192",
+    "south bradenton": "67258",
+    "south brooksville": "67266",
+    "south daytona": "67325",
+    "south gate ridge": "67450",
+    "south highpoint": "67462",
+    "south miami": "67550",
+    "south miami heights": "67575",
+    "south palm beach": "67650",
+    "south pasadena": "67675",
+    "south patrick shores": "67725",
+    "south sarasota": "67887",
+    "south venice": "68100",
+    "southchase": "67270",
+    "southeast arcadia": "67355",
+    "southgate": "67425",
+    "southport": "67800",
+    "southwest ranches": "68135",
+    "spring hill": "68350",
+    "spring lake": "68375",
+    "spring ridge": "68435",
+    "springfield": "68275",
+    "springhill": "68365",
+    "stacey street": "68487",
+    "starke": "68525",
+    "steinhatchee": "68625",
+    "stock island": "68800",
+    "stuart": "68875",
+    "sugarmill woods": "68950",
+    "sumatra": "69025",
+    "sun city center": "69250",
+    "suncoast estates": "69275",
+    "sunny isles beach": "69555",
+    "sunrise": "69700",
+    "sunset": "69812",
+    "surfside": "70075",
+    "sweetwater": "70345",
+    "taft": "70525",
+    "tallahassee": "70600",
+    "tamarac": "70675",
+    "tamiami": "70700",
+    "tampa": "71000",
+    "tangelo park": "71075",
+    "tangerine": "71100",
+    "tarpon springs": "71150",
+    "tavares": "71225",
+    "tavernier": "71250",
+    "taylor creek": "71300",
+    "temple terrace": "71400",
+    "tequesta": "71525",
+    "the acreage": "71564",
+    "the crossings": "71567",
+    "the hammocks": "71569",
+    "the meadows": "71580",
+    "the villages": "71625",
+    "thonotosassa": "71725",
+    "three lakes": "71741",
+    "three oaks": "71758",
+    "tice": "71800",
+    "tierra verde": "71825",
+    "tiger point": "71842",
+    "tildenville": "71850",
+    "timber pines": "71867",
+    "titusville": "71900",
+    "town 'n' country": "72145",
+    "treasure island": "72325",
+    "trenton": "72350",
+    "trilby": "72425",
+    "trinity": "72442",
+    "tropical park": "72521",
+    "tyndall afb": "72875",
+    "umatilla": "73025",
+    "union park": "73075",
+    "university": "73163",
+    "upper grand lagoon": "73312",
+    "valparaiso": "73675",
+    "valrico": "73700",
+    "vamo": "73725",
+    "venice": "73900",
+    "venice gardens": "73950",
+    "verandah": "74016",
+    "vernon": "74125",
+    "vero beach": "74150",
+    "vero beach south": "74200",
+    "vero lake estates": "74225",
+    "verona walk": "74235",
+    "viera east": "74368",
+    "viera west": "74370",
+    "vilano beach": "74400",
+    "villas": "74512",
+    "vineyards": "74562",
+    "virginia gardens": "74575",
+    "wabasso": "74625",
+    "wabasso beach": "74635",
+    "wacissa": "74700",
+    "wahneta": "74775",
+    "waldo": "74925",
+    "wallace": "74975",
+    "warm mineral springs": "75175",
+    "warrington": "75200",
+    "washington park": "75225",
+    "watergate": "75275",
+    "watertown": "75300",
+    "wauchula": "75375",
+    "waukeenah": "75425",
+    "wausau": "75450",
+    "waverly": "75475",
+    "webster": "75600",
+    "wedgefield": "75612",
+    "weeki wachee gardens": "75641",
+    "wekiwa springs": "75725",
+    "welaka": "75750",
+    "wellington": "75812",
+    "wesley chapel": "75875",
+    "west bradenton": "76050",
+    "west canaveral groves": "76058",
+    "west deland": "76087",
+    "west lealman": "76481",
+    "west little river": "76487",
+    "west melbourne": "76500",
+    "west miami": "76525",
+    "west palm beach": "76600",
+    "west park": "76658",
+    "west pensacola": "76675",
+    "west perrine": "76700",
+    "west samoset": "76740",
+    "west vero corridor": "76937",
+    "westchase": "76062",
+    "westchester": "76075",
+    "westgate": "76290",
+    "westlake": "76417",
+    "weston": "76582",
+    "westview": "76950",
+    "westville": "76975",
+    "westwood lakes": "77075",
+    "wewahitchka": "77100",
+    "whiskey creek": "77137",
+    "white": "77275",
+    "white springs": "77400",
+    "whitfield": "77467",
+    "wildwood": "77675",
+    "williamsburg": "77735",
+    "williston": "77825",
+    "williston highlands": "77837",
+    "willow oak": "77862",
+    "wilton manors": "78000",
+    "wimauma": "78025",
+    "windermere": "78050",
+    "winding cypress": "78063",
+    "windsor": "78110",
+    "winter beach": "78225",
+    "winter garden": "78250",
+    "winter haven": "78275",
+    "winter park": "78300",
+    "winter springs": "78325",
+    "wiscon": "78340",
+    "woodlawn beach": "78500",
+    "woodville": "78700",
+    "world golf": "78740",
+    "worthington springs": "78775",
+    "wright": "78800",
+    "yalaha": "78900",
+    "yankeetown": "78925",
+    "yeehaw junction": "78975",
+    "yulee": "79175",
+    "zellwood": "79200",
+    "zephyrhills": "79225",
+    "zephyrhills north": "79231",
+    "zephyrhills south": "79237",
+    "zephyrhills west": "79243",
+    "zolfo springs": "79250"
+}
+
+def _fl_place_fips(city):
+    if not city: return None
+    return _FL_PLACES.get(_place_key(city))
+
 def _resolve_place(city, state_abbr, address):
-    """(state_fips, place_fips) for the property's city: Census Geocoder first,
-    then a state place-list name match as fallback."""
+    """(state_fips, place_fips) for the property's city. Order: (1) the bundled
+    Florida Gazetteer table — offline and deterministic; (2) the keyless Census
+    Geocoder; (3) a state place-list name match (needs the optional Census key
+    from most networks)."""
+    if (state_abbr or "").upper() == "FL":
+        pf = _fl_place_fips(city)
+        if pf: return STATE_FIPS["FL"], pf
     geo = census_geographies(address)
     if geo and geo.get("place_fips"):
         return geo.get("state_fips"), geo.get("place_fips")
@@ -1483,6 +2464,7 @@ def census_demographics(zip_code, city=None, state=None, address=None):
            "date": datetime.date.today().isoformat()}
     zip_geo = f"86000US{zip_code}"
     blk, src = _geo_block_any(zip_geo, f"ZCTA5 {zip_code}", f"zip code tabulation area:{zip_code}")
+    if blk: blk["geoid"] = zip_geo; blk["scope_label"] = f"ZIP {zip_code} (ZCTA)"
     out["zip"] = blk
     if src: out["source"] = src
     if blk:
@@ -1508,6 +2490,7 @@ def census_demographics(zip_code, city=None, state=None, address=None):
     sfips, pfips = _resolve_place(city, state, address)
     if pfips:
         cblk, csrc = _geo_block_any(f"16000US{sfips}{pfips}", city, f"place:{pfips}&in=state:{sfips}")
+        if cblk: cblk["geoid"] = f"16000US{sfips}{pfips}"; cblk["scope_label"] = f"{city} (Census place)"
         out["city"] = cblk
         if not out["source"] and csrc: out["source"] = csrc
     if not out["source"]:
@@ -1690,7 +2673,34 @@ def _plain_error(kind, e):
         return f"Couldn't reach the data source — check the internet connection and try again. ({s[:140]})"
     return f"{kind.replace('_', ' ').title()} failed: {s[:200]}"
 
+JOB_TIMEOUT_S = 600
+
+def reap_stale_jobs():
+    """v2.0 reaper: ANY job still 'running' past the timeout is dead (its worker
+    thread is gone) — move it to a terminal state with a human message, not just
+    the single latest job per property. Called on job reads so pollers and
+    banners never wait forever."""
+    try:
+        db().execute("""UPDATE jobs SET status='error', finished_at=datetime('now'),
+                        message='This took too long (over 10 minutes) and was stopped — the data source may be slow or unreachable. Please try again.'
+                        WHERE status='running' AND started_at < datetime('now', ?)""",
+                     (f"-{JOB_TIMEOUT_S} seconds",))
+        db().commit()
+    except Exception:
+        pass
+
+def _humanize_job_message(msg):
+    """Plain-English banner text: never render raw exception/sqlite text."""
+    m = (msg or "").strip()
+    low = m.lower()
+    if "closed database" in low or "database is locked" in low or "disk i/o" in low:
+        return "A storage hiccup interrupted that job — please run it again."
+    if low.startswith("error:"):
+        m = m[len("error:"):].strip()
+    return m
+
 def latest_job(pid, kind=None):
+    reap_stale_jobs()
     q = "SELECT * FROM jobs WHERE property_id=?"; args = [pid]
     if kind: q += " AND kind=?"; args.append(kind)
     row = db().execute(q + " ORDER BY id DESC LIMIT 1", args).fetchone()
@@ -1739,10 +2749,13 @@ def job_demographics(pid):
             demo = census_demographics(p["zip"], p["city"], p["state"], p["address"])
         except Exception:
             demo = None
-        if not demo or (not demo.get("zip") and not demo.get("city")):
+        if not demo or not demo.get("zip"):
             # v1.6 honest-failure: keep cached demo_json/demo_date untouched; record
             # the error so the tab shows a scoped, dismissible notice instead of a
             # fresh 'pulled' stamp over empty data.
+            # v2.0: the ZIP block is the property's OWN geography and is required
+            # for success — a city-only result (bad ZIP, resolvable city) must not
+            # pose as a successful pull or overwrite the cache.
             msg = ("Census data didn't come back — Census Reporter (and the Census Geocoder for the "
                    "city scope) may be unreachable right now. Cached data, if any, is unchanged.")
             db().execute("UPDATE properties SET demo_error=? WHERE id=?", (msg, pid)); db().commit()
@@ -1932,10 +2945,13 @@ def property_page(pid):
     amenities_error = p["amenities_error"] if "amenities_error" in p.keys() else None
     dscope = request.args.get("dscope", "zip")
     if dscope not in ("zip", "city"): dscope = "zip"
-    dgeo = None; trend_svg = None
+    dgeo = None; trend_svg = None; demo_scope_fallback = False
     if demo:
         dgeo = demo.get("zip") if dscope == "zip" else demo.get("city")
-        if dgeo is None and dscope == "city": dscope, dgeo = "zip", demo.get("zip")
+        if dgeo is None and dscope == "city":
+            # v2.0: never silently show ZIP numbers under a city label — fall
+            # back AND say so on the page.
+            dscope, dgeo = "zip", demo.get("zip"); demo_scope_fallback = True
         if dgeo is None and dscope == "zip": dscope, dgeo = "city", demo.get("city")
         pts = (dgeo or {}).get("pop_trend") or []
         if len(pts) >= 2:
@@ -2014,16 +3030,31 @@ def property_page(pid):
     # error must not follow the user across every tab), timestamps are human, and
     # finished/error banners can be dismissed.
     JOB_TAB = {"comps": "comps", "demographics": "demographics", "amenities": "demographics"}
-    raw_job = latest_job(pid)
     banner_job = None
-    if raw_job and not (raw_job["dismissed"] if "dismissed" in raw_job.keys() else 0) \
-            and JOB_TAB.get(raw_job["kind"]) == tab:
+    for _try in range(5):
+        raw_job = latest_job(pid)
+        if not raw_job: break
+        if (raw_job["dismissed"] if "dismissed" in raw_job.keys() else 0): break
+        if JOB_TAB.get(raw_job["kind"]) != tab: break
+        # v2.0: finished banners auto-expire after 24h (dismissed in place)
+        # instead of lingering forever; messages are humanized before render
+        # so raw exception text never reaches the page.
+        if raw_job["status"] in ("done", "error") and raw_job["finished_at"]:
+            try:
+                fin = datetime.datetime.fromisoformat(str(raw_job["finished_at"]))
+                if (datetime.datetime.now() - fin).total_seconds() > 24 * 3600:
+                    d.execute("UPDATE jobs SET dismissed=1 WHERE id=?", (raw_job["id"],)); d.commit()
+                    continue
+            except Exception:
+                pass
         banner_job = dict(raw_job)
+        banner_job["message"] = _humanize_job_message(banner_job.get("message"))
         ts = raw_job["finished_at"] or raw_job["started_at"] or ""
         try:
             banner_job["when"] = datetime.datetime.fromisoformat(str(ts)).strftime("%b %d, %I:%M %p")
         except Exception:
             banner_job["when"] = ts
+        break
     amort = None
     amenities = None
     if tab == "demographics" and p["amenities_json"]:
@@ -2048,6 +3079,20 @@ def property_page(pid):
     sold_view = [c for c in (sold + actives) if in_radius(c) and (not c["event_date"] or c["event_date"] >= cutoff)]
     rents_view = [c for c in rents if in_radius(c)]
     sold_stats = pinned_sold_stats(sold_view)
+    # v2.0: whole-filtered-set averages (the sold set the user is looking at —
+    # window + radius applied) beside the pinned/top-3 line.
+    _set_sold = [c for c in sold_view if c["kind"] == "sold"]
+    _set_prices = [c["price"] for c in _set_sold if c["price"]]
+    _set_ppsf = [(c["price"] / c["sqft"]) for c in _set_sold if c["price"] and c["sqft"]]
+    _set_doms = [c["dom"] for c in _set_sold if c["dom"] is not None]
+    set_stats = {"n": len(_set_sold),
+                 "avg": round(sum(_set_prices) / len(_set_prices)) if _set_prices else None,
+                 "ppsf": round(sum(_set_ppsf) / len(_set_ppsf)) if _set_ppsf else None,
+                 "dom": round(sum(_set_doms) / len(_set_doms)) if _set_doms else None}
+    # v2.0 count reconciliation: the header count is ALL stored sold comps;
+    # the Sold view applies the date window — the difference is dated sales
+    # older than the window. Both bases are labeled on the page.
+    sold_older_n = len([c for c in sold if c["event_date"] and c["event_date"] < cutoff])
     ltr = ltr_stats(rents_view)
     coli = coliving_stats(rents_view)
     med_rent = ltr["median_rent"] if ltr else None
@@ -2103,10 +3148,12 @@ def property_page(pid):
     return render_template("property.html", p=p, comps=comps, sold=sold, rents=rents, liens=liens, docs=docs,
                            assigns=assigns, contractors=contractors, scenarios=scenarios, plans=plans,
                            v=v, market=market, demo=demo, demo_error=demo_error, amenities_error=amenities_error,
-                           dscope=dscope, dgeo=dgeo, trend_svg=trend_svg, tab=tab, amort=amort, amenities=amenities,
+                           dscope=dscope, dgeo=dgeo, demo_scope_fallback=demo_scope_fallback,
+                           trend_svg=trend_svg, tab=tab, amort=amort, amenities=amenities,
                            photos=photos, job=banner_job, steps=steps,
                            cview=cview, window=window, rmax=rmax, sold_view=sold_view, rents_view=rents_view,
-                           sold_stats=sold_stats, ltr=ltr, coli=coli, med_rent=med_rent, afford_view=afford_view,
+                           sold_stats=sold_stats, set_stats=set_stats, sold_older_n=sold_older_n,
+                           ltr=ltr, coli=coli, med_rent=med_rent, afford_view=afford_view,
                            breakdowns=breakdowns, room_est=room_est,
                            strategies=strategies, uw_fresh=uw_fresh, uw_saved=uw_saved, uw_current=uw_current,
                            uw_draft_meta=uw_draft_meta,
@@ -2205,14 +3252,23 @@ def _norm_addr(s):
     toks = [_ADDR_SUFFIX.get(t, t) for t in s.split() if t not in ("fl", "florida")]
     return " ".join(toks)
 
-def lookup_comp_by_address(prop, address, kind_choice):
-    """Add Comp (ReiSearch parity): resolve a typed address through HomeHarvest with a
-    ZIP-mode query + normalized-address match — NEVER raw full-address mode (mis-resolves).
-    Returns the matched HomeHarvest row (dict-like) or None."""
+_DIR_TOKENS = {"n", "s", "e", "w", "ne", "nw", "se", "sw",
+               "north", "south", "east", "west"}
+
+def _street_name_token(toks):
+    """First real street-name token of a normalized address: skip the house
+    number, directionals and suffixes. v2.0 root cause: the old fallback
+    compared raw token #2, which for '1220 E Comanche Ave' is the directional
+    'e' — so it matched '1220 E North St', a different house. A directional
+    can never BE the street name; fail closed (None) when no name token."""
+    for t in toks[1:]:
+        if t in _DIR_TOKENS or t in _ADDR_SUFFIX.values():
+            continue
+        return t
+    return None
+
+def _lookup_in_frame(address, z, kind_choice):
     from homeharvest import scrape_property
-    m = re.search(r"\b(\d{5})\b", address or "")
-    z = m.group(1) if m else (prop["zip"] or "")
-    if not z: return None
     lt = "sold" if kind_choice == "sold" else "for_sale"
     kw = {"location": z, "listing_type": lt}
     if lt == "sold": kw["past_days"] = 365
@@ -2224,7 +3280,7 @@ def lookup_comp_by_address(prop, address, kind_choice):
     target = _norm_addr(address)
     ttoks = target.split(" ")
     tnum = ttoks[0] if ttoks else ""
-    tname = ttoks[1] if len(ttoks) > 1 else ""
+    tname = _street_name_token(ttoks)
     best = None
     for _, r in df.iterrows():
         st = _norm_addr(_s(r.get("street")) + " " + (_s(r.get("city")) or ""))
@@ -2232,10 +3288,32 @@ def lookup_comp_by_address(prop, address, kind_choice):
         if st == target or target in st or st in target:
             return r
         stoks = st.split(" ")
-        if (tnum and tname and len(stoks) > 1 and stoks[0] == tnum and stoks[1] == tname
+        sname = _street_name_token(stoks)
+        if (tnum and tname and sname and stoks[0] == tnum and sname == tname
                 and best is None):
             best = r  # same house number AND street name, suffix/city form differs
     return best
+
+def lookup_comp_by_address(prop, address, kind_choice):
+    """Add Comp (ReiSearch parity): resolve a typed address through HomeHarvest with a
+    ZIP-mode query + normalized-address match — NEVER raw full-address mode (mis-resolves).
+    Returns the matched HomeHarvest row (dict-like) or None."""
+    m = re.search(r"\b(\d{5})\b", address or "")
+    z = m.group(1) if m else (prop["zip"] or "")
+    if not z: return None
+    hit = _lookup_in_frame(address, z, kind_choice)
+    if hit is not None: return hit
+    # The ZIP frame missed (no ZIP typed, or the typed ZIP isn't the ZIP the
+    # house actually sits in): geocode the typed address and retry once with
+    # the ZIP the geocoder reports for it.
+    try:
+        g = geocode_arcgis(address)
+        gz = (g or {}).get("zip")
+        if gz and gz != z:
+            return _lookup_in_frame(address, gz, kind_choice)
+    except Exception:
+        pass
+    return None
 
 def _insert_comp(prop, vals):
     d = db()
@@ -2314,6 +3392,7 @@ def add_comp_manual(pid):
 
 @app.route("/job/<int:jid>")
 def job_status(jid):
+    reap_stale_jobs()
     row = db().execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
     if not row: return jsonify({"status": "missing"}), 404
     return jsonify({"id": row["id"], "kind": row["kind"], "status": row["status"],
@@ -2435,6 +3514,16 @@ def del_scenario(sid):
     db().execute("DELETE FROM scenarios WHERE id=?", (sid,)); db().commit()
     return redirect(url_for("property_page", pid=row["property_id"], tab="underwriting"))
 
+@app.route("/amortization")
+def amortization_standalone():
+    """v2.0: the amortization tool lives inside Underwriting now — keep the
+    old standalone URL working as a redirect to the most recent property's
+    underwriting tab (dashboard when there are no properties)."""
+    row = db().execute("SELECT id FROM properties ORDER BY id DESC LIMIT 1").fetchone()
+    if row:
+        return redirect(url_for("property_page", pid=row["id"], tab="underwriting"))
+    return redirect(url_for("dashboard"))
+
 @app.route("/property/<int:pid>/amortize", methods=["POST"])
 def amortize(pid):
     p = get_prop(pid)
@@ -2533,6 +3622,26 @@ def add_note(pid):
         db().execute("INSERT INTO property_notes(property_id,author,text) VALUES(?,?,?)",
                      (pid, (request.form.get("author") or "You").strip() or "You", text))
         db().commit()
+    return redirect(url_for("property_page", pid=pid, tab="overview"))
+
+@app.route("/property/<int:pid>/notes/<int:nid>/edit", methods=["POST"])
+def edit_note(pid, nid):
+    """v2.0: notes feed edit — same PRG discipline as add (POST -> redirect),
+    so a reload can never resubmit a stale edit over newer data."""
+    get_prop(pid)
+    text = (request.form.get("text") or "").strip()
+    if text:
+        db().execute("UPDATE property_notes SET text=? WHERE id=? AND property_id=?",
+                     (text, nid, pid))
+        db().commit()
+    return redirect(url_for("property_page", pid=pid, tab="overview"))
+
+@app.route("/property/<int:pid>/notes/<int:nid>/delete", methods=["POST"])
+def delete_note(pid, nid):
+    """v2.0: notes feed delete (POST -> redirect, PRG like add/edit)."""
+    get_prop(pid)
+    db().execute("DELETE FROM property_notes WHERE id=? AND property_id=?", (nid, pid))
+    db().commit()
     return redirect(url_for("property_page", pid=pid, tab="overview"))
 
 @app.route("/property/<int:pid>/trades/add", methods=["POST"])

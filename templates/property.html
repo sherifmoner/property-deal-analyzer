@@ -74,7 +74,7 @@ if(o&&m){o.addEventListener('click',function(){m.classList.add('open')});}
 if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})();
 </script>
 {% else %}
-<div class="gallery"><div class="nophoto">📷 No photos found for this property — when you pull comps, the app automatically looks for this property's own listing photos. If it isn't currently/recently listed, none may exist.</div></div>
+<div class="gallery"><div class="nophoto" data-photos-empty>📷 No photos found for this property in free listing sources (HomeHarvest — Realtor.com/Zillow/Redfin). When you pull comps, the app automatically looks for this property's own listing photos, including a 10-year sold-history lookup. If the property isn't currently/recently listed and has no listing row in those sources, no photos exist to show — nothing is substituted or faked.</div></div>
 {% endif %}
 <h1 style="margin-top:10px">{{ p.address }}</h1>
 <p class="muted"><span class="badge {% if p.deal_method=='Cash' %}cash{% elif p.deal_method=='Subject To' %}subto{% endif %}">{{ p.deal_method }}</span>
@@ -122,7 +122,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <p style="margin:6px 0 0"><button type="button" class="btn sm" data-note-add>＋ Add note</button>
 <span class="small muted">Notes are timestamped and kept per property.</span></p></div>
 <div data-notes-feed>
-{% for n in prop_notes %}<div class="noteitem" data-note><div class="notehead"><b>{{ n.author or 'You' }}</b><span class="small muted">{{ n.when }}</span></div><p>{{ n.text }}</p></div>
+{% for n in prop_notes %}<div class="noteitem" data-note data-note-item="{{ n.id }}"><div class="notehead"><b>{{ n.author or 'You' }}</b><span class="small muted">{{ n.when }}</span> <button type="button" class="btn sm sec" data-note-edit-btn>Edit</button> <button type="button" class="btn sm sec" data-note-del-btn>Delete</button></div><p data-note-view>{{ n.text }}</p><div data-note-editbox hidden><textarea data-note-edit-text rows="3">{{ n.text }}</textarea><p style="margin:6px 0 0"><button type="button" class="btn sm" data-note-edit-save>Save edit</button> <button type="button" class="btn sm sec" data-note-edit-cancel>Cancel</button></p></div></div>
 {% else %}<p class="muted small" data-notes-empty>No notes yet — add the first one above.</p>{% endfor %}
 </div></div></div>
 <div data-ovcol="details"><div class="card"><h2>Property Details</h2>
@@ -298,6 +298,33 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
         .catch(function(){ addBtn.disabled = false; });
     });
   }
+  /* v2.0: note edit/delete — same fetch + full-reload discipline as add
+     (the server answers POST with a redirect: PRG, so a browser reload can
+     never resubmit a stale edit over newer data). */
+  document.querySelectorAll('[data-note-item]').forEach(function(item){
+    var nid = item.getAttribute('data-note-item');
+    var view = item.querySelector('[data-note-view]'), box = item.querySelector('[data-note-editbox]');
+    var eb = item.querySelector('[data-note-edit-btn]'), del = item.querySelector('[data-note-del-btn]');
+    var sv = item.querySelector('[data-note-edit-save]'), cx = item.querySelector('[data-note-edit-cancel]');
+    var ta = item.querySelector('[data-note-edit-text]');
+    if (eb) eb.addEventListener('click', function(){ box.hidden = false; if (view) view.style.display = 'none'; if (ta) ta.focus(); });
+    if (cx) cx.addEventListener('click', function(){ box.hidden = true; if (view) view.style.display = ''; });
+    if (sv) sv.addEventListener('click', function(){
+      var v = ta.value.trim(); if (!v) return;
+      sv.disabled = true;
+      var fd = new FormData(); fd.append('text', v);
+      fetch('/property/{{ p.id }}/notes/' + nid + '/edit', {method: 'POST', body: fd})
+        .then(function(){ location.reload(); })
+        .catch(function(){ sv.disabled = false; });
+    });
+    if (del) del.addEventListener('click', function(){
+      if (!confirm('Delete this note?')) return;
+      del.disabled = true;
+      fetch('/property/{{ p.id }}/notes/' + nid + '/delete', {method: 'POST', body: new FormData()})
+        .then(function(){ location.reload(); })
+        .catch(function(){ del.disabled = false; });
+    });
+  });
 })();
 </script>
 {% endif %}
@@ -310,6 +337,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>Sold within</label><select name="window_days">{% for dval,lab in [(30,'Last 30 days'),(90,'Last 90 days'),(180,'Last 6 months'),(365,'Last year')] %}<option value="{{ dval }}" {% if dval==365 %}selected{% endif %}>{{ lab }}</option>{% endfor %}</select></div>
 <div style="flex:0"><button class="btn big">🔍 Pull Comps</button></div></div></form>
 <p class="small muted">Pulls sold comps + rental comps + this property's own listing photos in the background (about a minute). The banner at the top of this page shows progress and the final counts — nothing happens silently. Match score weights: distance {{ comp_weights.distance|round|int }}% · sqft {{ comp_weights.sqft|round|int }}% · beds {{ comp_weights.beds|round|int }}% · baths {{ comp_weights.baths|round|int }}% · year built {{ comp_weights.year|round|int }}% · lot size {{ comp_weights.lot|round|int }}% — adjust them in the Weights box below. On file now: <b>{{ sold|length }} sold</b>, <b>{{ rents|length }} rentals</b>.</p>
+<p class="small muted" data-comp-counts>Count check: <b>{{ sold|length }} sold</b> comps are stored for this property in total. The Sold view below applies the “Show sold from” window (last {{ window }} days){% if rmax %} and the {{ rmax }} mi radius{% endif %}, so it currently shows <b>{{ set_stats.n }} sold</b>{% if sold_older_n %} — {{ sold_older_n }} stored sale{{ 's' if sold_older_n != 1 }} older than the {{ window }}-day window fall outside the view{% endif %}. The stored total and the in-view count use different bases by design; both are labeled so the numbers always reconcile.</p>
 <details class="weightsbox"><summary>⚖ Comp match weights — Distance {{ comp_weights.distance|round|int }} · Sqft {{ comp_weights.sqft|round|int }} · Beds {{ comp_weights.beds|round|int }} · Baths {{ comp_weights.baths|round|int }} · Year {{ comp_weights.year|round|int }} · Lot {{ comp_weights.lot|round|int }}</summary>
 <form method="post" action="{{ url_for('comp_weights_save', pid=p.id) }}"><div class="rowflex">
 <div><label>Distance %</label><input type="number" step="any" min="0" name="w_distance" value="{{ comp_weights.distance }}"></div>
@@ -397,6 +425,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><div class="lab">Avg days on market</div><div class="val" data-stat="sold_dom">{{ sold_stats.avg_dom if sold_stats.avg_dom is not none else '—' }}</div><div class="lab">&nbsp;</div></div>
 <div><div class="lab">Reconciled ARV (from these comps)</div><div class="val" data-stat="arv">{{ v.rec.arv|money }}</div><div class="lab">MAO <span data-stat="mao">{{ v.mao|money }}</span></div></div>
 </div>
+{% if set_stats %}<p class="small" data-setstat-line style="margin:2px 0 8px">Whole set: all <b data-setstat="n">{{ set_stats.n }}</b> sold comps in this view — avg sale <b data-setstat="avg">{{ set_stats.avg|money if set_stats.avg else '—' }}</b>{% if set_stats.ppsf %} · avg <b data-setstat="ppsf">${{ set_stats.ppsf }}</b>/sqft{% endif %}{% if set_stats.dom is not none %} · avg <b data-setstat="dom">{{ set_stats.dom }}</b> days on market{% endif %} <span class="muted">(the averages above are your pinned/top-3 set; this line is the whole filtered set)</span></p>{% endif %}
 <p class="small muted" data-stat="arv_note" style="margin-top:-6px">{{ v.rec.note }}</p>{% endif %}
 {% if sold_view %}<div class="compcards" data-comp-grid>{{ subjcard('sold') }}{% for c in sold_view %}{{ compcard(c, 'sold') }}{% endfor %}</div>
 <div class="pager" data-comp-pager><button type="button" class="btn sm sec" data-page-prev>‹ Previous</button> <span data-page-nums></span> <button type="button" class="btn sm sec" data-page-next>Next ›</button> <span class="small muted" data-comp-showing></span></div>
@@ -586,7 +615,21 @@ function captureOrigStats(){
       pEl = document.querySelector('[data-stat="sold_ppsf"]'), dEl = document.querySelector('[data-stat="sold_dom"]');
   if (bEl && aEl) ORIG_STATS = {basis: bEl.textContent, avg: aEl.textContent, ppsf: pEl ? pEl.textContent : '—', dom: dEl ? dEl.textContent : '—'};
 }
+function setSetStat(name, txt){ document.querySelectorAll('[data-setstat="' + name + '"]').forEach(function(e){ e.textContent = txt; }); }
+function refreshSetStats(){
+  /* v2.0: the whole-set line follows the same filtered set as the cards
+     (search + comp filters), sold kind only — mirrors the server render. */
+  if (!document.querySelector('[data-setstat="n"]')) return;
+  var vis = filteredSoldCards().filter(function(cd){ return (cd.getAttribute('data-kind') || 'sold') === 'sold'; });
+  function avg(attr){ var xs = vis.map(function(cd){ return parseFloat(cd.getAttribute(attr)); }).filter(function(x){ return !isNaN(x); }); return xs.length ? xs.reduce(function(a, b){ return a + b; }, 0) / xs.length : null; }
+  var ap = avg('data-price'), af = avg('data-ppsf'), ad = avg('data-dom');
+  setSetStat('n', String(vis.length));
+  setSetStat('avg', ap === null ? '—' : money(ap));
+  setSetStat('ppsf', af === null ? '—' : ('$' + Math.round(af)));
+  setSetStat('dom', ad === null ? '—' : String(Math.round(ad)));
+}
 function refreshCompStats(){
+  refreshSetStats();
   if (!compQuery() && !COMP_FILTERS.active){
     if (ORIG_STATS){ setStat('sold_basis', ORIG_STATS.basis); setStat('sold_avg', ORIG_STATS.avg); setStat('sold_ppsf', ORIG_STATS.ppsf); setStat('sold_dom', ORIG_STATS.dom); }
     return;
@@ -766,6 +809,8 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 <form method="post" action="{{ url_for('pull_demographics', pid=p.id) }}"><button class="btn big blue">📊 Load demographics</button></form>
 <p class="small muted">Runs in the background — the result appears on this tab. If the pull fails, you'll see the reason here on this tab, not a silent blank.</p>{% endif %}
 {% else %}<p class="small muted">Source: {{ demo.source }} · pulled {{ p.demo_date or demo.date }}</p>
+{% if demo_scope_fallback %}<div class="notice"><b>City scope not available for {{ p.city }}.</b> No Census place data could be resolved for this city, so this tab is showing <b>ZIP {{ p.zip }}</b> figures — labeled as ZIP scope, never passed off as city data.</div>{% endif %}
+{% if dgeo %}<p class="small muted">Scope shown: <b>{{ dgeo.scope_label or (('ZIP ' ~ p.zip) if dscope=='zip' else (p.city ~ ' (city)')) }}</b>{% if dgeo.geoid %} · Census geography <b>{{ dgeo.geoid }}</b>{% endif %} · {{ demo.source }}</p>{% endif %}
 <div class="scopetabs">
 <a class="btn sm {{ 'blue' if dscope=='zip' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='zip') }}">ZIP {{ p.zip }}</a>
 {% if demo.city %}<a class="btn sm {{ 'blue' if dscope=='city' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='city') }}">{{ p.city }} (city)</a>{% endif %}
@@ -807,10 +852,9 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 <p class="small muted">Male (left, blue) · Female (right, pink) — residents per age band (ACS B01001; the 80+ band totals the source's 80–84 and 85+ cells)</p></div>{% endif %}
 <h3>All figures</h3>
 <table><tr><th></th><th>ZIP {{ p.zip }}</th><th>{{ p.city }} (city)</th></tr>
-{% for lab, k in [('Population','population'),('Median home value','median_home_value'),('Median rent','median_rent'),('Median household income','median_income'),('Owner-occupied %','owner_pct'),('Renter-occupied %','renter_pct'),('Unemployment %','unemployment_pct')] %}
+{% for lab, k, kind in [('Population','population','int'),('Median home value','median_home_value','money'),('Median rent','median_rent','money'),('Median household income','median_income','money'),('Owner-occupied %','owner_pct','pct'),('Renter-occupied %','renter_pct','pct'),('Unemployment %','unemployment_pct','pct')] %}
 <tr><td><b>{{ lab }}</b></td>
-<td>{% if demo.zip and demo.zip[k] is not none %}{% if 'value' in k or 'rent' in k or 'income' in k %}{{ demo.zip[k]|money }}{% else %}{{ demo.zip[k]|num(1) }}{% endif %}{% else %}Not found{% endif %}</td>
-<td>{% if demo.city and demo.city[k] is not none %}{% if 'value' in k or 'rent' in k or 'income' in k %}{{ demo.city[k]|money }}{% else %}{{ demo.city[k]|num(1) }}{% endif %}{% else %}Not found{% endif %}</td></tr>{% endfor %}
+{% for blk in [demo.zip, demo.city] %}<td>{% if blk and blk[k] is not none %}{% if kind=='money' %}{{ blk[k]|money }}{% elif kind=='pct' %}{{ blk[k] }}%{% else %}{{ '{:,}'.format(blk[k]|int) }}{% endif %}{% else %}Not found{% endif %}</td>{% endfor %}</tr>{% endfor %}
 </table>
 {% endif %}
 <form method="post" action="{{ url_for('pull_demographics', pid=p.id) }}"><button class="btn sec">↻ Refresh demographics</button></form>{% endif %}
@@ -961,7 +1005,7 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% for z in market.nearby %}<tr{% if z.you %} style="background:#eff6ff"{% endif %}><td><b>{{ z.zip }}</b>{% if z.you %} <span class="badge cash">YOU</span>{% endif %}</td><td>{{ z.median_price|money }}</td><td>{{ z.median_dom|num }}</td><td>{{ z.n }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No ZIP data in the filtered set.</td></tr>{% endfor %}</table>
 {% else %}<p class="muted">Not found — pull comps first (Comparables tab); market stats are computed from them.</p>{% endif %}
 <h3>Rent benchmark</h3>
-{% if rents %}{% set rs = rents|map(attribute='price')|list %}<p>Median asking rent nearby: <b>{{ (rs|sort)[rs|length//2]|money }}/mo</b> from {{ rents|length }} rental comps (HomeHarvest, pulled with comps). Long Term comp average (pinned/top-3): <b>{{ ltr.avg_rent|money }}/mo</b>. HUD SAFMR ZIP benchmark: add via county/HUD download — Not found in-app yet.</p>
+{% if rents %}{% set rs = rents|map(attribute='price')|list %}<p>Median asking rent nearby: <b>{{ (rs|sort)[rs|length//2]|money }}/mo</b> from {{ rents|length }} rental comps (HomeHarvest, pulled with comps). Long Term comp average (pinned/top-3): <b>{{ ltr.avg_rent|money }}/mo</b>. HUD Small Area FMR (SAFMR) benchmark for this ZIP: <b>not loaded</b> — the app does not fetch HUD's SAFMR file, so no HUD figure is shown rather than an invented one. The Affordable Housing view uses the labeled below-median-rent proxy described there instead.</p>
 {% else %}<p class="muted">Not found — pull comps to get rental data.</p>{% endif %}</div>
 {% endif %}
 

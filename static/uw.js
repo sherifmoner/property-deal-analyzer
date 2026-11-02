@@ -846,6 +846,23 @@
           : '<div class="srow"><span>' + x[1] + "</span><b>" + x[2] + "</b></div>";
       }).join("") + ((r.flags && r.flags.length) ? '<p class="small muted">Flags: ' + r.flags.join("; ") + "</p>" : "");
     }
+    /* v2.0: the Insights rail pane shows the SAME computed insight the Details
+       pane carries (strongest/weak spot from the score parts) plus the parts
+       and penalties themselves — it was a static "Coming Soon" stub while the
+       numbers already existed. */
+    var ins = panel.querySelector("[data-insights]");
+    if (ins) {
+      var ih = '<h4 class="det-h">Deal Score — ' + r.score + " (" + (r.label || "") + ")</h4>";
+      if (r.insight) ih += '<p style="margin:4px 0 8px">' + r.insight + "</p>";
+      Object.keys(r.score_parts || {}).forEach(function (k) {
+        ih += '<div class="srow"><span>' + k + "</span><b>" + r.score_parts[k] + "</b></div>";
+      });
+      (r.penalties || []).forEach(function (p) {
+        ih += '<div class="srow"><span>Penalty −' + p.points + "</span><b>" + (p.reason || "") + "</b></div>";
+      });
+      if (r.flags && r.flags.length) ih += '<p class="small muted">Flags: ' + r.flags.join("; ") + "</p>";
+      ins.innerHTML = ih;
+    }
     var ga = panel.querySelector("[data-gapalert]");
     if (ga) {
       if (r.gap > 0) {
