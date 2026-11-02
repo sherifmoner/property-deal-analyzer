@@ -495,14 +495,17 @@ def _row_payment(f):
     Payment types mirror ReiSearch: Amortized | Interest Only | Principal Only | Fixed Payment."""
     if (f.get("type") or "") in ("Cash", "Equity"):
         return 0.0, 0.0
-    amt = fnum(f.get("amount"), 0) or 0
-    if amt <= 0: return 0.0, 0.0
     rate = fnum(f.get("rate"), 0) or 0
     tv = fnum(f.get("term_value"), 0) or 0
     months = tv if (f.get("term_unit") or "Months") == "Months" else tv * 12
     pt = f.get("payment_type") or "amortized"
+    # v1.8b: a Fixed payment IS the payment — it must not require a loan amount
+    # (Subject-To cards have a blank amount by design; blank cards start at 0).
     if pt == "fixed":
-        pay = fnum(f.get("fixed_payment"), 0) or 0
+        return (fnum(f.get("fixed_payment"), 0) or 0,
+                (fnum(f.get("taxes_mo"), 0) or 0) + (fnum(f.get("insurance_mo"), 0) or 0))
+    amt = fnum(f.get("amount"), 0) or 0
+    if amt <= 0: return 0.0, 0.0
     elif pt == "interest_only":
         pay = amt * rate / 100 / 12
     elif pt == "principal_only":
@@ -642,11 +645,26 @@ def compute_underwriting(strategy, raw_inp, prop):
             if s.get("preset") and s.get("preset") != lab: lab = f"{lab} · {s['preset']}"
             debt_lines.append({"label": lab, "payment": round(pay + esc)})
     # existing mortgage data (all strategies except Fix & Flip)
+    # v1.8a PITI wiring: the breakdown fields are LIVE components of the payment,
+    # not decoration. Base = the typed Monthly Payment, or the Principal+Interest
+    # split when no total is typed. Taxes / Insurance / PMI / Escrow are escrow
+    # add-ons counted on top (same pattern as funding-card escrow in _row_payment).
     entry_fee = md_payment = 0.0
+    md_base = md_escrow = 0.0
+    md_addons = {}
     if strategy != "Fix & Flip":
         entry_fee = fnum(inp.get("md_entry_fee"), 0) or 0
-        md_payment = fnum(inp.get("md_monthly_payment"), 0) or 0
-        paydown_y1 += (fnum(inp.get("md_piti_principal"), 0) or 0) * 12
+        _prin = fnum(inp.get("md_piti_principal"), 0) or 0
+        _int = fnum(inp.get("md_piti_interest"), 0) or 0
+        md_base = fnum(inp.get("md_monthly_payment"), 0) or 0
+        if md_base <= 0: md_base = _prin + _int
+        for k, lab in (("md_piti_taxes", "Taxes"), ("md_piti_insurance", "Insurance"),
+                       ("md_piti_pmi", "PMI"), ("md_piti_escrow", "Escrow")):
+            v = fnum(inp.get(k), 0) or 0
+            if v: md_addons[lab] = round(v)
+            md_escrow += v
+        md_payment = md_base + md_escrow
+        paydown_y1 += _prin * 12
     debt_service = debt_rows_service + md_payment
     closing = fnum(inp.get("closing_costs"), 0) or 0
     financing_costs = closing + points_fees
@@ -676,7 +694,8 @@ def compute_underwriting(strategy, raw_inp, prop):
            "debt_service_mo": round(debt_service), "entry_fee": round(entry_fee),
            "cash_contrib": round(cash_equity), "points_fees": round(points_fees),
            "closing_costs": round(closing), "debt_lines": debt_lines,
-           "md_payment_mo": round(md_payment)}
+           "md_payment_mo": round(md_payment), "md_base_mo": round(md_base),
+           "md_escrow_mo": round(md_escrow), "md_addons": md_addons}
 
     if strategy == "Fix & Flip":
         sale = fnum(inp.get("sale_price"), 0) or arv
@@ -698,6 +717,10 @@ def compute_underwriting(strategy, raw_inp, prop):
         scen = {"Downside (-10%)": _flip(sale * 0.9, rehab, holding_total),
                 "Base Case (0%)": _flip(sale, rehab, holding_total),
                 "Upside (+10%)": _flip(sale * 1.1, rehab, holding_total),
+                # v1.8a: the Fully Booked chip exists on the Flip panel too; a flip
+                # has no vacancy, so Fully Booked IS the Base Case there (it must
+                # still select/recompute, never sit cosmetic).
+                "Fully Booked (0% vacancy)": _flip(sale, rehab, holding_total),
                 "Overrun (rehab +20%, +3 mo)": _flip(sale, rehab * 1.2, holding_mo * (h_months + 3))}
         # Flip Deal Score: ReiSearch shows one for flips; scale = profit margin (50%, target 30%)
         # + ROI (50%, target 50%), labeled as our scale in Details.
@@ -828,7 +851,16 @@ def compute_underwriting(strategy, raw_inp, prop):
                "breakeven": ((opex + debt_service) / (gross + other)) if (gross + other) else 1.3,
                "downside_cf": (egi * 0.9 - opex - debt_service)}
     def _scen(mult, no_vac=False):
-        e2 = gross + other if no_vac else (gross - vac_loss) * mult + other
+        if no_vac and strategy == "Short Term":
+            # Fully Booked for STR = 100% occupancy (gross is occupancy-scaled;
+            # cleaning income inside `other` stays at the booked level — a
+            # documented, conservative simplification).
+            _occ = fnum(inp.get("occupancy_pct"), 0) or 0
+            e2 = (gross / (_occ / 100) if _occ else gross) + other
+        elif no_vac:
+            e2 = gross + other
+        else:
+            e2 = (gross - vac_loss) * mult + other
         noi_s = e2 - opex
         return {"revenue": round(e2), "expenses": round(opex), "loan": round(debt_service),
                 "net": round(e2 - opex - debt_service),
@@ -836,8 +868,9 @@ def compute_underwriting(strategy, raw_inp, prop):
                 "cap_rate_pct": round(noi_s * 12 / value * 100, 2) if value else 0,
                 "coc_pct": round((e2 - opex - debt_service) * 12 / cash_in * 100, 1) if cash_in else None}
     scen = {"Downside (-10%)": _scen(0.9), "Base Case (0%)": _scen(1.0), "Upside (+10%)": _scen(1.1)}
-    if strategy == "Co-Living":
-        scen["Fully Booked (0% vacancy)"] = _scen(1.0, no_vac=True)
+    # v1.8a: Fully Booked exists for EVERY rental strategy (it was Co-Living-only,
+    # which left the chip dead on STR/MTR/LTR panels).
+    scen["Fully Booked (0% vacancy)"] = _scen(1.0, no_vac=True)
     sc = score_rental(metrics, penalties)
     def _part_frac(item):
         k, v = item
@@ -1749,6 +1782,18 @@ def dashboard():
     counts = {r["status"]: r["c"] for r in db().execute("SELECT status, COUNT(*) c FROM properties GROUP BY status")}
     recent = db().execute("""SELECT s.*, p.address FROM scenarios s JOIN properties p ON p.id=s.property_id
                              ORDER BY s.id DESC LIMIT 6""").fetchall()
+    # v1.8a: same score reconciliation as the property page — recompute the
+    # displayed results with the current engine (stored results can be stale).
+    _rec = []
+    for _s in recent:
+        _s = dict(_s)
+        try:
+            _s["results"] = json.dumps(compute_underwriting(
+                _s["strategy"], json.loads(_s["inputs"] or "{}"), get_prop(_s["property_id"])))
+        except Exception:
+            pass
+        _rec.append(_s)
+    recent = _rec
     return render_template("dashboard.html", props=props, counts=counts, recent=recent)
 
 @app.route("/properties")
@@ -1819,6 +1864,21 @@ def property_page(pid):
                            ON c.id=a.contractor_id WHERE a.property_id=?""", (pid,)).fetchall()
     contractors = d.execute("SELECT * FROM contractors ORDER BY trade, name").fetchall()
     scenarios = d.execute("SELECT * FROM scenarios WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
+    # v1.8a score reconciliation: displayed scenario scores are recomputed with
+    # the CURRENT engine from the stored inputs, so the scenarios table can
+    # never drift from the live rail. The stored `results` are a snapshot of
+    # whatever code version saved them (shipped scenarios 1/2 predate the
+    # penalty rework and showed 80/63 for identical inputs).
+    _disp = []
+    for _s in scenarios:
+        _s = dict(_s)
+        try:
+            _s["results"] = json.dumps(compute_underwriting(
+                _s["strategy"], json.loads(_s["inputs"] or "{}"), p))
+        except Exception:
+            pass
+        _disp.append(_s)
+    scenarios = _disp
     plans = d.execute("SELECT * FROM floorplans WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
     v = verdict(p, comps, all_boxes())
     sold = [c for c in comps if c["kind"] == "sold" and not c["excluded"]]

@@ -20,10 +20,12 @@
   function rowPayment(f) {
     /* ReiSearch funding-card payment model. Returns {pay (P&I or fixed), esc (taxes+insurance)}. */
     if (!f || f.type === "Cash" || f.type === "Equity") return { pay: 0, esc: 0 };
-    var amt = N(f.amount); if (amt <= 0) return { pay: 0, esc: 0 };
     var rate = N(f.rate), months = termMonths(f), pt = f.payment_type || "amortized", pay = 0;
-    if (pt === "fixed") pay = N(f.fixed_payment);
-    else if (pt === "interest_only") pay = amt * rate / 100 / 12;
+    /* v1.8b: a Fixed payment IS the payment — it must not require a loan amount
+       (Subject-To cards have a blank amount by design; blank cards start at 0). */
+    if (pt === "fixed") return { pay: N(f.fixed_payment), esc: N(f.taxes_mo) + N(f.insurance_mo) };
+    var amt = N(f.amount); if (amt <= 0) return { pay: 0, esc: 0 };
+    if (pt === "interest_only") pay = amt * rate / 100 / 12;
     else if (pt === "principal_only") pay = amt * rate / 100 / 12 + (months ? amt / months : 0); // ReiSearch: interest + straight-line principal
     else pay = loanPayment(amt, rate, months / 12);
     return { pay: pay, esc: N(f.taxes_mo) + N(f.insurance_mo) };
@@ -132,10 +134,20 @@
         debtLines.push({ label: lab, payment: Math.round(rp.pay + rp.esc) });
       }
     });
-    var entryFee = 0, mdPayment = 0;
+    /* v1.8a PITI wiring (mirror of app.py): base = typed Monthly Payment, or
+       Principal+Interest when no total is typed; Taxes/Insurance/PMI/Escrow
+       are escrow add-ons counted on top. */
+    var entryFee = 0, mdPayment = 0, mdBase = 0, mdEscrow = 0, mdAddons = {};
     if (strat !== "Fix & Flip") {
-      entryFee = N(s.md_entry_fee); mdPayment = N(s.md_monthly_payment);
-      paydownY1 += N(s.md_piti_principal) * 12;
+      entryFee = N(s.md_entry_fee);
+      var prin = N(s.md_piti_principal), intr = N(s.md_piti_interest);
+      mdBase = N(s.md_monthly_payment);
+      if (mdBase <= 0) mdBase = prin + intr;
+      [["md_piti_taxes", "Taxes"], ["md_piti_insurance", "Insurance"], ["md_piti_pmi", "PMI"], ["md_piti_escrow", "Escrow"]].forEach(function (kv) {
+        var v = N(s[kv[0]]); if (v) mdAddons[kv[1]] = Math.round(v); mdEscrow += v;
+      });
+      mdPayment = mdBase + mdEscrow;
+      paydownY1 += prin * 12;
     }
     var debtService = debtRows + mdPayment;
     var closing = N(s.closing_costs);
@@ -153,7 +165,7 @@
       cash_in: cashIn, financing_costs: financingCosts, funding_status: fundingStatus,
       debt_service_mo: debtService, entry_fee: entryFee,
       cash_contrib: cashEquity, points_fees: pointsFees, closing_costs: closing,
-      debt_lines: debtLines, md_payment_mo: mdPayment };
+      debt_lines: debtLines, md_payment_mo: mdPayment, md_base_mo: mdBase, md_escrow_mo: mdEscrow, md_addons: mdAddons };
 
     if (strat === "Fix & Flip") {
       var sale = N(s.sale_price) || arv;
@@ -174,6 +186,7 @@
       var scen = { "Downside (-10%)": flip(sale * 0.9, rehab, holdingTotal),
         "Base Case (0%)": flip(sale, rehab, holdingTotal),
         "Upside (+10%)": flip(sale * 1.1, rehab, holdingTotal),
+        "Fully Booked (0% vacancy)": flip(sale, rehab, holdingTotal),
         "Overrun (rehab +20%, +3 mo)": flip(sale, rehab * 1.2, holdingMo * (hMonths + 3)) };
       function cs2(x, t) { return t ? clamp((x / t) * 100, 0, 100) : 0; }
       var parts = { "Profit margin (50%)": Math.round(0.5 * cs2((margin || 0) / 100, 0.30) * 10) / 10,
@@ -275,7 +288,10 @@
       breakeven: (gross + other) ? (opex + debtService) / (gross + other) : 1.3,
       downside_cf: egi * 0.9 - opex - debtService };
     function scenR(mult, noVac) {
-      var e2 = noVac ? gross + other : (gross - vacLoss) * mult + other;
+      var e2;
+      if (noVac && strat === "Short Term") { var occ = N(s.occupancy_pct); e2 = (occ ? gross / (occ / 100) : gross) + other; }
+      else if (noVac) e2 = gross + other;
+      else e2 = (gross - vacLoss) * mult + other;
       var noiS = e2 - opex;
       return { revenue: e2, expenses: opex, loan: debtService, net: e2 - opex - debtService,
         dscr: debtService ? noiS / debtService : (noiS > 0 ? 1.5 : 0),
@@ -283,7 +299,7 @@
         coc_pct: cashIn ? (e2 - opex - debtService) * 12 / cashIn * 100 : null };
     }
     var scen2 = { "Downside (-10%)": scenR(0.9), "Base Case (0%)": scenR(1.0), "Upside (+10%)": scenR(1.1) };
-    if (strat === "Co-Living") scen2["Fully Booked (0% vacancy)"] = scenR(1.0, true);
+    scen2["Fully Booked (0% vacancy)"] = scenR(1.0, true);
     var sc = scoreRental(metrics, penalties);
     var refiGross = arv ? Math.round(0.75 * arv) : 0;
     var refiNet = Math.max(0, refiGross - debtAmt);
@@ -548,7 +564,7 @@
       payback: r.payback_yrs ? ("Payback " + r.payback_yrs + " yrs") : "",
       breakeven_line: "Break-even occupancy: " + PC(r.breakeven_pct) + " — that share of gross rent must be collected to cover expenses + loan payments.",
       holding_desc: (s.holding_period || 0) + " " + (s.holding_unit || "Months") + " × " + M(N(s.holding_mo)) + "/mo ≈ " + M(r.holding_cost) + " total holding costs",
-      md_monthly_payment_label: N(s.md_monthly_payment) ? (M(N(s.md_monthly_payment)) + "/mo") : "",
+      md_monthly_payment_label: r.md_payment_mo ? (M(r.md_payment_mo) + "/mo") : "",
       profit_full: strat === "Fix & Flip" ? (M(r.profit) + (r.margin_pct != null ? " (" + PC(r.margin_pct) + " of sale price)" : "") + (hMonthsOf() === 0 ? " · no holding period set" : "")) : "",
       rule70_full: r.rule70_mao !== undefined ? (M(r.rule70_mao - N(s.purchase_price)) + " over max offer " + M(r.rule70_mao)) : "",
       rehab_range: (function () {
@@ -599,7 +615,9 @@
         return;
       }
       if (!sc) { elm.textContent = "—"; return; }
-      if (k === "net") elm.textContent = M(sc.net) + "/mo";
+      if (k === "net") elm.textContent = (sc.revenue !== undefined || sc.expenses !== undefined) ? M(sc.net) + "/mo" : M(sc.net);
+      else if (k === "sale") elm.textContent = M(sc.sale);
+      else if (k === "allin") elm.textContent = M(sc.all_in);
       else if (k === "coc") elm.textContent = PC(sc.coc_pct);
       else if (k === "dscr") elm.textContent = (sc.dscr === null || sc.dscr === undefined) ? "—" : (Math.round(sc.dscr * 100) / 100).toFixed(2);
       else if (k === "cap") elm.textContent = PC(sc.cap_rate_pct);
@@ -741,8 +759,30 @@
       var dl = (r.debt_lines || []).map(function (l) {
         return '<div class="srow"><span>' + l.label + '</span><b>' + M(l.payment) + '</b></div>';
       }).join("");
-      if (N(r.md_payment_mo)) dl += '<div class="srow"><span>Existing mortgage (PITI)</span><b>' + M(r.md_payment_mo) + '</b></div>';
+      if (N(r.md_payment_mo)) {
+        dl += '<div class="srow"><span>Existing mortgage (PITI)</span><b>' + M(r.md_payment_mo) + '</b></div>';
+        if (N(r.md_base_mo)) dl += '<div class="srow"><span>· base payment (P&amp;I)</span><b>' + M(r.md_base_mo) + '</b></div>';
+        Object.keys(r.md_addons || {}).forEach(function (k) {
+          dl += '<div class="srow"><span>· of which ' + k.toLowerCase() + ' (escrow)</span><b>' + M(r.md_addons[k]) + '</b></div>';
+        });
+      }
       dbd.innerHTML = dl ? '<h4 class="det-h">Monthly Debt Service</h4>' + dl : "";
+    }
+    /* v1.8a: the PITI breakdown line inside Existing Mortgage Data — every
+       component named, the counted total shown (nothing in the block is inert). */
+    var mpl = panel.querySelector("[data-md-piti-line]");
+    if (mpl) {
+      var pp = [];
+      if (N(s.md_piti_principal)) pp.push("Principal " + M(N(s.md_piti_principal)));
+      if (N(s.md_piti_interest)) pp.push("Interest " + M(N(s.md_piti_interest)));
+      if (N(s.md_piti_taxes)) pp.push("Taxes " + M(N(s.md_piti_taxes)));
+      if (N(s.md_piti_insurance)) pp.push("Insurance " + M(N(s.md_piti_insurance)));
+      if (N(s.md_piti_pmi)) pp.push("PMI " + M(N(s.md_piti_pmi)));
+      if (N(s.md_piti_escrow)) pp.push("Escrow " + M(N(s.md_piti_escrow)));
+      mpl.textContent = pp.length
+        ? "PITI breakdown — " + pp.join(" + ") + " = " + M(r.md_payment_mo || 0) + "/mo counted in debt service. Base = Monthly Payment" +
+          (N(s.md_monthly_payment) ? "" : " (here: Principal + Interest)") + "; Taxes / Insurance / PMI / Escrow are escrow add-ons on top of the base."
+        : "PITI breakdown — every field counts: Monthly Payment (or Principal + Interest) is the base payment; Taxes, Insurance, PMI and Escrow add on top as escrow.";
     }
     /* v1.7: Cash Needed ALWAYS shows its derivation — every component line,
        $0 lines included (a loan-only state must read "$0" WITH the math visible,
@@ -823,7 +863,24 @@
   function recalc(panel) {
     var s = readState(panel);
     var r = compute(panel.dataset.strategy, s);
+    /* v1.8b: writeOutputs withdraws flagged auto-estimates when a loan payment
+       takes over (taxes/insurance then live inside PITI). If it cleared a field,
+       recompute in the SAME interaction — otherwise totals land one input late:
+       fields show empty while totals still include the withdrawn estimates
+       (gate_v19 P3 root cause: P2 showed cf -$190, P3 then showed $35). */
+    var preTax = panel.querySelector('[name="taxes_mo"]');
+    var preIns = panel.querySelector('[name="insurance_mo"]');
+    var preT = (preTax && preTax.value) || "", preI = (preIns && preIns.value) || "";
     writeOutputs(panel, s, r);
+    var postTax = panel.querySelector('[name="taxes_mo"]');
+    var postIns = panel.querySelector('[name="insurance_mo"]');
+    var cleared = (preT !== "" && postTax && postTax.value === "") ||
+                  (preI !== "" && postIns && postIns.value === "");
+    if (cleared) {
+      s = readState(panel);
+      r = compute(panel.dataset.strategy, s);
+      writeOutputs(panel, s, r);
+    }
     if (!suppressSave) scheduleAutosave(panel);
     return r;
   }

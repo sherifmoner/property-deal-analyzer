@@ -254,11 +254,12 @@
 <div><label>Insurance $/mo</label><input type="number" step="any" name="md_piti_insurance" value="{{ st.md_piti_insurance }}"></div>
 <div><label>Escrow $/mo</label><input type="number" step="any" name="md_piti_escrow" value="{{ st.md_piti_escrow }}"></div>
 <div><label>Liens Amount $</label><input type="number" step="any" name="md_liens" value="{{ st.md_liens }}"></div>
-<div><label><b>Monthly Payment (PITI) $</b> <span class="muted">(counts as debt service)</span></label><input type="number" step="any" name="md_monthly_payment" value="{{ st.md_monthly_payment }}"></div>
+<div><label><b>Monthly Payment (PITI) $</b> <span class="muted">(base payment — counts as debt service; or fill Principal + Interest)</span></label><input type="number" step="any" name="md_monthly_payment" value="{{ st.md_monthly_payment }}"></div>
 </div>
 <div class="rowflex">
 <div><label>Interest Rate %</label><input type="number" step="any" name="md_rate" value="{{ st.md_rate }}"></div>
 </div>
+<p class="small muted" data-md-piti-line></p>
 </div></details>
 {% endif %}
 </div></details>
@@ -374,6 +375,7 @@
 {% else %}
 <div class="scorebox"><span>Deal Score</span><b data-out="score">—</b><small data-out="score_label"></small></div>
 <p class="small insight" data-out="score_insight"></p>
+<div class="chips"><button type="button" data-scenchip="Downside (-10%)" onclick="return uwScenChip(this)">Downside −10%</button><button type="button" class="on" data-scenchip="Base Case (0%)" onclick="return uwScenChip(this)">Base Case</button><button type="button" data-scenchip="Upside (+10%)" onclick="return uwScenChip(this)">Upside +10%</button><button type="button" data-scenchip="Fully Booked (0% vacancy)" onclick="return uwScenChip(this)">Fully Booked</button></div>
 <div class="srow"><span>Net Profit</span><b data-out="profit_full">$0</b></div>
 <div class="srow"><span>Sale Price</span><b data-out="sale_price_out">$0</b></div>
 <div class="srow"><span>All-in Cost</span><b data-out="all_in">$0</b></div>
@@ -394,6 +396,11 @@
 <div class="srow"><span>DSCR</span><b data-scenm="dscr">—</b></div>
 <div class="srow"><span>Cap Rate</span><b data-scenm="cap">—</b></div>
 {% else %}
+{% if strat=='Fix & Flip' %}
+<div class="srow"><span>Scenario Net Profit</span><b data-scenm="net">$0</b></div>
+<div class="srow"><span>Scenario Sale Price</span><b data-scenm="sale">$0</b></div>
+<div class="srow"><span>Scenario All-in Cost</span><b data-scenm="allin">$0</b></div>
+{% endif %}
 <div class="srow"><span>Net Profit</span><b data-out="profit">$0</b></div>
 <div class="srow"><span>ROI</span><b data-out="roi">—</b></div>
 <div class="srow"><span>Profit Margin</span><b data-out="margin_pct">—</b></div>
@@ -428,6 +435,12 @@
 <div class="srow"><span>Cash Outlay</span><b data-out="cash_in">$0</b></div>
 <div class="srow"><span>Income</span><b data-out="egi_mo">$0</b></div>
 <div class="srow"><span>Expenses</span><b data-out="expenses_total">$0</b></div>
+<div class="chips"><button type="button" data-scenchip="Downside (-10%)" onclick="return uwScenChip(this)">Downside −10%</button><button type="button" class="on" data-scenchip="Base Case (0%)" onclick="return uwScenChip(this)">Base Case</button><button type="button" data-scenchip="Upside (+10%)" onclick="return uwScenChip(this)">Upside +10%</button><button type="button" data-scenchip="Fully Booked (0% vacancy)" onclick="return uwScenChip(this)">Fully Booked</button></div>
+<h4>Key Metrics (<span data-scenm="name">Base Case</span>)</h4>
+<div class="srow"><span>Net Cash Flow</span><b data-scenm="net">$0/mo</b></div>
+<div class="srow"><span>Cash-on-Cash</span><b data-scenm="coc">—</b></div>
+<div class="srow"><span>DSCR</span><b data-scenm="dscr">—</b></div>
+<div class="srow"><span>Cap Rate</span><b data-scenm="cap">—</b></div>
 </div>
 {% endif %}
 <div class="sidecard"><h3>Loan Amortization</h3>
