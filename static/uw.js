@@ -401,7 +401,10 @@
     var termW = el("div", "fterm");
     termW.appendChild(numInput("f-termval", f.term_value));
     termW.appendChild(selOf("f-termunit", ["Months", "Years"], f.term_unit || "Months"));
-    grid.appendChild(field("Remaining Term", termW));
+    var termField = field("Remaining Term", termW);
+    termField.classList.add("fterm-field"); /* v22: term field spans 2 grid
+      columns so the value box has real width beside the unit selector */
+    grid.appendChild(termField);
     grid.appendChild(field("Points %", numInput("f-points", f.points)));
     grid.appendChild(field("Fees $", numInput("f-fees", f.fees)));
     grid.appendChild(field("Taxes $/mo (escrow)", numInput("f-taxes", f.taxes_mo)));
