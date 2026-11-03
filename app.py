@@ -909,10 +909,25 @@ def compute_underwriting(strategy, raw_inp, prop):
     # ReiSearch evidence (pass 2026-11-03): Hard Money Cash Needed $6,397 =
     # financing costs alone against a $56,445 gap, and ReiSearch's Total ROI
     # -27.7% = -$1,769 / $6,397 confirms gap-free Cash Needed on rentals.
+    # v2.9 (Pass #2, 2026-11-03 evening; supersedes the v1.6/v2.3 lines
+    # above AND the 2026-11-01 behavior spec's "moves with cash
+    # contributions" claim): ReiSearch's Cash Needed = cash costs that
+    # sit OUTSIDE Total Uses = financing costs (points + fees) + the
+    # Subject-To entry fee. Measured across 8 funding states (Total Uses
+    # $376,300 constant): Cash-only / empty / Conventional / Private /
+    # Seller / Conv+$50k-cash / Cash+Private ALL read Cash Needed $0 —
+    # contributions and gaps up to $376,300 move NOTHING; Hard Money
+    # reads exactly $6,397 = its points. cash_in below is KEPT as the
+    # separate total-cash-in figure (refi remaining_in_deal + the
+    # scenarios "Cash in" column) but no longer feeds any Cash Needed /
+    # CoC surface. Fix & Flip keeps its published fixture: cash_in
+    # (gap-inclusive) IS the flip's Cash Needed (test_fixtures_v15.py:
+    # FF Cash Needed $61,684; parity-plan-v16-v17 Senisa fixture list).
+    cash_needed = cash_in if strategy == "Fix & Flip" else points_fees + entry_fee
     if funded <= 0:
-        funding_status = "Not Funded"
+        funding_status = "Not Funded Yet"
     elif gap < -0.05 * max(uses, 1):
-        funding_status = "Over-funded"
+        funding_status = "Over Funded"
     elif gap <= 0:
         funding_status = "Fully Funded"
     else:
@@ -930,8 +945,8 @@ def compute_underwriting(strategy, raw_inp, prop):
     if uses_override:
         snap_uses = uses_override
         snap_gap = snap_uses - funded
-        if funded <= 0: snap_status = "Not Funded"
-        elif snap_gap < -0.05 * max(snap_uses, 1): snap_status = "Over-funded"
+        if funded <= 0: snap_status = "Not Funded Yet"
+        elif snap_gap < -0.05 * max(snap_uses, 1): snap_status = "Over Funded"
         elif snap_gap <= 0: snap_status = "Fully Funded"
         else: snap_status = "Partially Funded"
     else:
@@ -942,7 +957,8 @@ def compute_underwriting(strategy, raw_inp, prop):
            "furnishing": round(furnishing), "conversion": round(conversion),
            "total_project": round(total_project), "holding_cost": round(holding_total),
            "holding_months": round(h_months, 2), "uses": round(uses), "funded": round(funded),
-           "gap": round(gap), "cash_in": round(cash_in), "financing_costs": round(financing_costs),
+           "gap": round(gap), "cash_in": round(cash_in), "cash_needed": round(cash_needed),
+           "financing_costs": round(financing_costs),
            "funding_status": funding_status,
            "uses_override": round(uses_override) if uses_override else None,
            "snap_uses": round(snap_uses), "snap_gap": round(snap_gap), "snap_status": snap_status,
@@ -1110,18 +1126,20 @@ def compute_underwriting(strategy, raw_inp, prop):
     value = arv or price
     metrics = {"cf_per_room": (cf / rooms_n) if rooms_n else 0,
                "dscr": (noi / debt_service) if debt_service else (1.5 if noi > 0 else 0),
-               "coc": (cf * 12 / cash_in) if cash_in else 0,
+               "coc": (cf * 12 / cash_needed) if cash_needed else 0,
                "cap_rate": (noi * 12 / value) if value else 0,
                "breakeven": ((opex + debt_service) / (gross + other)) if (gross + other) else 1.3,
                "downside_cf": (egi * 0.9 - opex - debt_service)}
-    # v2.4 score-factor inputs (ReiSearch measured model; mirrors uw.js):
-    # DSCR is a real value or None (no debt scores 100, "No debt");
-    # Cash-on-cash is scored on the cash needed BEYOND the buyer's own cash
-    # contribution (cash_in - cash_equity = points/fees + closing + entry
-    # fee) and is "no data" — excluded — when that is $0, exactly
-    # ReiSearch's rule (Cash/Conventional/Seller excluded; HM's $6,397 scored).
+    # v2.9 score-factor inputs (mirrors uw.js): Cash-on-cash is scored on
+    # ReiSearch's Cash Needed (v2.9 definition: points/fees + entry fee
+    # only) and is "no data" — excluded from the weighted average — when
+    # that is $0 (Pass #2, 8 states). This SUPERSEDES the v2.4 reading
+    # (cash_in - cash_equity): on the shipped saved state the old score
+    # denominator was the $3,000 closing costs (CoC 603.9%) while the
+    # summary showed 4.2% on $428,900 — one definition now feeds both
+    # (Hard Money: both -27.7% on $6,397).
     metrics["dscr_val"] = (noi / debt_service) if debt_service else None
-    metrics["coc_val"] = (cf * 12 / (cash_in - cash_equity)) if (cash_in - cash_equity) > 0 else None
+    metrics["coc_val"] = (cf * 12 / cash_needed) if cash_needed > 0 else None
     metrics["downside_cf_per_room"] = (metrics["downside_cf"] / rooms_n) if rooms_n else 0
     def _scen(mult, no_vac=False):
         if no_vac and strategy == "Short Term":
@@ -1139,7 +1157,7 @@ def compute_underwriting(strategy, raw_inp, prop):
                 "net": round(e2 - opex - debt_service),
                 "dscr": round(noi_s / debt_service, 2) if debt_service else (1.5 if noi_s > 0 else 0),
                 "cap_rate_pct": round(noi_s * 12 / value * 100, 2) if value else 0,
-                "coc_pct": round((e2 - opex - debt_service) * 12 / cash_in * 100, 1) if cash_in else None}
+                "coc_pct": round((e2 - opex - debt_service) * 12 / cash_needed * 100, 1) if cash_needed else None}
     scen = {"Downside (-10%)": _scen(0.9), "Base Case (0%)": _scen(1.0), "Upside (+10%)": _scen(1.1)}
     # v1.8a: Fully Booked exists for EVERY rental strategy (it was Co-Living-only,
     # which left the chip dead on STR/MTR/LTR panels).
@@ -1172,9 +1190,9 @@ def compute_underwriting(strategy, raw_inp, prop):
                 "taxes_mo": taxes_mo, "insurance_mo": ins_mo,
                 "taxes_est": taxes_est, "insurance_est": ins_est, "noi_mo": round(noi),
                 "cashflow_mo": round(cf), "cf_per_room": round(metrics["cf_per_room"]),
-                "cash_per_room": round(cash_in / rooms_n) if rooms_n else None,
+                "cash_per_room": round(cash_needed / rooms_n) if rooms_n else None,
                 "dscr": round(metrics["dscr"], 2) if debt_service else None,   # v2.1: N/A when there is no debt
-                "coc_pct": round(metrics["coc"] * 100, 1) if cash_in else None,
+                "coc_pct": round(metrics["coc"] * 100, 1) if cash_needed else None,
                 "cap_rate_pct": round(metrics["cap_rate"] * 100, 2),
                 "breakeven_pct": round(metrics["breakeven"] * 100, 1),
                 "payback_yrs": round(1 / metrics["coc"], 1) if metrics["coc"] > 0 else None,
@@ -1182,7 +1200,7 @@ def compute_underwriting(strategy, raw_inp, prop):
                 "refi_proceeds": refi_gross, "remaining_in_deal": round(max(0, cash_in - refi_net)),
                 "paydown_y1": round(paydown_y1), "cashflow_y1": round(cf * 12),
                 "total_return_y1": round(cf * 12 + paydown_y1),
-                "total_roi_y1": round((cf * 12 + paydown_y1) / cash_in * 100, 1) if cash_in else None,
+                "total_roi_y1": round((cf * 12 + paydown_y1) / cash_needed * 100, 1) if cash_needed else None,
                 "score": sc["score"], "label": sc["label"], "score_parts": sc["parts"],
                 "score_factors": sc["factors"],
                 "penalties": sc["penalties"], "flags": flags, "insight": insight,

@@ -316,7 +316,20 @@
        Fix & Flip keeps the gap. (The v2.1 "gap for every strategy" rule is
        superseded by this measured evidence; mirrors app.py.) */
     var cashIn = cashEquity + pointsFees + closing + entryFee + (strat === "Fix & Flip" ? Math.max(gap, 0) : 0);
-    var fundingStatus = funded <= 0 ? "Not Funded" : (gap < -0.05 * Math.max(uses, 1) ? "Over-funded" : (gap <= 0 ? "Fully Funded" : "Partially Funded"));
+    /* v2.9 (Pass #2, 2026-11-03 evening; supersedes the block above AND
+       the 2026-11-01 behavior spec's "moves with cash contributions"
+       claim): Cash Needed = cash costs OUTSIDE Total Uses = financing
+       costs (points + fees) + Subject-To entry fee. Measured across 8
+       funding states: Cash-only / empty / Conventional / Private /
+       Seller / Conv+$50k-cash / Cash+Private all read $0 — contributions
+       and gaps move NOTHING; Hard Money reads exactly $6,397 = points.
+       cashIn stays as the total-cash-in figure (refi remaining_in_deal,
+       scenarios "Cash in" column, flip ROI) but feeds no Cash Needed /
+       CoC surface. Fix & Flip keeps its published fixture: cashIn
+       (gap-inclusive) IS the flip's Cash Needed (fixtures v15: $61,684).
+       Mirrors app.py. */
+    var cashNeeded = strat === "Fix & Flip" ? cashIn : pointsFees + entryFee;
+    var fundingStatus = funded <= 0 ? "Not Funded Yet" : (gap < -0.05 * Math.max(uses, 1) ? "Over Funded" : (gap <= 0 ? "Fully Funded" : "Partially Funded"));
     /* v2.8 (A10, evening pass 2026-11-03): Override Total Uses — while set,
        the Funding Snapshot's Total Uses / Gap / status read the OVERRIDE;
        Cash Needed, debt service and everything else keep the REAL uses
@@ -325,12 +338,12 @@
     var snapUses = uses, snapGap = gap, snapStatus = fundingStatus;
     if (usesOverride) {
       snapUses = usesOverride; snapGap = snapUses - funded;
-      snapStatus = funded <= 0 ? "Not Funded" : (snapGap < -0.05 * Math.max(snapUses, 1) ? "Over-funded" : (snapGap <= 0 ? "Fully Funded" : "Partially Funded"));
+      snapStatus = funded <= 0 ? "Not Funded Yet" : (snapGap < -0.05 * Math.max(snapUses, 1) ? "Over Funded" : (snapGap <= 0 ? "Fully Funded" : "Partially Funded"));
     }
     var out = { strategy: strat, arv: arv, purchase_price: price, rehab: rehab, rehab_calc: rehabCalc,
       rehab_mode: rehabMode, appliances: appliances, furnishing: furnishing, conversion: conversion,
       total_project: totalProject, holding_cost: holdingTotal, uses: uses, funded: funded, gap: gap,
-      cash_in: cashIn, financing_costs: financingCosts, funding_status: fundingStatus,
+      cash_in: cashIn, cash_needed: cashNeeded, financing_costs: financingCosts, funding_status: fundingStatus,
       uses_override: usesOverride || null, snap_uses: snapUses, snap_gap: snapGap, snap_status: snapStatus,
       debt_service_mo: debtService, entry_fee: entryFee,
       cash_contrib: cashEquity, points_fees: pointsFees, closing_costs: closing,
@@ -458,18 +471,20 @@
     var value = arv || price;
     var metrics = { cf_per_room: roomsN ? cf / roomsN : 0,
       dscr: debtService ? noi / debtService : (noi > 0 ? 1.5 : 0),
-      coc: cashIn ? cf * 12 / cashIn : 0,
+      coc: cashNeeded ? cf * 12 / cashNeeded : 0,
       cap_rate: value ? noi * 12 / value : 0,
       breakeven: (gross + other) ? (opex + debtService) / (gross + other) : 1.3,
       downside_cf: egi * 0.9 - opex - debtService };
-    /* v2.4 score-factor inputs (ReiSearch measured model): DSCR is a real
-       value or null (no debt scores 100, displayed "No debt"); Cash-on-cash
-       is scored on the cash needed BEYOND the buyer's own cash contribution
-       (cashIn - cashEquity = points/fees + closing + entry fee) and is
-       "no data" — excluded — when that is $0, exactly ReiSearch's rule
-       (Cash/Conventional/Seller excluded; Hard Money's $6,397 scored). */
+    /* v2.9 score-factor inputs (mirrors app.py): Cash-on-cash is scored
+       on ReiSearch's Cash Needed (v2.9: points/fees + entry fee only)
+       and is "no data" — excluded from the weighted average — when that
+       is $0 (Pass #2, 8 states). SUPERSEDES the v2.4 reading
+       (cashIn - cashEquity): on the shipped saved state the old score
+       denominator was the $3,000 closing costs (CoC 603.9%) while the
+       summary showed 4.2% on $428,900 — one definition feeds both now
+       (Hard Money: both -27.7% on $6,397). */
     metrics.dscr_val = debtService ? metrics.dscr : null;
-    metrics.coc_val = (cashIn - cashEquity) > 0 ? cf * 12 / (cashIn - cashEquity) : null;
+    metrics.coc_val = cashNeeded > 0 ? cf * 12 / cashNeeded : null;
     metrics.downside_cf_per_room = roomsN ? metrics.downside_cf / roomsN : 0;
     function scenR(mult, noVac) {
       var e2;
@@ -480,7 +495,7 @@
       return { revenue: e2, expenses: opex, loan: debtService, net: e2 - opex - debtService,
         dscr: debtService ? noiS / debtService : (noiS > 0 ? 1.5 : 0),
         cap_rate_pct: value ? noiS * 12 / value * 100 : 0,
-        coc_pct: cashIn ? (e2 - opex - debtService) * 12 / cashIn * 100 : null };
+        coc_pct: cashNeeded ? (e2 - opex - debtService) * 12 / cashNeeded * 100 : null };
     }
     var scen2 = { "Downside (-10%)": scenR(0.9), "Base Case (0%)": scenR(1.0), "Upside (+10%)": scenR(1.1) };
     scen2["Fully Booked (0% vacancy)"] = scenR(1.0, true);
@@ -509,16 +524,16 @@
     out.egi_mo = egi; out.opex_mo = opex; out.opex_cats = opexCats; out.taxes_mo = taxesMo; out.insurance_mo = insMo;
     out.taxes_est = taxesEst; out.insurance_est = insEst;
     out.noi_mo = noi; out.cashflow_mo = cf; out.cf_per_room = metrics.cf_per_room;
-    out.cash_per_room = roomsN ? cashIn / roomsN : null;
+    out.cash_per_room = roomsN ? cashNeeded / roomsN : null;
     out.dscr = debtService ? Math.round(metrics.dscr * 100) / 100 : null; /* v2.1: N/A with no debt */
-    out.coc_pct = cashIn ? metrics.coc * 100 : null; out.cap_rate_pct = metrics.cap_rate * 100;
+    out.coc_pct = cashNeeded ? metrics.coc * 100 : null; out.cap_rate_pct = metrics.cap_rate * 100;
     out.breakeven_pct = metrics.breakeven * 100;
     out.payback_yrs = metrics.coc > 0 ? Math.round(10 / metrics.coc) / 10 : null;
     out.scenarios = scen2; out.rooms = roomsN;
     out.refi_proceeds = refiGross; out.remaining_in_deal = Math.max(0, cashIn - refiNet);
     out.paydown_y1 = paydownY1; out.cashflow_y1 = cf * 12;
     out.total_return_y1 = cf * 12 + paydownY1;
-    out.total_roi_y1 = cashIn ? (cf * 12 + paydownY1) / cashIn * 100 : null;
+    out.total_roi_y1 = cashNeeded ? (cf * 12 + paydownY1) / cashNeeded * 100 : null;
     out.score = sc.score; out.label = sc.label; out.score_parts = sc.parts; out.score_factors = sc.factors;
     out.penalties = sc.penalties; out.flags = flags;
     out.insight = insightFromFactors(sc.factors);
@@ -915,7 +930,11 @@
       egi_wk: M((r.egi_mo || 0) * 12 / 52), amenity_total: M(r.amenity_mo || 0), amenity_wk: M((r.amenity_mo || 0) * 12 / 52),
       funding_status: r.snap_status || r.funding_status || "",
       uses: M(r.snap_uses !== undefined && r.snap_uses !== null ? r.snap_uses : r.uses),
-      gap: M(r.snap_gap !== undefined && r.snap_gap !== null ? r.snap_gap : r.gap),
+      /* v2.9 (Pass #2): the DISPLAYED Remaining Funding Gap floors at $0
+         when over-funded (ReiSearch State 7: $677,340 added vs $376,300
+         uses, gap shown $0). The raw r.gap stays signed — the funding
+         snapshot's gapalert and the flip cash breakdown use the real gap. */
+      gap: M(Math.max(0, r.snap_gap !== undefined && r.snap_gap !== null ? r.snap_gap : r.gap)),
       score_insight: r.insight || "",
       payback_full: r.payback_yrs ? (r.payback_yrs + " yrs") : "—",
       cf_bar_legend: (function () {
@@ -944,7 +963,7 @@
       if (elm.tagName === "INPUT") elm.value = txt; else elm.textContent = txt;
       if (key === "funding_status") {
         var fst = r.snap_status || r.funding_status;
-        elm.className = "fbadge " + (fst === "Fully Funded" ? "full" : (fst === "Over-funded" ? "over" : (fst === "Partially Funded" ? "part" : "none")));
+        elm.className = "fbadge " + (fst === "Fully Funded" ? "full" : (fst === "Over Funded" ? "over" : (fst === "Partially Funded" ? "part" : "none")));
       }
     });
     /* Month/Year summary panels (ReiSearch side panels) */
@@ -1164,16 +1183,25 @@
     /* v1.7: Cash Needed ALWAYS shows its derivation — every component line,
        $0 lines included (a loan-only state must read "$0" WITH the math visible,
        not as a bare unexplained number). Rendered into the Funding Snapshot
-       (data-breakdown="cash") and the sidebar Overview (data-breakdown="cashside"). */
+       (data-breakdown="cash") and the sidebar Overview (data-breakdown="cashside").
+       v2.9: the RENTAL lines are ReiSearch's measured components only —
+       points/fees + entry fee (Pass #2: contributions and closing costs are
+       NOT part of Cash Needed; they still show in the snapshot's own rows).
+       Fix & Flip keeps its gap-inclusive lines (published fixture). */
     var cashLines = [];
-    if (strat === "Fix & Flip" && r.gap > 0) cashLines.push(["Funding gap (cash at closing)", r.gap]);
-    cashLines.push(["Cash contributions", N(r.cash_contrib)]);
-    cashLines.push(["Points & fees", N(r.points_fees)]);
-    cashLines.push(["Closing costs", N(r.closing_costs)]);
-    cashLines.push(["Entry fee", N(r.entry_fee)]);
+    if (strat === "Fix & Flip") {
+      if (r.gap > 0) cashLines.push(["Funding gap (cash at closing)", r.gap]);
+      cashLines.push(["Cash contributions", N(r.cash_contrib)]);
+      cashLines.push(["Points & fees", N(r.points_fees)]);
+      cashLines.push(["Closing costs", N(r.closing_costs)]);
+      cashLines.push(["Entry fee", N(r.entry_fee)]);
+    } else {
+      cashLines.push(["Points & fees", N(r.points_fees)]);
+      cashLines.push(["Entry fee", N(r.entry_fee)]);
+    }
     var cashRowsHtml = cashLines.map(function (x) {
       return '<div class="srow"><span>' + x[0] + '</span><b>' + M(x[1]) + '</b></div>';
-    }).join("") + '<div class="srow tot"><span>Cash Needed</span><b>' + M(r.cash_in) + '</b></div>';
+    }).join("") + '<div class="srow tot"><span>Cash Needed</span><b>' + M(r.cash_needed) + '</b></div>';
     var cbd = panel.querySelector('[data-breakdown="cash"]');
     if (cbd) cbd.innerHTML = '<h4 class="det-h">Cash Needed — breakdown</h4>' + cashRowsHtml;
     var csb = panel.querySelector('[data-breakdown="cashside"]');
@@ -1200,7 +1228,7 @@
         R("Purchase Price", M(r.purchase_price)); R("Rehab", M(r.rehab));
         R("Holding Costs", M(r.holding_cost)); R("Financing (closing, points, interest)", M(r.financing_total || 0)); R("All-in Cost", M(r.all_in));
         H("Cash & Capital");
-        R("Total Uses", M(r.uses)); R("Funding Added", M(r.funded)); R("Cash Needed", M(r.cash_in));
+        R("Total Uses", M(r.uses)); R("Funding Added", M(r.funded)); R("Cash Needed", M(r.cash_needed));
         H("Return Metrics");
         R("Net Profit", M(r.profit)); R("ROI", PC(r.roi)); R("Annualized ROI", PC(r.annualized_roi));
         R("Profit Margin", PC(r.margin_pct)); R("70% Rule Max Offer", M(r.rule70_mao));
@@ -1214,7 +1242,7 @@
         H("Loan Payments");
         R("Loan Payments", M(r.debt_service_mo));
         H("Cash & Capital");
-        R("Total Uses", M(r.uses)); R("Funding Added", M(r.funded)); R("Cash Needed", M(r.cash_in));
+        R("Total Uses", M(r.uses)); R("Funding Added", M(r.funded)); R("Cash Needed", M(r.cash_needed));
         H("Return Metrics");
         R("Net Cash Flow", M(r.cashflow_mo) + "/mo"); R("Cash-on-Cash", PC(r.coc_pct));
         R("DSCR", (r.dscr === null || r.dscr === undefined) ? "N/A" : (Math.round(r.dscr * 100) / 100).toFixed(2));

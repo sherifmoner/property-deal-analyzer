@@ -233,7 +233,7 @@
 <button type="button" class="btn sm sec" onclick="return uwClearFunding(this)">Clear all</button>
 <p class="small muted">You can combine multiple funding sources to match the deal.</p>
 </div>
-<div class="sumcard snapcard"><h4>Funding Snapshot <span class="fbadge" data-out="funding_status">Not Funded</span></h4>
+<div class="sumcard snapcard"><h4>Funding Snapshot <span class="fbadge" data-out="funding_status">Not Funded Yet</span></h4>
 <div class="srow"><span>Total Uses (purchase + renovation + holding)</span><b data-out="uses">$0</b> <button type="button" class="uses-pencil" data-uses-edit title="Override total uses" onclick="return uwUsesEdit(this)">✎</button></div>
 {# v2.8 (A10, evening pass 2026-11-03): Override Total Uses — pencil opens the
    editor (prefilled with the current value); while overridden, the snapshot's
@@ -249,7 +249,7 @@
 <div class="srow"><span>Funding Added</span><b data-out="funded">$0</b></div>
 <div class="srow"><span>Remaining Funding Gap</span><b data-out="gap">$0</b></div>
 <div class="srow"><span>Cash Contributions</span><b data-out="cash_contrib">$0</b></div>
-<div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Cash Needed</span><b data-out="cash_needed">$0</b></div>
 <div class="srow"><span>Monthly Debt Service</span><b data-out="debt_service_mo">$0</b></div>
 <div class="srow tot"><span>Estimated Financing Costs</span><b data-out="financing_costs">$0</b></div>
 <div data-breakdown="debt"></div><div data-breakdown="cash"></div></div>
@@ -327,7 +327,7 @@
 <div class="card uwbottom">
 <h3>Underwriting Summary</h3>
 <div class="hcards">
-<div class="hcard"><span>Cash Needed</span><b data-out="cash_in">$0</b><small data-out="cash_per_room"></small></div>
+<div class="hcard"><span>Cash Needed</span><b data-out="cash_needed">$0</b><small data-out="cash_per_room"></small></div>
 <div class="hcard"><span>Net Cash Flow / Mo</span><b data-out="cashflow_mo">$0</b><small data-out="cf_per_room"></small></div>
 <div class="hcard"><span>Cash-on-Cash</span><b data-out="coc_pct">—</b><small data-out="payback"></small></div>
 <div class="hcard"><span>DSCR</span><b data-out="dscr">—</b><small>&nbsp;</small></div>
@@ -385,9 +385,9 @@
 <p class="small insight" data-out="score_insight"></p>
 <p class="small"><a href="#" onclick="return uwGoDetails(this)">View Details</a></p>
 <div class="chips"><button type="button" data-scenchip="Downside (-10%)" onclick="return uwScenChip(this)">Downside −10%</button><button type="button" class="on" data-scenchip="Base Case (0%)" onclick="return uwScenChip(this)">Base Case</button><button type="button" data-scenchip="Upside (+10%)" onclick="return uwScenChip(this)">Upside +10%</button><button type="button" data-scenchip="Fully Booked (0% vacancy)" onclick="return uwScenChip(this)">Fully Booked</button></div>
-<div class="srow big"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
+<div class="srow big"><span>Cash Needed</span><b data-out="cash_needed">$0</b></div>
 <div data-breakdown="cashside"></div>
-<p class="small muted">One-time cash to get into the deal (cash contributions + closing + points/fees + entry fee — a loan-only funding gap doesn't count).</p>
+<p class="small muted">One-time cash beyond the funding stack (loan points/fees + sub-to entry fee — cash contributions, closing costs and a loan-only funding gap don't count).</p>
 <div class="cfbox"><h4>Monthly Cash Flow</h4>
 <div class="srow"><span>+ Revenue</span><b data-scen="rev">$0</b></div>
 <div class="srow"><span>− Expenses</span><b data-scen="exp">$0</b></div>
@@ -409,7 +409,7 @@
 <div class="srow"><span>Net Profit</span><b data-out="profit_full">$0</b></div>
 <div class="srow"><span>Sale Price</span><b data-out="sale_price_out">$0</b></div>
 <div class="srow"><span>All-in Cost</span><b data-out="all_in">$0</b></div>
-<div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Cash Needed</span><b data-out="cash_needed">$0</b></div>
 <div data-breakdown="cashside"></div>
 <div class="srow"><span>ROI</span><b data-out="roi">—</b></div>
 <div class="srow"><span>Annualized ROI</span><b data-out="annualized_roi">—</b></div>
@@ -443,7 +443,7 @@
 <div class="srow"><span>Refinance Proceeds</span><b data-out="refi_proceeds">$0</b></div>
 <div class="srow"><span>Remaining in Deal</span><b data-out="remaining_in_deal">$0</b></div>
 <div class="srow"><span>Net Cash Flow</span><b><span data-out="cashflow_mo">$0</span>/mo</b></div>
-<div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Cash Needed</span><b data-out="cash_needed">$0</b></div>
 <div class="srow"><span>Cash-on-Cash</span><b data-out="coc_pct">—</b></div>
 <div class="srow"><span>DSCR</span><b data-out="dscr">—</b></div>
 <div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
@@ -451,7 +451,7 @@
 {% else %}
 <div class="srow"><span>Total Project Cost</span><b data-out="total_project">$0</b></div>
 <div class="srow"><span>Total Uses (incl. holding)</span><b data-out="uses">$0</b></div>
-<div class="srow"><span>Cash Needed</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Cash Needed</span><b data-out="cash_needed">$0</b></div>
 <div class="srow"><span>Net Sale Proceeds</span><b data-out="net_proceeds">$0</b></div>
 <div class="srow"><span>Net Profit</span><b data-out="profit">$0</b></div>
 <div class="srow"><span>ROI</span><b data-out="roi">—</b></div>
@@ -465,7 +465,7 @@
 {# v2.3 (P2a, ReiSearch pass 2026-11-03): the sparse sidebar for Short/Mid/Long
    Term carries ONLY these three rows + the Loan Amortization block below —
    no score/NCF/DSCR/Cap rows and no scenario chips in this panel. #}
-<div class="srow"><span>Cash Outlay</span><b data-out="cash_in">$0</b></div>
+<div class="srow"><span>Cash Outlay</span><b data-out="cash_needed">$0</b></div>
 <div class="srow"><span>Income</span><b data-out="egi_mo">$0</b></div>
 <div class="srow"><span>Expenses</span><b data-out="expenses_total">$0</b></div>
 </div>
