@@ -10,3 +10,9 @@ services:
         value: 0.0.0.0
       - key: PYTHON_VERSION
         value: 3.12.7
+      - key: PDA_PASSWORD   # set a value in the Render dashboard to lock the app behind a login
+        sync: false
+      - key: PDA_USER
+        value: admin
+      - key: PDA_SECRET
+        generateValue: true

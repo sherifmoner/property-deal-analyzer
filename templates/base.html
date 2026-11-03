@@ -6,7 +6,7 @@
 <script src="{{ url_for('static', filename='vendor/leaflet.js') }}"></script>
 <script src="https://us-assets.i.posthog.com/static/array.js" async></script>
 <script>window.addEventListener('load',function(){if(window.posthog){posthog.init('phc_r6MLtMTBCsWT8b2UkasUoEKsgasX9QHs6ibH4nfZREES',{api_host:'https://us.i.posthog.com',capture_pageview:true})}})</script></head>
-<body><div class="layout">
+<body><div class="mobilebar"><button type="button" aria-label="Menu" onclick="document.body.classList.toggle('navopen')">☰</button><b>🏠 Deal Analyzer</b></div><div class="layout">
 <nav class="sidenav"><div class="brand">🏠 Deal Analyzer</div>
 <a href="{{ url_for('dashboard') }}">Dashboard</a>
 <a href="{{ url_for('properties') }}">Properties</a>

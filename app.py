@@ -5,14 +5,27 @@ Run: .venv/bin/python app.py  ->  http://127.0.0.1:5050
 import json, math, os, re, sqlite3, datetime, io, csv, threading, ast
 from functools import wraps
 import requests
-from flask import Flask, request, redirect, url_for, render_template, jsonify, g, send_file, abort, flash
+from flask import Flask, request, redirect, url_for, render_template, jsonify, g, send_file, abort, flash, Response
+import hmac
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("PDA_DB", os.path.join(BASE, "analyzer.db"))
 UPLOAD_DIR = os.path.join(BASE, "uploads"); os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
-app.secret_key = "pda-local-dev"
+app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
+
+@app.before_request
+def _require_login():
+    """Optional password gate. Set PDA_PASSWORD (and optionally PDA_USER, default 'admin') in the
+    hosting dashboard to lock the whole app behind a browser login. Unset = open (local use)."""
+    pw = os.environ.get("PDA_PASSWORD")
+    if not pw:
+        return None
+    a = request.authorization
+    if a and hmac.compare_digest(a.password or "", pw) and hmac.compare_digest(a.username or "", os.environ.get("PDA_USER", "admin")):
+        return None
+    return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Deal Analyzer"'})
 
 # ---------------------------------------------------------------- DB layer
 def db():
@@ -124,6 +137,26 @@ def init_db():
     for col in ("visit_status", "quote_status", "contact_company", "contact_name",
                 "contact_phone", "contact_email"):
         if col not in acols: d.execute(f"ALTER TABLE assignments ADD COLUMN {col} TEXT")
+    # v2.1 repair: text that slipped into numeric columns ("$410,000") becomes a real number (or NULL)
+    for col in NUMERIC_PROP_FIELDS:
+        if col in cols:
+            for rid, raw in d.execute(f"SELECT id, {col} FROM properties WHERE typeof({col})='text'").fetchall():
+                d.execute(f"UPDATE properties SET {col}=? WHERE id=?", (clean_num(raw), rid))
+    # v2.1 repair: autosaved drafts still carrying the old PadSplit-only defaults on non-co-living
+    # strategies (untouched values only; anything the user changed is left alone).
+    _old = {"electric_mo": 400, "water_mo": 80, "gas_mo": 50, "internet_mo": 70, "cleaning_mo": 120,
+            "property_manager_mo": 300, "booking_days": 10, "service_fee_pct": 8}
+    _fix = {"Long Term": {"electric_mo": 0, "water_mo": 0, "gas_mo": 0, "internet_mo": 0, "cleaning_mo": 0,
+                          "property_manager_mo": 0, "booking_days": 0, "service_fee_pct": 0},
+            "Mid Term": {"cleaning_mo": 0, "property_manager_mo": 0, "booking_days": 0, "service_fee_pct": 0},
+            "Short Term": {"booking_days": 0, "service_fee_pct": 0}}
+    for pid_, strat_, st_ in d.execute("SELECT property_id, strategy, state FROM uw_drafts WHERE strategy IN ('Long Term','Mid Term','Short Term')").fetchall():
+        try: s_ = json.loads(st_ or "{}")
+        except Exception: continue
+        fix_ = _fix[strat_]
+        if all(fnum(s_.get(k)) == _old[k] for k in fix_):
+            s_.update(fix_)
+            d.execute("UPDATE uw_drafts SET state=? WHERE property_id=? AND strategy=?", (json.dumps(s_), pid_, strat_))
     d.commit(); d.close()
 
 # Schema creation must happen at import time, not only under __main__: production
@@ -132,8 +165,8 @@ def init_db():
 # __main__, so the uw_drafts table was never created on the deployed instance and
 # every /uw-autosave POST died with "no such table: uw_drafts" (HTTP 500), while
 # local runs via `python app.py` looked fine. init_db() is idempotent
-# (CREATE TABLE IF NOT EXISTS + PRAGMA-guarded ALTERs), so calling it here is safe.
-init_db()
+# (CREATE TABLE IF NOT EXISTS + PRAGMA-guarded ALTERs), so calling it is safe.
+# v2.1: the call now sits at the bottom of the file, after the helpers init_db() uses are defined.
 
 def get_setting(k, default=""):
     row = db().execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
@@ -152,6 +185,31 @@ def fnum(v, default=None):
         if v is None or v == "": return default
         return float(str(v).replace(",", "").replace("$", ""))
     except Exception: return default
+
+# v2.1: property columns that are REAL/INTEGER in the schema. A typed "$410,000" / "250k" used to be
+# stored as literal text and then crashed every property tab with a 500 error.
+NUMERIC_PROP_FIELDS = (
+    "list_price", "beds", "baths", "sqft", "lot_sqft", "year_built", "hoa_dues", "as_is_value", "arv",
+    "repairs", "purchase_price", "inspection_days", "buy_it_now", "min_offer", "wholesale_contract_amt",
+    "emd_ab", "emd_bc", "loan_balance", "loan_rate", "loan_piti", "dispo_asking", "dispo_bin", "dispo_min",
+    "dispo_inspection_days", "est_zillow", "est_realtor", "est_redfin", "est_county", "tax_market",
+    "tax_assessed", "tax_taxable", "tax_amount")
+
+def clean_num(v):
+    """Typed money/number text -> float, or None when blank/unreadable. Accepts $ , % spaces and k/m suffix."""
+    if v is None: return None
+    if isinstance(v, (int, float)):
+        return float(v) if math.isfinite(float(v)) else None
+    t = str(v).strip().lower().replace("$", "").replace(",", "").replace("%", "").replace(" ", "")
+    if not t: return None
+    mult = 1
+    if t.endswith("k"): mult, t = 1000, t[:-1]
+    elif t.endswith("m"): mult, t = 1000000, t[:-1]
+    try:
+        x = float(t) * mult
+        return x if math.isfinite(x) else None
+    except ValueError:
+        return None
 
 def _s(v):
     """Safe string for pandas values (None / NaN / pd.NA -> '')."""
@@ -637,6 +695,8 @@ def compute_underwriting(strategy, raw_inp, prop):
     funded = cash_equity = debt_amt = debt_rows_service = 0.0
     paydown_y1 = 0.0
     points_fees = 0.0
+    carry_mo = 0.0          # v2.1: monthly cost of carrying funded debt (Fix & Flip profit)
+    piti_included = False   # v2.1: True only when a loan payment really contains taxes+insurance
     debt_lines = []
     for s in stack:
         amt = fnum(s.get("amount"), 0) or 0
@@ -649,6 +709,9 @@ def compute_underwriting(strategy, raw_inp, prop):
             pay, esc = _row_payment(s)
             debt_rows_service += pay + esc
             paydown_y1 += _paydown_y1(s)
+            if esc > 0 or (s.get("payment_type") == "fixed" and pay > 0): piti_included = True
+            if s.get("payment_type") == "fixed": carry_mo += pay + esc
+            else: carry_mo += amt * (fnum(s.get("rate"), 0) or 0) / 100 / 12 + esc
             lab = s.get("loan_type") or s.get("type") or "Loan"
             if s.get("preset") and s.get("preset") != lab: lab = f"{lab} · {s['preset']}"
             debt_lines.append({"label": lab, "payment": round(pay + esc)})
@@ -672,6 +735,7 @@ def compute_underwriting(strategy, raw_inp, prop):
             if v: md_addons[lab] = round(v)
             md_escrow += v
         md_payment = md_base + md_escrow
+        if md_payment > 0: piti_included = True
         paydown_y1 += _prin * 12
     debt_service = debt_rows_service + md_payment
     closing = fnum(inp.get("closing_costs"), 0) or 0
@@ -711,17 +775,22 @@ def compute_underwriting(strategy, raw_inp, prop):
         close_pct = fnum(inp.get("closing_pct"), 2) or 0
         comm_amt = sale * comm_pct / 100; close_amt = sale * close_pct / 100
         net = sale - comm_amt - close_amt
-        profit = net - total_project - holding_total
+        # v2.1: financing is a real cost of the flip: buy-side closing, loan points/fees and the interest
+        # (or fixed payment) carried while the project runs. Profit used to ignore all of it.
+        financing_carry = carry_mo * h_months
+        financing_total = financing_costs + financing_carry
+        profit = net - total_project - holding_total - financing_total
         # ReiSearch All-in Cost includes the sale costs (commission + seller closing) — Senisa fixture.
-        all_in = total_project + holding_total + comm_amt + close_amt
+        all_in = total_project + holding_total + financing_total + comm_amt + close_amt
         roi = round(profit / cash_in * 100, 1) if cash_in else None
         margin = round(profit / sale * 100, 1) if sale else None
         ann = round(profit / cash_in * 100 * 12 / h_months, 1) if cash_in and h_months else None
         def _flip(sale2, rehab2, hold2):
             n2 = sale2 * (1 - comm_pct / 100 - close_pct / 100)
             proj2 = price + rehab2 + appliances + furnishing
-            return {"sale": round(sale2), "all_in": round(proj2 + hold2 + sale2 * (comm_pct + close_pct) / 100),
-                    "net": round(n2 - proj2 - hold2)}
+            fin2 = financing_costs + carry_mo * (hold2 / holding_mo if holding_mo else h_months)
+            return {"sale": round(sale2), "all_in": round(proj2 + hold2 + fin2 + sale2 * (comm_pct + close_pct) / 100),
+                    "net": round(n2 - proj2 - hold2 - fin2)}
         scen = {"Downside (-10%)": _flip(sale * 0.9, rehab, holding_total),
                 "Base Case (0%)": _flip(sale, rehab, holding_total),
                 "Upside (+10%)": _flip(sale * 1.1, rehab, holding_total),
@@ -739,6 +808,7 @@ def compute_underwriting(strategy, raw_inp, prop):
         out.update({"sale_price": round(sale), "commission_pct": comm_pct, "closing_pct": close_pct,
                     "commission_amt": round(comm_amt), "closing_amt": round(close_amt),
                     "net_proceeds": round(net), "all_in": round(all_in), "profit": round(profit),
+                    "financing_carry": round(financing_carry), "financing_total": round(financing_total),
                     "roi": roi, "annualized_roi": ann, "margin_pct": margin,
                     "rule70_mao": round(arv * 0.70 - rehab), "scenarios": scen,
                     "score": fscore, "label": _score_label(fscore), "score_parts": parts, "penalties": [],
@@ -774,19 +844,19 @@ def compute_underwriting(strategy, raw_inp, prop):
     # baseline scores 93 with no such drag. The estimates therefore carry FLAGS
     # (transparency) but no score penalty; the genuinely-empty-expense penalty
     # (no utilities/maintenance at all) below is unchanged.
-    if debt_service == 0 and taxes_mo == 0:
+    if not piti_included and taxes_mo == 0:
         taxes_mo = prop_tax_mo or (round((price or arv) * 0.011 / 12) if (price or arv) else 0)
         taxes_est = taxes_mo > 0
         if taxes_est:
             flags.append("Taxes estimated — verify with county")
-    elif debt_service == 0 and _est_flag("taxes_est") and taxes_mo > 0:
+    elif not piti_included and _est_flag("taxes_est") and taxes_mo > 0:
         taxes_est = True
         flags.append("Taxes estimated — verify with county")
-    if debt_service == 0 and ins_mo == 0:
+    if not piti_included and ins_mo == 0:
         ins_mo = 180
         ins_est = True
         flags.append("Insurance estimated")
-    elif debt_service == 0 and _est_flag("insurance_est") and ins_mo > 0:
+    elif not piti_included and _est_flag("insurance_est") and ins_mo > 0:
         ins_est = True
         flags.append("Insurance estimated")
     # revenue
@@ -1059,14 +1129,21 @@ def uw_state(strategy, prop, saved_inp, ctx):
     if strategy != "Fix & Flip":
         fresh = saved_inp is None
         st["vacancy_pct"] = g("vacancy_pct", 15 if strategy == "Co-Living" else 5)
-        st["booking_days"] = g("booking_days", 10 if (fresh or strategy == "Co-Living") else 0)
-        st["service_fee_pct"] = g("service_fee_pct", 8 if (fresh or strategy == "Co-Living") else 0)
+        # v2.1: PadSplit booking fee (10 days) + 8% service fee exist ONLY for Co-Living. They used to be
+        # applied to every fresh rental panel (and double-charged Short Term, which has its own platform %).
+        st["booking_days"] = g("booking_days", 10 if strategy == "Co-Living" else 0)
+        st["service_fee_pct"] = g("service_fee_pct", 8 if strategy == "Co-Living" else 0)
         st["mgmt_fee_pct"] = g("mgmt_fee_pct", 0); st["mgmt_fee_basis"] = g("mgmt_fee_basis", "gross")
         # v1.5: a FRESH panel opens with ReiSearch's PadSplit expense template prefilled
         # (screenshot spec). Saved scenarios/drafts keep exactly what they stored.
-        template = {"electric_mo": 400, "water_mo": 80, "gas_mo": 50, "internet_mo": 70,
-                    "cleaning_mo": 120, "landscaping_mo": 100, "pest_mo": 50, "handyman_mo": 150,
-                    "property_manager_mo": 300, "turnover_reserve_mo": 0, "additional_insurance_mo": 0}
+        # v2.1: only Co-Living / Short Term get the cleaning + property-manager lines; a Long Term tenant
+        # pays utilities, so utilities start at $0 there. All fields stay editable.
+        _owner_utils = strategy in ("Co-Living", "Short Term", "Mid Term")
+        _hosted = strategy in ("Co-Living", "Short Term")
+        template = {"electric_mo": 400 if _owner_utils else 0, "water_mo": 80 if _owner_utils else 0,
+                    "gas_mo": 50 if _owner_utils else 0, "internet_mo": 70 if _owner_utils else 0,
+                    "cleaning_mo": 120 if _hosted else 0, "landscaping_mo": 100, "pest_mo": 50, "handyman_mo": 150,
+                    "property_manager_mo": 300 if _hosted else 0, "turnover_reserve_mo": 0, "additional_insurance_mo": 0}
         for k in ("electric_mo", "water_mo", "gas_mo", "internet_mo", "cleaning_mo",
                   "landscaping_mo", "pest_mo", "handyman_mo", "property_manager_mo",
                   "turnover_reserve_mo", "additional_insurance_mo", "taxes_mo", "insurance_mo", "hoa_mo"):
@@ -2866,8 +2943,11 @@ def job_demographics(pid):
 
 # ---------------------------------------------------------------- routes
 def get_prop(pid):
-    p = db().execute("SELECT * FROM properties WHERE id=?", (pid,)).fetchone()
-    if not p: abort(404)
+    row = db().execute("SELECT * FROM properties WHERE id=?", (pid,)).fetchone()
+    if not row: abort(404)
+    p = dict(row)
+    for k in NUMERIC_PROP_FIELDS:      # heal any text that already slipped into a numeric column
+        if isinstance(p.get(k), str): p[k] = clean_num(p[k])
     return p
 
 def all_boxes():
@@ -2954,7 +3034,8 @@ def property_page(pid):
         for f in EDITABLE:
             if f in request.form:
                 v = request.form.get(f)
-                sets.append(f"{f}=?"); args.append(v if v != "" else None)
+                v = clean_num(v) if f in NUMERIC_PROP_FIELDS else (v if v != "" else None)
+                sets.append(f"{f}=?"); args.append(v)
         if sets:
             args.append(pid); d.execute(f"UPDATE properties SET {','.join(sets)} WHERE id=?", args); d.commit()
             p = get_prop(pid)
@@ -3875,16 +3956,20 @@ def import_json():
 
 @app.template_filter("money")
 def money(v):
+    v = clean_num(v)
     return "Not found" if v is None else f"${v:,.0f}"
 
 @app.template_filter("num")
 def numf(v, dec=0):
+    v = clean_num(v)
     return "—" if v is None else f"{v:,.{dec}f}"
 
 @app.template_filter("jload")
 def jload(v):
     try: return json.loads(v) if v else {}
     except Exception: return {}
+
+init_db()
 
 if __name__ == "__main__":
     init_db()

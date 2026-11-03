@@ -120,7 +120,7 @@ select.inline{width:auto;display:inline-block}
 .segtools select{width:auto}
 .uw-grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
 @media(max-width:1000px){.uw-grid{grid-template-columns:1fr}}
-.uw-side{position:sticky;top:14px}
+.uw-side{position:sticky;top:14px;max-height:calc(100vh - 28px);overflow-y:auto}
 details.acc{border:1px solid var(--line);border-radius:10px;margin:0 0 10px;background:#fff}
 details.acc>summary{list-style:none;display:flex;align-items:center;gap:10px;padding:11px 14px;font-size:14px;color:var(--ink)}
 details.acc>summary::-webkit-details-marker{display:none}
@@ -425,4 +425,13 @@ button:focus-visible, a:focus-visible {
 .viewpane.on, .uw-panel.on, .sidepane.on { animation: pdaFade .22s ease; }
 @media (prefers-reduced-motion: reduce) {
   .btn, .ccard, .viewpane.on, .uw-panel.on, .sidepane.on { transition: none; animation: none; transform: none; }
+}
+
+/* v2.1 mobile menu: the left nav is hidden under 900px, so give phones a top bar with a menu button */
+.mobilebar{display:none}
+@media(max-width:900px){
+ .mobilebar{display:flex;align-items:center;gap:10px;background:#0f2233;color:#fff;padding:10px 14px;position:sticky;top:0;z-index:60}
+ .mobilebar button{background:none;border:1px solid #3b556e;color:#fff;border-radius:8px;padding:5px 11px;font-size:18px;cursor:pointer}
+ .sidenav{position:fixed;top:0;left:0;bottom:0;z-index:70;width:240px;overflow:auto}
+ body.navopen .sidenav{display:block}
 }

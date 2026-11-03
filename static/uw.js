@@ -133,6 +133,7 @@
     var hMonths = hUnit === "Months" ? hPeriod : hPeriod / 30;
     var holdingMo = N(s.holding_mo), holdingTotal = holdingMo * hMonths;
     var funded = 0, cashEquity = 0, debtAmt = 0, debtRows = 0, paydownY1 = 0, pointsFees = 0;
+    var carryMo = 0, pitiIncluded = false; /* v2.1 (mirror of app.py) */
     var debtLines = [];
     (s.funding || []).forEach(function (f) {
       var amt = N(f.amount); funded += amt;
@@ -141,6 +142,9 @@
       else {
         debtAmt += amt;
         var rp = rowPayment(f); debtRows += rp.pay + rp.esc;
+        if (rp.esc > 0 || (f.payment_type === "fixed" && rp.pay > 0)) pitiIncluded = true;
+        if (f.payment_type === "fixed") carryMo += rp.pay + rp.esc;
+        else carryMo += amt * N(f.rate) / 100 / 12 + rp.esc;
         paydownY1 += paydownY1For(f);
         var lab = f.loan_type || f.type || "Loan";
         if (f.preset && f.preset !== lab) lab += " · " + f.preset;
@@ -160,6 +164,7 @@
         var v = N(s[kv[0]]); if (v) mdAddons[kv[1]] = Math.round(v); mdEscrow += v;
       });
       mdPayment = mdBase + mdEscrow;
+      if (mdPayment > 0) pitiIncluded = true;
       paydownY1 += prin * 12;
     }
     var debtService = debtRows + mdPayment;
@@ -186,15 +191,18 @@
       var closePct = N(s.closing_pct) || 0; if (s.closing_pct === "" || s.closing_pct == null) closePct = 2;
       var commAmt = sale * commPct / 100, closeAmt = sale * closePct / 100;
       var net = sale - commAmt - closeAmt;
-      var profit = net - totalProject - holdingTotal;
-      var allIn = totalProject + holdingTotal + commAmt + closeAmt;
+      var financingCarry = carryMo * hMonths;
+      var financingTotal = financingCosts + financingCarry; /* v2.1: profit now includes financing */
+      var profit = net - totalProject - holdingTotal - financingTotal;
+      var allIn = totalProject + holdingTotal + financingTotal + commAmt + closeAmt;
       var roi = cashIn ? profit / cashIn * 100 : null;
       var margin = sale ? profit / sale * 100 : null;
       var ann = (cashIn && hMonths) ? profit / cashIn * 100 * 12 / hMonths : null;
       function flip(sale2, rehab2, hold2) {
         var n2 = sale2 * (1 - commPct / 100 - closePct / 100);
         var proj = price + rehab2 + appliances + furnishing;
-        return { sale: sale2, all_in: proj + hold2 + sale2 * (commPct + closePct) / 100, net: n2 - proj - hold2 };
+        var fin2 = financingCosts + carryMo * (holdingMo ? hold2 / holdingMo : hMonths);
+        return { sale: sale2, all_in: proj + hold2 + fin2 + sale2 * (commPct + closePct) / 100, net: n2 - proj - hold2 - fin2 };
       }
       var scen = { "Downside (-10%)": flip(sale * 0.9, rehab, holdingTotal),
         "Base Case (0%)": flip(sale, rehab, holdingTotal),
@@ -207,6 +215,7 @@
       var fscore = clamp(Math.round(parts["Profit margin (50%)"] + parts["ROI on cash (50%)"]), 0, 99);
       out.sale_price = sale; out.commission_amt = commAmt; out.closing_amt = closeAmt;
       out.net_proceeds = net; out.all_in = allIn; out.profit = profit; out.roi = roi;
+      out.financing_carry = financingCarry; out.financing_total = financingTotal;
       out.annualized_roi = ann; out.margin_pct = margin; out.rule70_mao = arv * 0.70 - rehab;
       out.scenarios = scen; out.score = fscore; out.label = scoreLabel(fscore);
       out.score_parts = parts; out.penalties = [];
@@ -229,20 +238,20 @@
     /* v1.7 (mirror of app.py): populated, flagged auto-estimates carry NO score
        penalty — they are labeled data in the field, not missing data (Garland
        clean-state root-cause: 80 vs ReiSearch 93; flags remain for transparency). */
-    if (debtService === 0 && taxesMo === 0) {
+    if (!pitiIncluded && taxesMo === 0) {
       taxesMo = propTaxMo || ((price || arv) ? Math.round((price || arv) * 0.011 / 12) : 0);
       if (taxesMo > 0) {
         taxesEst = true;
         flags.push("Taxes estimated — verify with county");
       }
-    } else if (debtService === 0 && estFlag("taxes_est") && taxesMo > 0) {
+    } else if (!pitiIncluded && estFlag("taxes_est") && taxesMo > 0) {
       taxesEst = true;
       flags.push("Taxes estimated — verify with county");
     }
-    if (debtService === 0 && insMo === 0) {
+    if (!pitiIncluded && insMo === 0) {
       insMo = 180; insEst = true;
       flags.push("Insurance estimated");
-    } else if (debtService === 0 && estFlag("insurance_est") && insMo > 0) {
+    } else if (!pitiIncluded && estFlag("insurance_est") && insMo > 0) {
       insEst = true;
       flags.push("Insurance estimated");
     }
@@ -832,7 +841,7 @@
         R("Seller Closing Costs", M(r.closing_amt)); R("Net Sale Proceeds", M(r.net_proceeds));
         H("Costs");
         R("Purchase Price", M(r.purchase_price)); R("Rehab", M(r.rehab));
-        R("Holding Costs", M(r.holding_cost)); R("All-in Cost", M(r.all_in));
+        R("Holding Costs", M(r.holding_cost)); R("Financing (closing, points, interest)", M(r.financing_total || 0)); R("All-in Cost", M(r.all_in));
         H("Cash & Capital");
         R("Total Uses", M(r.uses)); R("Funding Added", M(r.funded)); R("Cash Needed", M(r.cash_in));
         H("Return Metrics");
