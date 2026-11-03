@@ -676,10 +676,14 @@ def canon_inputs(strategy, inp, prop):
 # 0..100. The total is computed from UNROUNDED factor scores — Senisa
 # proves it: its displayed factors average exactly 84.5 yet ReiSearch shows
 # 84, because its CF/room sits between knots at 64.6 unrounded. Cap rate
-# scores percent x 10 capped at 100 (measured 8.9->89, 8.6->86, 14.9->100);
-# Cash-on-cash uses the same percent x 10 line — its only measured point
-# (-27.7% -> 0) sits on it, so the line beyond that point is an
-# extrapolation on the cap-rate pattern, flagged unverified.
+# scores percent x 10 capped at 100 (measured 8.9->89, 8.6->86, 14.9->100).
+# v3.0 (Pass #3, 2026-11-03 evening): Cash-on-cash does NOT use that line —
+# it is REFUTED at CoC 14.5% (the line gives 100; ReiSearch scores 93).
+# CoC is now a piecewise-linear curve through the three measured anchors
+# (-27.7% -> 0, 14.5% -> 93, 49.0% -> 100 — all Hard Money states at Cash
+# Needed $6,397), reproducing the published totals 15/41/54 with the other
+# factors on the v2.8 curves. Still FLAGGED: a 3-anchor curve — the
+# segments between anchors are interpolation, not measurement.
 # v2.8 REFIT (evening measurement pass 2026-11-03, research/
 # reisearch-measurement-2026-11-03-evening.md): the curves are now
 # piecewise-linear through EVERY published (value -> displayed score)
@@ -705,6 +709,7 @@ _SCORE_CURVES = {
     "ds": [(-288.78, 0), (-126.07, 0), (-106.47, 0), (-50.63, 0), (-32.95, 14),
            (-0.63, 39), (49.92, 57), (124.8, 81), (125.83, 81), (130.62, 83),
            (172.02, 93), (589.04, 100), (626.54, 100)],
+    "coc": [(-27.7, 0), (14.5, 93), (49.0, 100)],
 }
 
 def _pw_curve(x, knots):
@@ -742,7 +747,7 @@ def score_factors(m):
          "score": 100.0 if dscr_val is None else _pw_curve(dscr_val, _SCORE_CURVES["dscr"])},
         {"key": "coc", "name": "Cash-on-cash", "weight": 20,
          "value": "No data" if coc_val is None else _fmt_pct1(coc_val * 100),
-         "score": None if coc_val is None else max(0.0, min(100.0, coc_val * 1000))},
+         "score": None if coc_val is None else _pw_curve(coc_val * 100, _SCORE_CURVES["coc"])},
         {"key": "be", "name": "Break-even occupancy", "weight": 12,
          "value": _fmt_pct1(m.get("breakeven", 0) * 100),
          "score": _pw_curve(m.get("breakeven", 0) * 100, _SCORE_CURVES["be"])},
