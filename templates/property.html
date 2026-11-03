@@ -857,7 +857,8 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% endif %}
 
 {% if tab=='demographics' %}
-<div class="card"><h2>Demographics — {{ ('ZIP ' ~ p.zip) if dscope=='zip' else (p.city ~ ' (city)') }}</h2>
+<div class="card"><h2>Demographic Overview — {{ ('ZIP ' ~ p.zip) if dscope=='zip' else (p.city ~ ' (city)') }}</h2>
+<p class="small muted" style="margin-top:2px">{{ p.city }}, {{ p.state }} {{ p.zip }}</p>
 {% if demo_error %}<div class="notice err"><b>Last refresh failed.</b> {{ demo_error }}{% if demo %} The data below (pulled {{ p.demo_date or demo.date }}) was <b>not</b> overwritten.{% endif %}
 <form method="post" action="{{ url_for('dismiss_data_error', pid=p.id) }}" style="display:inline;margin-left:8px"><input type="hidden" name="which" value="demo"><button class="btn sm sec">Dismiss</button></form></div>{% endif %}
 {% if not demo %}{% if job and job.kind=='demographics' and job.status=='running' %}<div data-demo-loading><p>⏳ <b>Loading demographics…</b> Pulling US Census ACS data for ZIP {{ p.zip }} from the Census Reporter API (free — no key required). This tab refreshes itself when the data lands, usually in under a minute.</p></div>
@@ -868,27 +869,32 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% if demo_scope_fallback %}<div class="notice"><b>City scope not available for {{ p.city }}.</b> No Census place data could be resolved for this city, so this tab is showing <b>ZIP {{ p.zip }}</b> figures — labeled as ZIP scope, never passed off as city data.</div>{% endif %}
 {% if dgeo %}<p class="small muted">Scope shown: <b>{{ dgeo.scope_label or (('ZIP ' ~ p.zip) if dscope=='zip' else (p.city ~ ' (city)')) }}</b>{% if dgeo.geoid %} · Census geography <b>{{ dgeo.geoid }}</b>{% endif %} · {{ demo.source }}</p>{% endif %}
 <div class="scopetabs">
-<a class="btn sm {{ 'blue' if dscope=='zip' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='zip') }}">ZIP {{ p.zip }}</a>
 {% if demo.city %}<a class="btn sm {{ 'blue' if dscope=='city' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='city') }}">{{ p.city }} (city)</a>{% endif %}
+<a class="btn sm {{ 'blue' if dscope=='zip' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='zip') }}">ZIP {{ p.zip }}</a>
 {% if dgeo %}<span class="small muted" style="margin-left:8px">{{ dgeo.name }}</span>{% endif %}
 </div>
 {% if dgeo %}
 <div class="demogrid">
-<div class="dcard"><h4>Housing — Tenure</h4>
+<div class="dcard" data-dblock="home_value"><h4>Median Home Value</h4>
+<p class="bignum">{{ dgeo.median_home_value|money }}</p>
 {% if dgeo.owner_pct is not none %}<div class="donutwrap"><svg viewBox="0 0 84 84" class="donut"><circle cx="42" cy="42" r="34" fill="none" stroke="#e5e7eb" stroke-width="12"/><circle cx="42" cy="42" r="34" fill="none" stroke="#2563eb" stroke-width="12" stroke-dasharray="{{ (dgeo.owner_pct / 100 * 213.63)|round(1) }} 213.63" transform="rotate(-90 42 42)"/><text x="42" y="46" text-anchor="middle" font-size="12" font-weight="700">{{ dgeo.owner_pct }}%</text></svg>
-<p class="small">Owner-occupied <b>{{ dgeo.owner_pct }}%</b><br>Renter-occupied <b>{{ dgeo.renter_pct }}%</b></p></div>{% else %}<p class="muted">Not found</p>{% endif %}
-<div class="kv"><div><span>Median home value</span><b>{{ dgeo.median_home_value|money }}</b>{% if dgeo.change and dgeo.change.home_value_pct is not none %}<span class="small {{ 'up' if dgeo.change.home_value_pct >= 0 else 'dn' }}">{{ '▲' if dgeo.change.home_value_pct >= 0 else '▼' }} {{ dgeo.change.home_value_pct }}% vs prior ACS vintage</span>{% endif %}</div>
-<div><span>Median rent</span><b>{{ dgeo.median_rent|money }}</b>{% if dgeo.change and dgeo.change.rent_pct is not none %}<span class="small {{ 'up' if dgeo.change.rent_pct >= 0 else 'dn' }}">{{ '▲' if dgeo.change.rent_pct >= 0 else '▼' }} {{ dgeo.change.rent_pct }}% vs prior ACS vintage</span>{% endif %}</div></div>
+<p class="small">Owner-occupied <b>{{ dgeo.owner_pct }}%</b></p></div>{% else %}<p class="muted">Owner-occupied share: Not found</p>{% endif %}
+{% if dgeo.change and dgeo.change.home_value_pct is not none %}<p class="small {{ 'up' if dgeo.change.home_value_pct >= 0 else 'dn' }}">{{ '▲' if dgeo.change.home_value_pct >= 0 else '▼' }} {{ dgeo.change.home_value_pct }}% vs prior ACS vintage</p>{% endif %}
 </div>
-<div class="dcard"><h4>Income Distribution</h4>
+<div class="dcard" data-dblock="rent"><h4>Median Rent</h4>
+<p class="bignum">{{ dgeo.median_rent|money }}</p>
+{% if dgeo.renter_pct is not none %}<p class="small">Renter-occupied <b>{{ dgeo.renter_pct }}%</b></p>{% else %}<p class="muted">Renter-occupied share: Not found</p>{% endif %}
+{% if dgeo.change and dgeo.change.rent_pct is not none %}<p class="small {{ 'up' if dgeo.change.rent_pct >= 0 else 'dn' }}">{{ '▲' if dgeo.change.rent_pct >= 0 else '▼' }} {{ dgeo.change.rent_pct }}% vs prior ACS vintage</p>{% endif %}
+</div>
+<div class="dcard" data-dblock="income"><h4>Income Distribution</h4>
 {% for b in dgeo.income_buckets %}<div class="bar-row"><span>{{ b.label }}</span><div class="bar-track"><div class="bar-fill" style="width:{{ b.pct }}%;background:#2563eb"></div></div><b>{{ b.pct }}%</b></div>{% else %}<p class="muted">Not found</p>{% endfor %}
 <p class="small muted">Median household income <b>{{ dgeo.median_income|money }}</b> · share of households per bracket</p>
 </div>
-<div class="dcard"><h4>Unemployment Rate</h4>
+<div class="dcard" data-dblock="unemployment"><h4>Unemployment Rate</h4>
 {% if dgeo.unemployment_pct is not none %}<svg viewBox="0 0 100 58" class="gauge"><path d="M 10 52 A 40 40 0 0 1 90 52" fill="none" stroke="#e5e7eb" stroke-width="10"/><path d="M 10 52 A 40 40 0 0 1 90 52" fill="none" stroke="#d97706" stroke-width="10" stroke-dasharray="{{ (dgeo.unemployment_pct / 100 * 125.66)|round(1) }} 125.66"/><text x="50" y="48" text-anchor="middle" font-size="14" font-weight="700">{{ dgeo.unemployment_pct }}%</text></svg>
 <p class="small muted">Share of the labor force unemployed (ACS B23025)</p>{% else %}<p class="muted">Not found</p>{% endif %}
 </div>
-<div class="dcard"><h4>Population</h4>
+<div class="dcard" data-dblock="population"><h4>Population</h4>
 <p class="bignum">{{ dgeo.population|num }}</p>
 {% if trend_svg %}<svg viewBox="0 0 300 50" preserveAspectRatio="none" class="trendchart" style="width:100%;height:64px"><polyline points="{{ trend_svg.points }}" fill="none" stroke="#ea580c" stroke-width="2"/></svg>
 <p class="small muted">{{ trend_svg.first_year }}: {{ trend_svg.first_pop|num }} → {{ trend_svg.last_year }}: {{ trend_svg.last_pop|num }} (ACS 5-year vintages)</p>
@@ -897,13 +903,13 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% endif %}
 </div>
 </div>
-{% if dgeo.race %}<h3>Race &amp; Ethnicity</h3>
-<div class="racewrap">{% set ns = namespace(g='') %}{% for r in dgeo.race %}{% set ns.g = ns.g ~ r.color ~ ' ' ~ r.from ~ '% ' ~ r.to ~ '%,' %}{% endfor %}
-<div class="racedonut" style="background:conic-gradient({{ ns.g[:-1] }})"></div>
-<table class="racetab"><tr><th>Group</th><th>Residents</th><th>Share</th></tr>
-{% for r in dgeo.race %}<tr><td><span class="swatch" style="background:{{ r.color }}"></span>{{ r.label }}</td><td>{{ r.count|num }}</td><td>{{ r.pct }}%</td></tr>{% endfor %}</table></div>
+{% if dgeo.race %}<h3>Population by Race</h3>
+<table class="racetab"><tr><th>Race</th><th>Percentage</th><th>Population</th></tr>
+{% for r in dgeo.race %}<tr><td><span class="swatch" style="background:{{ r.color }}"></span>{{ r.label }}</td><td>{{ r.pct }}%</td><td>{{ r.count|num }}</td></tr>{% endfor %}</table>
 <p class="small muted">Shares of total population. Hispanic or Latino (any race) comes from ACS B03003; the other groups from B02001 — the two tables overlap by design.</p>{% endif %}
-{% if dgeo.pyramid %}<h3>Age &amp; Sex</h3>
+{% if dgeo.pyramid %}<h3>Population by Age</h3>
+{% set mt = dgeo.pyramid|sum(attribute='male') %}{% set ft = dgeo.pyramid|sum(attribute='female') %}
+<p class="small">Male <b>{{ mt|num }}</b> ({{ (mt / (mt + ft) * 100)|round(1) }}%) · Female <b>{{ ft|num }}</b> ({{ (ft / (mt + ft) * 100)|round(1) }}%)</p>
 <div class="pyr">{% for b in dgeo.pyramid %}<div class="pyrrow"><div class="pyrl"><span>{{ b.male|num }}</span><div class="pyrbar m" style="width:{{ b.male_w }}%"></div></div><span class="pyrb">{{ b.band }}</span><div class="pyrr"><div class="pyrbar f" style="width:{{ b.female_w }}%"></div><span>{{ b.female|num }}</span></div></div>{% endfor %}
 <p class="small muted">Male (left, blue) · Female (right, pink) — residents per age band (ACS B01001; the 80+ band totals the source's 80–84 and 85+ cells)</p></div>{% endif %}
 <h3>All figures</h3>
@@ -1037,28 +1043,41 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% endif %}
 
 {% if tab=='market' %}
-<div class="card"><h2>Market Data — ZIP {{ p.zip }}</h2>
+<div class="card"><h2>{{ p.zip }} Market Overview</h2>
+<p class="small muted" style="margin-top:2px">Comprehensive market analysis for ZIP code {{ p.zip }}, {{ p.city }}, {{ p.state }} — computed from your stored HomeHarvest sold comps (free data)</p>
 {% if market %}
 <div class="mkt-filters"><span class="small muted">Property type:</span>
-{% for mt in ['All','Single Family','Condo','Townhouse'] %}<a class="btn sm {{ 'blue' if market.mtype==mt else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='market', mtype=mt, mrange=market.mrange) }}">{{ mt }}{% if mt=='All' %} ({{ market.type_counts.values()|sum }}){% elif market.type_counts.get(mt) %} ({{ market.type_counts.get(mt) }}){% endif %}</a>{% endfor %}
-<span class="small muted" style="margin-left:12px">Trend range:</span>
-{% for mr in ['1Y','3Y','5Y'] %}<a class="btn sm {{ 'blue' if market.mrange==mr else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='market', mtype=market.mtype, mrange=mr) }}">{{ mr }}</a>{% endfor %}
+{% for mt in ['All','Single Family','Condo','Townhouse'] %}<a class="btn sm {{ 'blue' if market.mtype==mt else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='market', mtype=mt, mrange=market.mrange) }}">{{ 'All Types' if mt=='All' else mt }}{% if mt=='All' %} ({{ market.type_counts.values()|sum }}){% elif market.type_counts.get(mt) %} ({{ market.type_counts.get(mt) }}){% endif %}</a>{% endfor %}
 </div>
 {% if market.untyped %}<p class="small muted" style="margin:4px 0 10px">Note: {{ market.untyped }} stored comp(s) were pulled before property types were recorded and are counted as Single Family — re-pull comps (Comparables tab) to record their real types and sharpen this filter.</p>{% endif %}
-<div class="kv">
-<div><span>Sold comps in set</span><b>{{ market.count }}</b></div>
-<div><span>Median sale price</span><b>{{ market.median_price|money }}</b></div>
-<div><span>Median $/sqft</span><b>${{ market.median_ppsf|num }}</b></div>
-<div><span>Median DOM</span><b>{{ market.median_dom|num }}</b></div></div>
-<p class="small muted">Source: {{ market.source }} · computed {{ market.date }} from the comps stored on this property — always date-stamped.</p>
-<h3>Price trend (median sale price by month)</h3>
+<p class="small muted">Last updated: {{ market.date }} · Source: {{ market.source }} — computed from the comps stored on this property.</p>
+<div class="kv mktgrid">
+<div data-mcard="sale_price"><span>Median Sale Price</span><b>{{ market.median_price|money }}</b></div>
+<div data-mcard="list_price"><span>Median Listing Price</span><b class="nf">Not found</b></div>
+<div data-mcard="sold_ppsf"><span>Sold $/Sq Ft</span><b>${{ market.median_ppsf|num }}</b></div>
+<div data-mcard="listed_ppsf"><span>Listed $/Sq Ft</span><b class="nf">Not found</b></div>
+<div data-mcard="homes_sold"><span>Homes Sold</span><b>{{ market.count }}</b></div>
+<div data-mcard="pending"><span>Pending Sales</span><b class="nf">Not found</b></div>
+<div data-mcard="new_listings"><span>New Listings</span><b class="nf">Not found</b></div>
+<div data-mcard="active_listings"><span>Active Listings</span><b class="nf">Not found</b></div>
+<div data-mcard="dom"><span>Days on Market</span><b>{{ market.median_dom|num }}</b></div>
+<div data-mcard="sale_to_list"><span>Sale-to-List Ratio</span><b class="nf">Not found</b></div>
+<div data-mcard="above_list"><span>Sold Above List</span><b class="nf">Not found</b></div>
+<div data-mcard="off_market"><span>Off-Market &lt;2 Wks</span><b class="nf">Not found</b></div>
+</div>
+<p class="small muted">Cards marked "Not found" need data the free sources don't store for this property — original listing prices, pending/active listing status, or time-to-pending. Nothing is estimated to fill them.</p>
+<h3>Price Trend <span class="small muted" style="margin-left:10px">Range:</span> {% for mr in ['1Y','3Y','5Y'] %}<a class="btn sm {{ 'blue' if market.mrange==mr else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='market', mtype=market.mtype, mrange=mr) }}">{{ mr }}</a>{% endfor %}</h3>
 {% if market.spark %}<svg viewBox="0 0 300 40" preserveAspectRatio="none" class="trendchart" style="width:100%;height:90px"><polyline points="{{ market.spark }}" fill="none" stroke="#ea580c" stroke-width="2"/></svg>
-<p class="small muted">{{ market.trend[0].month }} → {{ market.trend[-1].month }} · low {{ market.trend_min|money }} · high {{ market.trend_max|money }} (range buttons change the chart + table only; the cards above always use the full filtered set)</p>{% endif %}
-<table><tr><th>Month</th><th>Median</th><th>Sales</th></tr>
+<p class="small muted">Median Sale Price by month · {{ market.trend[0].month }} → {{ market.trend[-1].month }} · low {{ market.trend_min|money }} · high {{ market.trend_max|money }} (range buttons change the chart + table only; the cards above always use the full filtered set)</p>{% endif %}
+<p class="small muted">Median Listing Price series: Not found — no listing prices are stored in the free data, so only the sale-price series is charted.</p>
+<table><tr><th>Month</th><th>Median Sale Price</th><th>Sales</th></tr>
 {% for t in market.trend %}<tr><td>{{ t.month }}</td><td>{{ t.median|money }}</td><td>{{ t.count }}</td></tr>{% endfor %}</table>
-<h3>Nearby ZIP comparison</h3>
-<table><tr><th>ZIP</th><th>Median price</th><th>Median DOM</th><th>Sold comps</th></tr>
-{% for z in market.nearby %}<tr{% if z.you %} style="background:#eff6ff"{% endif %}><td><b>{{ z.zip }}</b>{% if z.you %} <span class="badge cash">YOU</span>{% endif %}</td><td>{{ z.median_price|money }}</td><td>{{ z.median_dom|num }}</td><td>{{ z.n }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No ZIP data in the filtered set.</td></tr>{% endfor %}</table>
+<h3>Market Snapshot</h3>
+<div data-snapshot><p class="small muted">Key insights for this ZIP{% if market.mtype != 'All' %} · property-type filter: {{ market.mtype }}{% endif %}</p>
+{% for s in market.snapshot %}<p style="margin:4px 0">{{ s }}</p>{% endfor %}</div>
+<h3>Nearby ZIP Comparison</h3>
+<div data-nearby-zip><table><tr><th>ZIP CODE</th><th>MEDIAN SALE PRICE</th><th>DAYS ON MARKET</th><th>ACTIVE LISTINGS</th></tr>
+{% for z in market.nearby %}<tr{% if z.you %} style="background:#eff6ff"{% endif %}><td><b>{{ z.zip }}</b>{% if z.you %} <span class="badge cash">YOU</span>{% endif %}</td><td>{{ z.median_price|money }}</td><td>{{ z.median_dom|num }}</td><td>Not found</td></tr>{% else %}<tr><td colspan="4" class="muted">No ZIP data in the filtered set.</td></tr>{% endfor %}</table></div>
 {% else %}<p class="muted">Not found — pull comps first (Comparables tab); market stats are computed from them.</p>{% endif %}
 <h3>Rent benchmark</h3>
 {% if rents %}{% set rs = rents|map(attribute='price')|list %}<p>Median asking rent nearby: <b>{{ (rs|sort)[rs|length//2]|money }}/mo</b> from {{ rents|length }} rental comps (HomeHarvest, pulled with comps). Long Term comp average (pinned/top-3): <b>{{ ltr.avg_rent|money }}/mo</b>. HUD Small Area FMR (SAFMR) benchmark for this ZIP: <b>not loaded</b> — the app does not fetch HUD's SAFMR file, so no HUD figure is shown rather than an invented one. The Affordable Housing view uses the labeled below-median-rent proxy described there instead.</p>

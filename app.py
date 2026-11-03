@@ -3275,7 +3275,25 @@ def property_page(pid):
             zp = sorted(c["price"] for c in cs if c["price"]); zd = sorted(c["dom"] for c in cs if c["dom"])
             nearby.append({"zip": z, "median_price": med(zp), "median_dom": med(zd), "n": len(cs), "you": z == p["zip"]})
         nearby.sort(key=lambda r: (not r["you"], -r["n"]))
+        # v2.6 Market Snapshot: insights computed ONLY from the stored set
+        # (no editorializing, no outside figures). ReiSearch's own snapshot
+        # block is a "COMING SOON" placeholder; ours carries real computed
+        # statements or nothing.
+        snap = []
+        if med(prices) is not None:
+            snap.append(f"Median sale price {money(med(prices))} across {len(msold)} stored sold "
+                        f"comps in ZIP {p['zip']}" + (f" (property-type filter: {mtype})" if mtype != "All" else "") + ".")
+        if len(trend_all) >= 2 and trend_all[0]["median"]:
+            _f, _l = trend_all[0], trend_all[-1]
+            _chg = (_l["median"] - _f["median"]) / _f["median"] * 100
+            snap.append(f"Median sale price moved from {money(_f['median'])} ({_f['month']}) to "
+                        f"{money(_l['median'])} ({_l['month']}) — {'+' if _chg >= 0 else ''}{_chg:.1f}% over the stored trend window.")
+        if med(doms) is not None:
+            snap.append(f"Median days on market: {med(doms):g} (of the stored sold comps with a recorded DOM).")
+        if med(ppsfs) is not None:
+            snap.append(f"Median sold price per sq ft: ${med(ppsfs):,.0f}.")
         market = {"count": len(msold), "median_price": med(prices), "median_ppsf": med(ppsfs), "median_dom": med(doms),
+                  "snapshot": snap,
                   "trend": trend, "spark": spark,
                   "trend_min": min([t["median"] for t in trend]) if trend else None,
                   "trend_max": max([t["median"] for t in trend]) if trend else None,
