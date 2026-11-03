@@ -107,20 +107,101 @@
      Band edges 75/65/55 are the round boundaries consistent with all 13
      labeled ReiSearch observations. */
   function scoreLabel(t) { return t >= 75 ? "Strong" : (t >= 65 ? "Good" : (t >= 55 ? "Fair" : "Weak")); }
+  /* v2.4: Deal Score = ReiSearch's MEASURED model (pass 2026-11-03, Addenda
+     2+3). Score = weighted average over the SCORED factors only (a "no data"
+     factor is EXCLUDED from the denominator), minus penalties, rounded
+     half-up. Per-factor curves are piecewise-linear through ReiSearch's
+     measured points; between points the simplest monotone interpolation,
+     beyond the end points the end segment's slope, all clamped 0..100.
+     The total is computed from UNROUNDED factor scores — Senisa proves it:
+     its displayed factors average exactly 84.5 yet ReiSearch shows 84,
+     because its CF/room sits between knots at 64.6 unrounded. Cap rate
+     scores percent x 10 capped at 100 (measured 8.9->89, 8.6->86,
+     14.9->100); Cash-on-cash uses the same percent x 10 line — its only
+     measured point (-27.7% -> 0) sits on it, so the line beyond that point
+     is an extrapolation on the cap-rate pattern, flagged unverified. */
+  var SCORE_CURVES = {
+    cf: [[-37, 0], [195, 64], [242, 73], [696, 100]],
+    dscr: [[0.95, 15], [1.39, 79], [1.53, 91], [1.83, 97]],
+    be: [[0, 100], [55.5, 95], [61.1, 89], [63.7, 86], [89.5, 32]],
+    ds: [[-106, 0], [126, 81], [131, 83], [172, 93], [627, 100]]
+  };
+  function pwCurve(x, knots) {
+    var n = knots.length, i = 0;
+    if (x <= knots[0][0]) i = 0;
+    else if (x >= knots[n - 1][0]) i = n - 2;
+    else { for (i = 0; i < n - 1; i++) { if (x >= knots[i][0] && x <= knots[i + 1][0]) break; } }
+    var x0 = knots[i][0], y0 = knots[i][1], x1 = knots[i + 1][0], y1 = knots[i + 1][1];
+    return clamp(y0 + (x - x0) * (y1 - y0) / (x1 - x0), 0, 100);
+  }
+  function roundHalfUp(x) { return Math.floor(x + 0.5); }
+  function fmtMoney0(x) {
+    return (x < 0 ? "−$" : "$") + roundHalfUp(Math.abs(x)).toLocaleString("en-US") + "/mo";
+  }
+  function fmtPct1(x) {
+    if (!x) return "0%";
+    return (x < 0 ? "−" : "") + (roundHalfUp(Math.abs(x) * 10) / 10).toFixed(1) + "%";
+  }
+  function scoreFactors(m) {
+    /* m: cf_per_room, dscr_val (null = no debt -> scored 100, "No debt"),
+       coc_val (fraction, null = no data -> EXCLUDED), cap_rate (fraction),
+       breakeven (fraction), downside_cf_per_room. */
+    return [
+      { key: "cf", name: "Cash flow per room", weight: 25, value: fmtMoney0(m.cf_per_room),
+        score: pwCurve(m.cf_per_room, SCORE_CURVES.cf) },
+      { key: "dscr", name: "DSCR", weight: 20,
+        value: m.dscr_val === null ? "No debt" : (Math.round(m.dscr_val * 100) / 100).toFixed(2),
+        score: m.dscr_val === null ? 100 : pwCurve(m.dscr_val, SCORE_CURVES.dscr) },
+      { key: "coc", name: "Cash-on-cash", weight: 20,
+        value: m.coc_val === null ? "No data" : fmtPct1(m.coc_val * 100),
+        score: m.coc_val === null ? null : clamp(m.coc_val * 1000, 0, 100) },
+      { key: "be", name: "Break-even occupancy", weight: 12, value: fmtPct1(m.breakeven * 100),
+        score: pwCurve(m.breakeven * 100, SCORE_CURVES.be) },
+      { key: "ds", name: "Downside cash flow per room", weight: 8, value: fmtMoney0(m.downside_cf_per_room),
+        score: pwCurve(m.downside_cf_per_room, SCORE_CURVES.ds) },
+      { key: "cap", name: "Cap rate", weight: 15, value: fmtPct1(m.cap_rate * 100),
+        score: clamp(m.cap_rate * 1000, 0, 100) }
+    ];
+  }
   function scoreRental(m, penalties) {
-    function cs(x, t) { return t ? clamp((x / t) * 100, 0, 100) : 0; }
-    var parts = {
-      "Cash flow / room (25%)": Math.round(0.25 * cs(m.cf_per_room, 300) * 10) / 10,
-      "DSCR (20%)": Math.round(0.20 * cs(m.dscr, 1.5) * 10) / 10,
-      "Cash-on-cash (20%)": Math.round(0.20 * cs(m.coc, 0.25) * 10) / 10,
-      "Cap rate (15%)": Math.round(0.15 * cs(m.cap_rate, 0.10) * 10) / 10,
-      "Break-even occupancy (12%)": Math.round(0.12 * clamp((1.3 - m.breakeven) / 0.6 * 100, 0, 100) * 10) / 10,
-      "Downside cash flow (8%)": Math.round(0.08 * (m.downside_cf > 0 ? 100 : (m.downside_cf === 0 ? 50 : 10)) * 10) / 10
-    };
-    var total = 0; Object.keys(parts).forEach(function (k) { total += parts[k]; });
+    var factors = scoreFactors(m);
+    var sw = 0, ss = 0, parts = {};
+    factors.forEach(function (fc) {
+      if (fc.score === null) return;
+      sw += fc.weight; ss += fc.weight * fc.score;
+      parts[fc.name + " (" + fc.weight + "%)"] = Math.round(fc.score * 10) / 10;
+    });
+    var total = sw ? ss / sw : 0;
     penalties.forEach(function (p) { total -= p.points; });
-    total = clamp(Math.round(total), 1, 99);
-    return { score: total, label: scoreLabel(total), parts: parts, penalties: penalties };
+    total = clamp(roundHalfUp(total), 1, 99);
+    return { score: total, label: scoreLabel(total), parts: parts, factors: factors, penalties: penalties };
+  }
+  /* v2.4 note logic, derived from ReiSearch's five measured notes (Addenda
+     2+3): strongest = highest factor score, ties broken by the higher
+     weight (Cash: CF/room wins a four-way tie at 100 on weight 25;
+     Conventional: Cap rate beats Break-even at 89 on weight 15 > 12;
+     Hard Money weakest: CF/room wins a three-way tie at 0 on weight 25).
+     A "Weakest" is named only when the lowest scored factor is below 65
+     (Conventional's 64 is named; Senisa's 65 is not). */
+  function insightFromFactors(factors) {
+    /* Comparisons use the DISPLAYED (rounded) factor scores, as ReiSearch
+       does: Conventional's Break-even (88.96 unrounded) and Cap rate (88.80)
+       both display 89, and ReiSearch names Cap rate — the tie is broken by
+       weight; Senisa's CF/room (64.6 unrounded) displays 65 and ReiSearch
+       reports "No weak spots", so the <65 weak test also reads the
+       displayed value. */
+    var scored = (factors || []).filter(function (f) { return f.score !== null; });
+    if (!scored.length) return "";
+    function rs(f) { return roundHalfUp(f.score); }
+    var strong = scored.slice().sort(function (a, b) { return (rs(b) - rs(a)) || (b.weight - a.weight); })[0];
+    var weak = scored.slice().sort(function (a, b) { return (rs(a) - rs(b)) || (b.weight - a.weight); })[0];
+    return "Strongest: " + strong.name + ". " +
+      (rs(weak) < 65 ? "Weakest: " + weak.name + "." : "No weak spots.");
+  }
+  function factorRow(fc) {
+    /* ReiSearch "View Details" row: factor value + integer factor score;
+       an excluded factor reads "No data". */
+    return fc.score === null ? "No data" : fc.value + " · " + roundHalfUp(fc.score);
   }
   function insightFromParts(parts) {
     function frac(item) { var m = /\((\d+)%\)/.exec(item[0]); var w = m ? parseFloat(m[1]) : 0; return w ? item[1] / w : 0; }
@@ -346,6 +427,15 @@
       cap_rate: value ? noi * 12 / value : 0,
       breakeven: (gross + other) ? (opex + debtService) / (gross + other) : 1.3,
       downside_cf: egi * 0.9 - opex - debtService };
+    /* v2.4 score-factor inputs (ReiSearch measured model): DSCR is a real
+       value or null (no debt scores 100, displayed "No debt"); Cash-on-cash
+       is scored on the cash needed BEYOND the buyer's own cash contribution
+       (cashIn - cashEquity = points/fees + closing + entry fee) and is
+       "no data" — excluded — when that is $0, exactly ReiSearch's rule
+       (Cash/Conventional/Seller excluded; Hard Money's $6,397 scored). */
+    metrics.dscr_val = debtService ? metrics.dscr : null;
+    metrics.coc_val = (cashIn - cashEquity) > 0 ? cf * 12 / (cashIn - cashEquity) : null;
+    metrics.downside_cf_per_room = roomsN ? metrics.downside_cf / roomsN : 0;
     function scenR(mult, noVac) {
       var e2;
       if (noVac && strat === "Short Term") { var occ = N(s.occupancy_pct); e2 = (occ ? gross / (occ / 100) : gross) + other; }
@@ -359,6 +449,19 @@
     }
     var scen2 = { "Downside (-10%)": scenR(0.9), "Base Case (0%)": scenR(1.0), "Upside (+10%)": scenR(1.1) };
     scen2["Fully Booked (0% vacancy)"] = scenR(1.0, true);
+    /* v2.4 penalty (measured, Addendum 2): ReiSearch docks 5 points when
+       operating expenses are an unrealistically low share of revenue, with
+       the note below. Measured firing at a 0% opex ratio (all four
+       presets) and — via Addendum 2's Electric reconciliation — at 3.7%;
+       measured ABSENT at Senisa's 35%. The exact threshold is UNMEASURED:
+       5% is the narrowest round bound consistent with both observations
+       and is flagged as unverified in the v24 build log. */
+    if (egi > 0 && opex / egi < 0.05) {
+      var _or = opex / egi * 100;
+      penalties.push({ points: 5, reason: "Operating expenses are only " +
+        (_or === 0 ? "0" : (Math.round(_or * 10) / 10)) +
+        "% of revenue, which looks unrealistically low." });
+    }
     var sc = scoreRental(metrics, penalties);
     var refiGross = arv ? Math.round(0.75 * arv) : 0;
     var refiNet = Math.max(0, refiGross - debtAmt);
@@ -378,8 +481,9 @@
     out.paydown_y1 = paydownY1; out.cashflow_y1 = cf * 12;
     out.total_return_y1 = cf * 12 + paydownY1;
     out.total_roi_y1 = cashIn ? (cf * 12 + paydownY1) / cashIn * 100 : null;
-    out.score = sc.score; out.label = sc.label; out.score_parts = sc.parts; out.penalties = sc.penalties; out.flags = flags;
-    out.insight = insightFromParts(sc.parts);
+    out.score = sc.score; out.label = sc.label; out.score_parts = sc.parts; out.score_factors = sc.factors;
+    out.penalties = sc.penalties; out.flags = flags;
+    out.insight = insightFromFactors(sc.factors);
     out.amenity_mo = amenityRows + N(s.amenities_mo);
     out.expenses_total = opex + debtService;
     return out;
@@ -930,7 +1034,11 @@
       function R(a, b) { rows.push(["R", a, b]); }
       H("Deal Score");
       R("Deal Score", r.score + " (" + (r.label || "") + ")");
-      Object.keys(r.score_parts || {}).forEach(function (k) { R("· " + k, r.score_parts[k]); });
+      if (r.score_factors && r.score_factors.length) {
+        r.score_factors.forEach(function (fc) { R("· " + fc.name + " (" + fc.weight + "%)", factorRow(fc)); });
+      } else {
+        Object.keys(r.score_parts || {}).forEach(function (k) { R("· " + k, r.score_parts[k]); });
+      }
       (r.penalties || []).forEach(function (p) { R("· Penalty −" + p.points, p.reason); });
       if (r.insight) R("Insight", r.insight);
       if (strat === "Fix & Flip") {
@@ -976,9 +1084,15 @@
     if (ins) {
       var ih = '<h4 class="det-h">Deal Score — ' + r.score + " (" + (r.label || "") + ")</h4>";
       if (r.insight) ih += '<p style="margin:4px 0 8px">' + r.insight + "</p>";
-      Object.keys(r.score_parts || {}).forEach(function (k) {
-        ih += '<div class="srow"><span>' + k + "</span><b>" + r.score_parts[k] + "</b></div>";
-      });
+      if (r.score_factors && r.score_factors.length) {
+        r.score_factors.forEach(function (fc) {
+          ih += '<div class="srow"><span>' + fc.name + " (" + fc.weight + "%)</span><b>" + factorRow(fc) + "</b></div>";
+        });
+      } else {
+        Object.keys(r.score_parts || {}).forEach(function (k) {
+          ih += '<div class="srow"><span>' + k + "</span><b>" + r.score_parts[k] + "</b></div>";
+        });
+      }
       (r.penalties || []).forEach(function (p) {
         ih += '<div class="srow"><span>Penalty −' + p.points + "</span><b>" + (p.reason || "") + "</b></div>";
       });

@@ -667,22 +667,106 @@ def canon_inputs(strategy, inp, prop):
         c["rooms_rows"] = norm
     return c
 
+# v2.4: Deal Score = ReiSearch's MEASURED model (pass 2026-11-03, Addenda
+# 2+3; mirrors uw.js exactly). Score = weighted average over the SCORED
+# factors only (a "no data" factor is EXCLUDED from the denominator), minus
+# penalties, rounded half-up. Per-factor curves are piecewise-linear through
+# ReiSearch's measured points; between points the simplest monotone
+# interpolation, beyond the end points the end segment's slope, clamped
+# 0..100. The total is computed from UNROUNDED factor scores — Senisa
+# proves it: its displayed factors average exactly 84.5 yet ReiSearch shows
+# 84, because its CF/room sits between knots at 64.6 unrounded. Cap rate
+# scores percent x 10 capped at 100 (measured 8.9->89, 8.6->86, 14.9->100);
+# Cash-on-cash uses the same percent x 10 line — its only measured point
+# (-27.7% -> 0) sits on it, so the line beyond that point is an
+# extrapolation on the cap-rate pattern, flagged unverified.
+_SCORE_CURVES = {
+    "cf": [(-37, 0), (195, 64), (242, 73), (696, 100)],
+    "dscr": [(0.95, 15), (1.39, 79), (1.53, 91), (1.83, 97)],
+    "be": [(0, 100), (55.5, 95), (61.1, 89), (63.7, 86), (89.5, 32)],
+    "ds": [(-106, 0), (126, 81), (131, 83), (172, 93), (627, 100)],
+}
+
+def _pw_curve(x, knots):
+    n = len(knots)
+    if x <= knots[0][0]: i = 0
+    elif x >= knots[-1][0]: i = n - 2
+    else:
+        i = 0
+        while not (knots[i][0] <= x <= knots[i + 1][0]): i += 1
+    x0, y0 = knots[i]; x1, y1 = knots[i + 1]
+    return max(0.0, min(100.0, y0 + (x - x0) * (y1 - y0) / (x1 - x0)))
+
+def _rhu(x):
+    return math.floor(x + 0.5)
+
+def _fmt_money0(x):
+    return ("−$" if x < 0 else "$") + f"{_rhu(abs(x)):,}" + "/mo"
+
+def _fmt_pct1(x):
+    if not x: return "0%"
+    return ("−" if x < 0 else "") + f"{_rhu(abs(x) * 10) / 10:.1f}" + "%"
+
+def score_factors(m):
+    """m: cf_per_room, dscr_val (None = no debt -> scored 100, 'No debt'),
+    coc_val (fraction, None = no data -> EXCLUDED), cap_rate (fraction),
+    breakeven (fraction), downside_cf_per_room."""
+    dscr_val = m.get("dscr_val")
+    coc_val = m.get("coc_val")
+    return [
+        {"key": "cf", "name": "Cash flow per room", "weight": 25,
+         "value": _fmt_money0(m.get("cf_per_room", 0)),
+         "score": _pw_curve(m.get("cf_per_room", 0), _SCORE_CURVES["cf"])},
+        {"key": "dscr", "name": "DSCR", "weight": 20,
+         "value": "No debt" if dscr_val is None else f"{dscr_val:.2f}",
+         "score": 100.0 if dscr_val is None else _pw_curve(dscr_val, _SCORE_CURVES["dscr"])},
+        {"key": "coc", "name": "Cash-on-cash", "weight": 20,
+         "value": "No data" if coc_val is None else _fmt_pct1(coc_val * 100),
+         "score": None if coc_val is None else max(0.0, min(100.0, coc_val * 1000))},
+        {"key": "be", "name": "Break-even occupancy", "weight": 12,
+         "value": _fmt_pct1(m.get("breakeven", 0) * 100),
+         "score": _pw_curve(m.get("breakeven", 0) * 100, _SCORE_CURVES["be"])},
+        {"key": "ds", "name": "Downside cash flow per room", "weight": 8,
+         "value": _fmt_money0(m.get("downside_cf_per_room", 0)),
+         "score": _pw_curve(m.get("downside_cf_per_room", 0), _SCORE_CURVES["ds"])},
+        {"key": "cap", "name": "Cap rate", "weight": 15,
+         "value": _fmt_pct1(m.get("cap_rate", 0) * 100),
+         "score": max(0.0, min(100.0, m.get("cap_rate", 0) * 1000))},
+    ]
+
+def _insight_from_factors(factors):
+    """Note logic derived from ReiSearch's five measured notes (Addenda
+    2+3): strongest = highest factor score, ties broken by the higher
+    weight (Cash: CF/room wins a four-way tie at 100 on weight 25;
+    Conventional: Cap rate beats Break-even at 89 on weight 15 > 12;
+    Hard Money weakest: CF/room wins a three-way tie at 0 on weight 25).
+    A 'Weakest' is named only when the lowest scored factor is below 65
+    (Conventional's 64 is named; Senisa's 65 is not). Comparisons use the
+    DISPLAYED (rounded) factor scores, as ReiSearch does: Conventional's
+    Break-even (88.96 unrounded) and Cap rate (88.80) both display 89, and
+    ReiSearch names Cap rate — the tie is broken by weight; Senisa's
+    CF/room (64.6 unrounded) displays 65 and ReiSearch reports 'No weak
+    spots', so the <65 weak test also reads the displayed value."""
+    scored = [f for f in factors if f["score"] is not None]
+    if not scored: return ""
+    strong = sorted(scored, key=lambda f: (-_rhu(f["score"]), -f["weight"]))[0]
+    weak = sorted(scored, key=lambda f: (_rhu(f["score"]), -f["weight"]))[0]
+    return "Strongest: " + strong["name"] + ". " + \
+        ("Weakest: " + weak["name"] + "." if _rhu(weak["score"]) < 65 else "No weak spots.")
+
 def score_rental(m, penalties):
-    """Co-Living weights: CF/room 25, DSCR 20, CoC 20, cap 15, break-even 12, downside CF 8."""
-    def cap_scale(x, target): return max(0.0, min(100.0, (x / target) * 100)) if target else 0.0
-    parts = {
-        "Cash flow / room (25%)": round(0.25 * cap_scale(m.get("cf_per_room", 0), 300), 1),
-        "DSCR (20%)": round(0.20 * cap_scale(m.get("dscr", 0), 1.5), 1),
-        "Cash-on-cash (20%)": round(0.20 * cap_scale(m.get("coc", 0), 0.25), 1),
-        "Cap rate (15%)": round(0.15 * cap_scale(m.get("cap_rate", 0), 0.10), 1),
-        "Break-even occupancy (12%)": round(0.12 * max(0.0, min(100.0, (1.3 - m.get("breakeven", 1.3)) / 0.6 * 100)), 1),
-        "Downside cash flow (8%)": round(0.08 * (100 if m.get("downside_cf", 0) > 0 else (50 if m.get("downside_cf", 0) == 0 else 10)), 1),
-    }
-    total = sum(parts.values())
+    factors = score_factors(m)
+    sw = ss = 0.0
+    parts = {}
+    for fc in factors:
+        if fc["score"] is None: continue
+        sw += fc["weight"]; ss += fc["weight"] * fc["score"]
+        parts[f"{fc['name']} ({fc['weight']}%)"] = round(fc["score"], 1)
+    total = (ss / sw) if sw else 0.0
     for p in penalties: total -= p["points"]
-    total = max(1, min(99, round(total)))
+    total = max(1, min(99, _rhu(total)))
     label = "Strong" if total >= 75 else ("Good" if total >= 65 else ("Fair" if total >= 55 else "Weak"))
-    return {"score": total, "label": label, "parts": parts, "penalties": penalties}
+    return {"score": total, "label": label, "parts": parts, "factors": factors, "penalties": penalties}
 
 def _score_label(total):
     return "Strong" if total >= 75 else ("Good" if total >= 65 else ("Fair" if total >= 55 else "Weak"))
@@ -963,6 +1047,15 @@ def compute_underwriting(strategy, raw_inp, prop):
                "cap_rate": (noi * 12 / value) if value else 0,
                "breakeven": ((opex + debt_service) / (gross + other)) if (gross + other) else 1.3,
                "downside_cf": (egi * 0.9 - opex - debt_service)}
+    # v2.4 score-factor inputs (ReiSearch measured model; mirrors uw.js):
+    # DSCR is a real value or None (no debt scores 100, "No debt");
+    # Cash-on-cash is scored on the cash needed BEYOND the buyer's own cash
+    # contribution (cash_in - cash_equity = points/fees + closing + entry
+    # fee) and is "no data" — excluded — when that is $0, exactly
+    # ReiSearch's rule (Cash/Conventional/Seller excluded; HM's $6,397 scored).
+    metrics["dscr_val"] = (noi / debt_service) if debt_service else None
+    metrics["coc_val"] = (cf * 12 / (cash_in - cash_equity)) if (cash_in - cash_equity) > 0 else None
+    metrics["downside_cf_per_room"] = (metrics["downside_cf"] / rooms_n) if rooms_n else 0
     def _scen(mult, no_vac=False):
         if no_vac and strategy == "Short Term":
             # Fully Booked for STR = 100% occupancy (gross is occupancy-scaled;
@@ -984,16 +1077,20 @@ def compute_underwriting(strategy, raw_inp, prop):
     # v1.8a: Fully Booked exists for EVERY rental strategy (it was Co-Living-only,
     # which left the chip dead on STR/MTR/LTR panels).
     scen["Fully Booked (0% vacancy)"] = _scen(1.0, no_vac=True)
+    # v2.4 penalty (measured, Addendum 2; mirrors uw.js): ReiSearch docks 5
+    # points when operating expenses are an unrealistically low share of
+    # revenue, with the note below. Measured firing at a 0% opex ratio (all
+    # four presets) and — via Addendum 2's Electric reconciliation — at
+    # 3.7%; measured ABSENT at Senisa's 35%. The exact threshold is
+    # UNMEASURED: 5% is the narrowest round bound consistent with both
+    # observations and is flagged as unverified in the v24 build log.
+    if egi > 0 and opex / egi < 0.05:
+        _or = opex / egi * 100
+        penalties.append({"points": 5, "reason": "Operating expenses are only " +
+                          ("0" if _or == 0 else str(round(_or, 1))) +
+                          "% of revenue, which looks unrealistically low."})
     sc = score_rental(metrics, penalties)
-    def _part_frac(item):
-        k, v = item
-        try: w = float(k.rsplit("(", 1)[1].rstrip("%)"))
-        except Exception: w = 0
-        return (v / w) if w else 0
-    _sorted_parts = sorted(sc["parts"].items(), key=_part_frac)
-    _weak, _strong = _sorted_parts[0], _sorted_parts[-1]
-    insight = "Strongest: " + _strong[0].split(" (")[0] + ". " + \
-        ("No weak spots." if _part_frac(_weak) >= 0.8 else "Weak spot: " + _weak[0].split(" (")[0] + ".")
+    insight = _insight_from_factors(sc["factors"])
     refi_gross = round(0.75 * arv) if arv else 0
     refi_net = max(0, refi_gross - debt_amt)
     out.update({"gross_mo": round(gross), "vacancy_loss_mo": round(vac_loss),
@@ -1017,6 +1114,7 @@ def compute_underwriting(strategy, raw_inp, prop):
                 "total_return_y1": round(cf * 12 + paydown_y1),
                 "total_roi_y1": round((cf * 12 + paydown_y1) / cash_in * 100, 1) if cash_in else None,
                 "score": sc["score"], "label": sc["label"], "score_parts": sc["parts"],
+                "score_factors": sc["factors"],
                 "penalties": sc["penalties"], "flags": flags, "insight": insight,
                 "amenity_mo": round(amenity_rows + (fnum(inp.get("amenities_mo"), 0) or 0))})
     return out
