@@ -325,6 +325,29 @@ input.est{background:#fffbeb;border-color:#d97706;border-style:dashed}
 .scorebox>b{color:var(--orange)}
 .scorebox>small{color:#9a3412}
 .fcard select.f-loantype{border:2px solid var(--orange);background:var(--orange-soft);font-weight:700;color:#9a3412}
+/* v2.3 funding-card anatomy (ReiSearch pass 2026-11-03): term = small bordered
+   value box (~45-60px on ReiSearch) + Months|Years segmented immediately right;
+   payment type = full-width segmented control; fixed-amount box inside the
+   Fixed segment. */
+.fgrid .fterm-field{grid-column:span 2}
+.fterm{display:flex;gap:0;align-items:stretch}
+.fterm input.f-termval,.fterm input.f-amortval{width:56px;flex:0 0 56px;text-align:center;border-radius:8px 0 0 8px}
+.funit{display:flex;flex:0 0 auto}
+.funit .fu{border:1px solid #cbd5e1;border-left:none;background:#f1f5f9;padding:7px 10px;font-size:12px;font-weight:600;cursor:pointer;color:var(--ink)}
+.funit .fu:last-of-type{border-radius:0 8px 8px 0}
+.funit .fu.on{background:var(--accent2);color:#fff;border-color:var(--accent2)}
+.fuse{display:flex;gap:5px;align-items:center}
+.fuse input.f-pct{width:64px;flex:0 0 64px}
+.fuse select.f-basis{flex:1;width:auto}
+.fitype{display:flex}
+.fitype .f-it{border:1px solid #cbd5e1;background:#f1f5f9;padding:7px 12px;font-size:12px;font-weight:600;cursor:pointer;color:var(--ink)}
+.fitype .f-it:first-child{border-radius:8px 0 0 8px}
+.fitype .f-it:last-child{border-radius:0 8px 8px 0;border-left:none}
+.fitype .f-it.on{background:var(--accent2);color:#fff;border-color:var(--accent2)}
+.f-lender{flex:0 1 180px;width:180px}
+.fseg{flex-wrap:nowrap;width:100%}
+.fseg .f-pt{flex:1 1 0;text-align:center;border-radius:8px;display:flex;align-items:center;justify-content:center;gap:6px}
+.f-pt-fixed input.f-fixed{width:70px;flex:0 0 70px;padding:4px 6px}
 .chips button.on{background:var(--orange);border-color:var(--orange);color:#fff}
 .chips button{background:#eef1f5;border-color:var(--line);color:#334155}
 .cfbox{background:#f8fafc;border:1px solid var(--line)}

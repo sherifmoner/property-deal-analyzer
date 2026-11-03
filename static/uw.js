@@ -17,23 +17,36 @@
     return amt * rate / 100 / 12;
   }
   function termMonths(f) { var tv = N(f.term_value); return (f.term_unit || "Months") === "Months" ? tv : tv * 12; }
+  /* v2.3 TWO-TERM MODEL (ReiSearch pass 2026-11-03, measured): the card carries
+     a Loan Term and an Amortization Term. The AMORTIZATION term drives the
+     payment; the LOAN term never touches the payment — it only sets the
+     amortization table's horizon (balloon). Legacy cards saved with only the
+     single term keep it as BOTH (server _norm_funding migrates on load; the
+     undefined-check here is the same rule for in-flight states). */
+  function amortMonths(f) {
+    if (!f) return 0;
+    if (f.amort_value === undefined || f.amort_value === null) return termMonths(f);
+    var tv = N(f.amort_value); return (f.amort_unit || "Months") === "Months" ? tv : tv * 12;
+  }
   function rowPayment(f) {
     /* ReiSearch funding-card payment model. Returns {pay (P&I or fixed), esc (taxes+insurance)}. */
     if (!f || f.type === "Cash" || f.type === "Equity") return { pay: 0, esc: 0 };
-    var rate = N(f.rate), months = termMonths(f), pt = f.payment_type || "amortized", pay = 0;
+    var rate = N(f.rate), months = amortMonths(f), pt = f.payment_type || "amortized", pay = 0;
     /* v1.8b: a Fixed payment IS the payment — it must not require a loan amount
        (Subject-To cards have a blank amount by design; blank cards start at 0). */
     if (pt === "fixed") return { pay: N(f.fixed_payment), esc: N(f.taxes_mo) + N(f.insurance_mo) };
     var amt = N(f.amount); if (amt <= 0) return { pay: 0, esc: 0 };
-    /* v2.0 (P0-3 root cause): an Amortized/Principal-Only card with NO term
-       typed silently priced as interest-only (loanPayment's yrs<=0 fallback),
-       so the term field looked dead and a loan number existed that the user
-       never agreed to. Now: no term -> payment "not set", $0 debt — the same
-       honest state as a blank Fixed payment. No term is ever invented. */
+    /* v2.0 (P0-3 root cause): an Amortized/Principal-Only card with NO
+       amortization term typed silently priced as interest-only (loanPayment's
+       yrs<=0 fallback), so the term field looked dead and a loan number existed
+       that the user never agreed to. Now: no amortization term -> payment
+       "not set", $0 debt — the same honest state as a blank Fixed payment.
+       No term is ever invented. (v2.3: the rule keys on the AMORTIZATION term;
+       clearing the Loan Term alone never unsets a payment — ReiSearch.) */
     if ((pt === "amortized" || pt === "principal_only") && !months)
       return { pay: 0, esc: N(f.taxes_mo) + N(f.insurance_mo), notset: true };
     if (pt === "interest_only") pay = amt * rate / 100 / 12;
-    else if (pt === "principal_only") pay = amt * rate / 100 / 12 + (months ? amt / months : 0); // ReiSearch: interest + straight-line principal
+    else if (pt === "principal_only") pay = amt * rate / 100 / 12 + (months ? amt / months : 0); // ReiSearch: interest + straight-line principal over the AMORTIZATION term
     else pay = loanPayment(amt, rate, months / 12);
     return { pay: pay, esc: N(f.taxes_mo) + N(f.insurance_mo) };
   }
@@ -43,10 +56,10 @@
        amortization table booked IO balances as Year-1 paydown). */
     if (!f || f.type === "Cash" || f.type === "Equity") return 0;
     var amt = N(f.amount); if (amt <= 0) return 0;
-    var rate = N(f.rate), months = termMonths(f), pt = f.payment_type || "amortized";
+    var rate = N(f.rate), months = amortMonths(f), pt = f.payment_type || "amortized";
     if (pt === "interest_only") return 0;
     if (pt === "principal_only") return months ? Math.min(amt, amt / months * 12) : 0;
-    if (pt === "amortized" && !months) return 0; /* v2.0: no term -> no payment -> no paydown (never invent 360) */
+    if (pt === "amortized" && !months) return 0; /* v2.0: no amortization term -> no payment -> no paydown (never invent 360) */
     var pay = pt === "fixed" ? N(f.fixed_payment) : loanPayment(amt, rate, months / 12);
     if (pay <= 0) return 0;
     var r = rate / 100 / 12, bal = amt, prin = 0;
@@ -55,24 +68,30 @@
   }
   function loanSchedule(f) {
     /* Full schedule simulated by the card's OWN payment type (mirrors the sidebar
-       view): IO = interest only, $0 principal, balance flat. */
+       view): IO = interest only, $0 principal, balance flat.
+       v2.3 TWO-TERM: the payment comes from the AMORTIZATION term (rowPayment);
+       the table's HORIZON is the LOAN term — a loan term shorter than the
+       amortization term ends the table with a balloon balance, exactly as
+       ReiSearch's table behaves (measured 2026-11-03). */
     var amt = N(f.amount), rate = N(f.rate), pt = f.payment_type || "amortized";
-    /* v2.0: an Amortized/Principal-Only card with no term has NO schedule —
-       the old || 360 invented a 30-year term the user never entered. (Fixed
-       cards keep a display horizon only; their payment is the user's amount.) */
-    if ((pt === "amortized" || pt === "principal_only") && !termMonths(f) && amt > 0)
+    /* v2.0: an Amortized/Principal-Only card with no AMORTIZATION term has NO
+       schedule — the old || 360 invented a 30-year term the user never entered.
+       (Fixed cards keep a display horizon only; their payment is the user's amount.) */
+    if ((pt === "amortized" || pt === "principal_only") && !amortMonths(f) && amt > 0)
       return { payment: 0, rows: [], notset: true };
-    var months = termMonths(f) || 360;
+    var aMonths = amortMonths(f);
+    var months = termMonths(f) || aMonths || 360;
     var rp = rowPayment(f);
     var r = rate / 100 / 12, bal = amt, rows = [];
-    var pmtAm = loanPayment(amt, rate, months / 12);
+    var pmtAm = aMonths ? loanPayment(amt, rate, aMonths / 12) : 0;
     var maxY = Math.min(Math.ceil(months / 12), 40);
     for (var y = 1; y <= maxY; y++) {
       var ti = 0, tp = 0;
-      for (var i = 0; i < 12; i++) {
+      var mInYear = Math.min(12, months - (y - 1) * 12);
+      for (var i = 0; i < mInYear; i++) {
         var inter = bal * r, prin = 0;
         if (pt === "interest_only") { inter = amt * r; prin = 0; }
-        else if (pt === "principal_only") prin = Math.min(amt / months, bal);
+        else if (pt === "principal_only") prin = aMonths ? Math.min(amt / aMonths, bal) : 0;
         else if (pt === "fixed") prin = Math.min(Math.max(rp.pay - inter, 0), bal);
         else prin = Math.min(Math.max(pmtAm - inter, 0), bal);
         ti += inter; tp += prin; bal -= prin; if (bal < 0) bal = 0;
@@ -83,7 +102,11 @@
     }
     return { payment: rp.pay + rp.esc, rows: rows };
   }
-  function scoreLabel(t) { return t >= 75 ? "Strong" : (t >= 55 ? "Workable" : (t >= 40 ? "Thin" : "Weak")); }
+  /* v2.3: label vocabulary + bands measured on ReiSearch (pass 2026-11-03):
+     93/83/81 Strong, 74/73/70 Good, 63 Fair, 44/38/28/15/12 Weak.
+     Band edges 75/65/55 are the round boundaries consistent with all 13
+     labeled ReiSearch observations. */
+  function scoreLabel(t) { return t >= 75 ? "Strong" : (t >= 65 ? "Good" : (t >= 55 ? "Fair" : "Weak")); }
   function scoreRental(m, penalties) {
     function cs(x, t) { return t ? clamp((x / t) * 100, 0, 100) : 0; }
     var parts = {
@@ -168,14 +191,26 @@
       paydownY1 += prin * 12;
     }
     var debtService = debtRows + mdPayment;
+    /* v2.3: ANY loan payment retires the OpEx taxes/insurance auto-estimates —
+       the rule the panel's own help text documents ("Skipped when a loan
+       payment exists: they live inside PITI then") and the only rule under
+       which ReiSearch's measured fixtures reproduce (Conventional: NOI $2,785,
+       NCF $782, DSCR 1.39 — ReiSearch's OpEx has no taxes/insurance lines in
+       any measured state). The v2.1 narrowing (escrow-on-card only) left the
+       estimates charged on top of a plain P&I loan, which ReiSearch never does. */
+    if (debtService > 0) pitiIncluded = true;
     var closing = N(s.closing_costs);
     var financingCosts = closing + pointsFees;
     var uses = totalProject + holdingTotal;
     var gap = uses - funded;
-    /* v1.6 Cash Needed (ReiSearch): cash contributions + points/fees + closing +
-       entry fee. A loan-only funding GAP does not inflate Cash Needed on rentals;
-       Fix & Flip keeps the gap (mirrors app.py compute_underwriting). */
-    var cashIn = cashEquity + pointsFees + closing + entryFee + Math.max(gap, 0);
+    /* Cash Needed (ReiSearch, re-measured 2026-11-03): cash contributions +
+       points/fees + closing + entry fee. A loan-only funding GAP does NOT
+       inflate Cash Needed on rentals — ReiSearch's Hard Money state shows
+       Cash Needed $6,397 = its financing costs alone against a $56,445 gap
+       (and its Total ROI −27.7% = −$1,769 / $6,397 confirms the denominator).
+       Fix & Flip keeps the gap. (The v2.1 "gap for every strategy" rule is
+       superseded by this measured evidence; mirrors app.py.) */
+    var cashIn = cashEquity + pointsFees + closing + entryFee + (strat === "Fix & Flip" ? Math.max(gap, 0) : 0);
     var fundingStatus = funded <= 0 ? "Not Funded" : (gap < -0.05 * Math.max(uses, 1) ? "Over-funded" : (gap <= 0 ? "Fully Funded" : "Partially Funded"));
     var out = { strategy: strat, arv: arv, purchase_price: price, rehab: rehab, rehab_calc: rehabCalc,
       rehab_mode: rehabMode, appliances: appliances, furnishing: furnishing, conversion: conversion,
@@ -300,7 +335,9 @@
     var opexCats = { "Booking & Service Fees": feesCat, "Utilities": util, "Cleaning Service": cleaning,
       "Maintenance": maint, "Management": mgmtLines, "Taxes, Insurance & HOA": taxesMo + insMo + hoa };
     var opex = 0; Object.keys(opexCats).forEach(function (k) { opex += opexCats[k]; });
-    if (util === 0 && maint === 0) penalties.push({ points: 10, reason: "No utilities/maintenance entered — expenses look unrealistically low" });
+    /* v2.3: the old -10 "no utilities/maintenance" penalty is REMOVED — an
+       app-side invention contradicted by ReiSearch's measured states (blank
+       utilities/maintenance at score 93 Cash / 73 Conventional). Mirrors app.py. */
     var noi = egi - opex, cf = noi - debtService;
     var value = arv || price;
     var metrics = { cf_per_room: roomsN ? cf / roomsN : 0,
@@ -381,27 +418,75 @@
     d.appendChild(lab); d.appendChild(numInput("r-qty", r.qty)); d.appendChild(numInput("r-unit", r.unit));
     d.appendChild(el("span", "r-tot", "$0")); d.appendChild(delBtn()); return d;
   }
+  /* v2.3: ReiSearch term control — a small bordered value box (~45-60px) with a
+     two-button Months|Years segmented control immediately to its right. The
+     hidden input keeps the state machine (and older tooling) reading one value. */
+  function unitSeg(hiddenCls, unit) {
+    var w = el("span", "funit");
+    ["Months", "Years"].forEach(function (u) {
+      var b = el("button", "fu" + (u === unit ? " on" : ""), u);
+      b.type = "button"; b.dataset.u = u; w.appendChild(b);
+    });
+    var h = el("input", hiddenCls); h.type = "hidden"; h.value = unit;
+    w.appendChild(h);
+    return w;
+  }
+  function setUnitSeg(cardEl, hiddenCls, unit) {
+    var h = cardEl.querySelector("." + hiddenCls); if (h) h.value = unit;
+    var w = h ? h.closest(".funit") : null;
+    if (w) w.querySelectorAll(".fu").forEach(function (b) { b.classList.toggle("on", b.dataset.u === unit); });
+  }
+  function termControl(valCls, unitCls, val, unit) {
+    var w = el("div", "fterm");
+    w.appendChild(numInput(valCls, val));
+    w.appendChild(unitSeg(unitCls, unit));
+    return w;
+  }
   function fundingCard(f) {
+    /* v2.3 anatomy (ReiSearch pass 2026-11-03, top to bottom): title + lender
+       name, Loan Position, Open Calculator, Remove; Amount; Use % of; Rate;
+       Interest Type Simple/Compound; Loan Term (payment-invariant); Amortization
+       Term (drives the payment); Points; Fees; escrow Taxes/Insurance (the
+       Subject-To card carries them on ReiSearch); Payment Type as a full-width
+       segmented control with the fixed-amount box INSIDE the Fixed segment;
+       bottom line "Monthly payment" + amount or "Monthly payment not set". */
     var d = el("div", "fcard"); d.dataset.kind = "funding";
     d.dataset.type = f.type || "Conventional"; d.dataset.preset = f.preset || f.type || "Conventional";
     d.dataset.ptype = f.payment_type || "amortized";
+    d.dataset.itype = f.interest_type || "simple";
     var head = el("div", "fcard-h");
     head.appendChild(el("span", "f-title", ""));
+    var lender = el("input", "f-lender"); lender.type = "text"; lender.placeholder = "Lender name";
+    lender.value = f.lender || ""; head.appendChild(lender);
     var posLab = el("label", "f-poslab", "Loan Position ");
-    posLab.appendChild(selOf("f-pos", ["1st Position", "2nd Position", "3rd Position"], f.position || "1st Position"));
+    posLab.appendChild(selOf("f-pos", ["1st Position", "2nd Position"], f.position || "1st Position"));
     head.appendChild(posLab);
     var calc = el("a", "btn sm sec", "Open Calculator"); calc.href = "#amortcard"; head.appendChild(calc);
     head.appendChild(delBtn());
     d.appendChild(head);
     var grid = el("div", "fgrid");
-    function field(lab, node) { var w = el("div", "ffield"); w.appendChild(el("label", "", lab)); w.appendChild(node); return w; }
+    function field(lab, node, cls) { var w = el("div", "ffield" + (cls ? " " + cls : "")); w.appendChild(el("label", "", lab)); w.appendChild(node); return w; }
     grid.appendChild(field("Existing Loan Type", selOf("f-loantype", LOAN_TYPES, f.loan_type || f.type || "Conventional")));
     grid.appendChild(field("Loan Balance $", numInput("f-amt", f.amount)));
+    var useW = el("div", "fuse");
+    useW.appendChild(numInput("f-pct", f.pct));
+    var basis = selOf("f-basis", ["of Purchase Price", "of ARV"], f.basis === "arv" ? "of ARV" : "of Purchase Price");
+    basis.dataset.basis = f.basis === "arv" ? "arv" : "price";
+    useW.appendChild(basis);
+    grid.appendChild(field("Use % of", useW));
     grid.appendChild(field("Interest Rate %", numInput("f-rate", f.rate)));
-    var termW = el("div", "fterm");
-    termW.appendChild(numInput("f-termval", f.term_value));
-    termW.appendChild(selOf("f-termunit", ["Months", "Years"], f.term_unit || "Months"));
-    grid.appendChild(field("Remaining Term", termW));
+    var itW = el("div", "fitype");
+    [["simple", "Simple"], ["compound", "Compound"]].forEach(function (it) {
+      var b = el("button", "f-it" + (d.dataset.itype === it[0] ? " on" : ""), it[1]);
+      b.type = "button"; b.dataset.it = it[0]; itW.appendChild(b);
+    });
+    grid.appendChild(field("Interest Type", itW));
+    /* legacy single-term states arrive migrated server-side (amort = term);
+       the same rule is applied here for any in-flight unmigrated state. */
+    var aVal = (f.amort_value === undefined || f.amort_value === null) ? f.term_value : f.amort_value;
+    var aUnit = (f.amort_value === undefined || f.amort_value === null) ? (f.term_unit || "Months") : (f.amort_unit || "Months");
+    grid.appendChild(field("Loan Term", termControl("f-termval", "f-termunit", f.term_value, f.term_unit || "Months"), "fterm-field"));
+    grid.appendChild(field("Amortization Term", termControl("f-amortval", "f-amortunit", aVal, aUnit), "fterm-field"));
     grid.appendChild(field("Points %", numInput("f-points", f.points)));
     grid.appendChild(field("Fees $", numInput("f-fees", f.fees)));
     grid.appendChild(field("Taxes $/mo (escrow)", numInput("f-taxes", f.taxes_mo)));
@@ -410,12 +495,18 @@
     var seg = el("div", "fseg");
     seg.appendChild(el("span", "fseg-lab", "Payment Type"));
     PTYPES.forEach(function (pt) {
-      var b = el("button", "f-pt" + (d.dataset.ptype === pt[0] ? " on" : ""), pt[1]);
-      b.type = "button"; b.dataset.pt = pt[0]; seg.appendChild(b);
+      if (pt[0] === "fixed") {
+        var fb = el("div", "f-pt f-pt-fixed" + (d.dataset.ptype === "fixed" ? " on" : ""));
+        fb.dataset.pt = "fixed";
+        fb.appendChild(el("span", "", pt[1]));
+        var fx = numInput("f-fixed", f.fixed_payment); fx.placeholder = "$/mo";
+        fb.appendChild(fx);
+        seg.appendChild(fb);
+      } else {
+        var b = el("button", "f-pt" + (d.dataset.ptype === pt[0] ? " on" : ""), pt[1]);
+        b.type = "button"; b.dataset.pt = pt[0]; seg.appendChild(b);
+      }
     });
-    var fx = numInput("f-fixed", f.fixed_payment); fx.placeholder = "Fixed $/mo";
-    fx.style.display = d.dataset.ptype === "fixed" ? "" : "none";
-    seg.appendChild(fx);
     d.appendChild(seg);
     var pay = el("div", "fpay", "Monthly payment ");
     pay.appendChild(el("b", "f-pay", "$0"));
@@ -424,10 +515,17 @@
   }
   function readCard(d) {
     var tv = d.querySelector(".f-termval").value;
+    var av = d.querySelector(".f-amortval").value;
+    var basisEl = d.querySelector(".f-basis");
     return { type: d.dataset.type || "Conventional", preset: d.dataset.preset || "Conventional",
       loan_type: d.querySelector(".f-loantype").value, position: d.querySelector(".f-pos").value,
+      lender: d.querySelector(".f-lender").value,
       amount: N(d.querySelector(".f-amt").value), rate: N(d.querySelector(".f-rate").value),
+      pct: d.querySelector(".f-pct").value === "" ? "" : N(d.querySelector(".f-pct").value),
+      basis: basisEl && basisEl.value === "of ARV" ? "arv" : "price",
+      interest_type: d.dataset.itype || "simple",
       term_value: tv === "" ? "" : N(tv), term_unit: d.querySelector(".f-termunit").value,
+      amort_value: av === "" ? "" : N(av), amort_unit: d.querySelector(".f-amortunit").value,
       points: N(d.querySelector(".f-points").value), fees: N(d.querySelector(".f-fees").value),
       payment_type: d.dataset.ptype || "amortized",
       fixed_payment: d.querySelector(".f-fixed").value === "" ? "" : N(d.querySelector(".f-fixed").value),
@@ -738,7 +836,7 @@
       var amt = 0, rate = 0;
       if (loan) { amt = N(loan.amount); rate = N(loan.rate); }
       if (amt > 0 && loanSchedule(loan).notset) {
-        am.innerHTML = '<p class="small muted">This loan has no term yet — enter the term (years) on its Funding card to see its amortization here.</p>';
+        am.innerHTML = '<p class="small muted">This loan has no amortization term yet — enter the Amortization Term on its Funding card to see its amortization here.</p>';
       } else if (amt > 0) {
         var sch = loanSchedule(loan);
         var maxPI = 1; sch.rows.slice(0, 15).forEach(function (x) { maxPI = Math.max(maxPI, x.interest + x.principal); });
@@ -1069,8 +1167,10 @@
     return false;
   };
   function blankCard(type) {
-    return { type: type, preset: type, loan_type: type, position: "1st Position", amount: 0, rate: 0,
-      term_value: "", term_unit: "Months", points: 0, fees: 0, payment_type: "amortized", fixed_payment: "", taxes_mo: 0, insurance_mo: 0 };
+    return { type: type, preset: type, loan_type: type, position: "1st Position", lender: "", amount: 0, rate: 0,
+      pct: "", basis: "price", interest_type: "simple",
+      term_value: "", term_unit: "Years", amort_value: "", amort_unit: "Years",
+      points: 0, fees: 0, payment_type: "amortized", fixed_payment: "", taxes_mo: 0, insurance_mo: 0 };
   }
   window.uwAddRow = function (btn, kind) {
     var panel = btn.closest(".uw-panel");
@@ -1138,7 +1238,8 @@
   function setPtypeUI(cardEl, pt) {
     cardEl.dataset.ptype = pt;
     cardEl.querySelectorAll(".f-pt").forEach(function (b) { b.classList.toggle("on", b.dataset.pt === pt); });
-    var fx = cardEl.querySelector(".f-fixed"); if (fx) fx.style.display = pt === "fixed" ? "" : "none";
+    /* v2.3: the fixed-amount box lives INSIDE the Fixed segment (ReiSearch) —
+       always visible, no show/hide. */
   }
   function subjectToCard(panel) {
     var pl = UW.propLoan || {};
@@ -1172,19 +1273,41 @@
     var d = LOAN_DEFAULTS[name]; if (!d) return;
     cardEl.dataset.type = name; cardEl.dataset.preset = name;
     set(".f-amt", Math.round(d.pct * price)); set(".f-rate", d.rate);
-    set(".f-termval", d.tv); set(".f-termunit", d.unit); set(".f-points", d.points || 0);
+    set(".f-pct", Math.round(d.pct * 100)); set(".f-points", d.points || 0);
+    /* v2.3: a preset applies its term to BOTH term controls (ReiSearch presets
+       carry Loan Term == Amortization Term: 30/30, 12mo/12mo). */
+    set(".f-termval", d.tv); setUnitSeg(cardEl, "f-termunit", d.unit);
+    set(".f-amortval", d.tv); setUnitSeg(cardEl, "f-amortunit", d.unit);
     setPtypeUI(cardEl, d.pt);
   }
+  window.uwClearFunding = function (btn) {
+    /* ReiSearch "Clear all": empties the funding stack (its confirm dialog is
+       ReiSearch-internal; the stack is autosaved and presets restore in one click). */
+    var panel = btn.closest(".uw-panel");
+    var box = panel.querySelector('[data-rows="funding"]'); if (!box) return false;
+    while (box.firstChild) box.removeChild(box.firstChild);
+    recalc(panel);
+    return false;
+  };
   window.uwPreset = function (btn, name) {
     var panel = btn.closest(".uw-panel");
     var s = readState(panel);
     var r = compute(panel.dataset.strategy, s);
     var price = N(s.purchase_price), uses = r.uses;
     var box = panel.querySelector('[data-rows="funding"]'); if (!box) return false;
-    while (box.firstChild) box.removeChild(box.firstChild); /* v2.1: a preset REPLACES the stack instead of piling on */
+    /* v2.3: presets ADD to the stack (the v1.6 model, restored). ReiSearch's
+       funding model is additive — "You can combine multiple funding sources
+       to match the deal" — and its preset row is the empty-state starting
+       point for exactly that stack. The v2.1 replace-on-click behavior made
+       preset clicks destroy existing cards, which ReiSearch never does;
+       "Clear all" (uwClearFunding) is the explicit empty-the-stack action. */
     function card(type, amt, rate, tv, unit, ptype, extra) {
       var c = blankCard(type); c.amount = Math.round(amt); c.rate = rate;
       c.term_value = tv; c.term_unit = unit; c.payment_type = ptype;
+      /* v2.3: presets set the Amortization Term equal to the Loan Term
+         (ReiSearch preset cards carry both, equal). */
+      c.amort_value = tv; c.amort_unit = unit;
+      var dd = LOAN_DEFAULTS[type]; if (dd) { c.pct = Math.round(dd.pct * 100); c.basis = "price"; }
       if (extra) Object.keys(extra).forEach(function (k) { c[k] = extra[k]; });
       return c;
     }
@@ -1234,6 +1357,21 @@
           else if (t.name === "late_fees_mo") { var w1 = panel.querySelector('[name="late_fees_wk"]'); if (w1) w1.value = Math.round(N(t.value) * 12 / 52 * 100) / 100; }
           if (t.name === "taxes_mo") { var fl = panel.querySelector('[name="taxes_est"]'); if (fl) fl.value = ""; t.classList.remove("est"); }
           if (t.name === "insurance_mo") { var fl2 = panel.querySelector('[name="insurance_est"]'); if (fl2) fl2.value = ""; t.classList.remove("est"); }
+          /* v2.3 "Use % of" (ReiSearch): pct x basis drives the Amount; editing
+             the Amount re-derives the pct. Synced at input time, like the rent pair. */
+          if (t.classList.contains("f-pct") || t.classList.contains("f-basis") || t.classList.contains("f-amt")) {
+            var cel = t.closest(".fcard");
+            if (cel) {
+              var pEl = cel.querySelector(".f-pct"), bEl = cel.querySelector(".f-basis"), aEl = cel.querySelector(".f-amt");
+              var st2 = readState(panel);
+              var base2 = bEl && bEl.value === "of ARV" ? N(st2.arv) : N(st2.purchase_price);
+              if (t.classList.contains("f-amt")) {
+                if (base2 > 0 && aEl.value !== "") pEl.value = Math.round(N(aEl.value) / base2 * 10000) / 100;
+              } else if (base2 > 0 && pEl.value !== "") {
+                aEl.value = Math.round(base2 * N(pEl.value) / 100);
+              }
+            }
+          }
         }
         clearTimeout(timer); timer = setTimeout(function () { recalc(panel); }, 90);
       });
@@ -1252,7 +1390,22 @@
           var cardEl = pt.closest(".fcard");
           cardEl.dataset.ptype = pt.dataset.pt;
           cardEl.querySelectorAll(".f-pt").forEach(function (b) { b.classList.toggle("on", b === pt); });
-          cardEl.querySelector(".f-fixed").style.display = pt.dataset.pt === "fixed" ? "" : "none";
+          recalc(panel); return;
+        }
+        var fu = t.closest ? t.closest(".fu") : null;
+        if (fu) {
+          /* Months|Years segmented unit (Loan Term + Amortization Term) */
+          var segW = fu.closest(".funit");
+          var hid = segW ? segW.querySelector("input[type='hidden']") : null;
+          if (hid) hid.value = fu.dataset.u;
+          segW.querySelectorAll(".fu").forEach(function (b) { b.classList.toggle("on", b === fu); });
+          recalc(panel); return;
+        }
+        var fit = t.closest ? t.closest(".f-it") : null;
+        if (fit) {
+          var cardEl2 = fit.closest(".fcard");
+          cardEl2.dataset.itype = fit.dataset.it;
+          cardEl2.querySelectorAll(".f-it").forEach(function (b) { b.classList.toggle("on", b === fit); });
           recalc(panel); return;
         }
         var vs = t.closest ? t.closest(".r-vacstep") : null;

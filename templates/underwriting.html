@@ -201,7 +201,7 @@
 {% endif %}
 
 <details class="acc" open data-sec="funding"><summary><span class="acc-t">Funding Structure</span><span class="acc-mode">LIVE TOTALS</span><span class="acc-total" data-out="funded">$0</span></summary><div class="acc-b">
-<p class="small muted" style="margin-top:0">How will you fund this deal? Pick a preset to <b>add</b> a funding card — presets stack, and every card is removable. Each card's loan-type dropdown re-applies that type's standard terms. <b>Subject-To</b> adds an existing-loan card (fill in its balance/payment); on rentals, the Existing Mortgage Data below separately adds an entry fee + existing PITI payment when you model the deal that way.</p>
+<p class="small muted" style="margin-top:0">Build the capital stack for the purchase, renovation, closing costs, and reserves. Pick a preset to <b>add</b> a funding card — presets stack, and every card is removable. Each card's loan-type dropdown re-applies that type's standard terms. <b>Subject-To</b> adds an existing-loan card (fill in its balance/payment); on rentals, the Existing Mortgage Data below separately adds an entry fee + existing PITI payment when you model the deal that way.</p>
 <div class="rowflex">
 <div><label>Purchase price $</label><input type="number" step="any" name="purchase_price" value="{{ st.purchase_price }}"></div>
 <div><label>ARV $</label><input type="number" step="any" name="arv" value="{{ st.arv }}"></div>
@@ -213,6 +213,8 @@
 </div>
 <div data-rows="funding"></div>
 <button type="button" class="btn sm sec" onclick="return uwAddRow(this,'funding')">+ Add Funding Source</button>
+<button type="button" class="btn sm sec" onclick="return uwClearFunding(this)">Clear all</button>
+<p class="small muted">You can combine multiple funding sources to match the deal.</p>
 </div>
 <div class="sumcard snapcard"><h4>Funding Snapshot <span class="fbadge" data-out="funding_status">Not Funded</span></h4>
 <div class="srow"><span>Total Uses (purchase + renovation + holding)</span><b data-out="uses">$0</b></div>
@@ -432,15 +434,12 @@
 </div>
 {% else %}
 <div class="sidecard"><h3>Deal Analysis Summary</h3>
+{# v2.3 (P2a, ReiSearch pass 2026-11-03): the sparse sidebar for Short/Mid/Long
+   Term carries ONLY these three rows + the Loan Amortization block below —
+   no score/NCF/DSCR/Cap rows and no scenario chips in this panel. #}
 <div class="srow"><span>Cash Outlay</span><b data-out="cash_in">$0</b></div>
 <div class="srow"><span>Income</span><b data-out="egi_mo">$0</b></div>
 <div class="srow"><span>Expenses</span><b data-out="expenses_total">$0</b></div>
-<div class="chips"><button type="button" data-scenchip="Downside (-10%)" onclick="return uwScenChip(this)">Downside −10%</button><button type="button" class="on" data-scenchip="Base Case (0%)" onclick="return uwScenChip(this)">Base Case</button><button type="button" data-scenchip="Upside (+10%)" onclick="return uwScenChip(this)">Upside +10%</button><button type="button" data-scenchip="Fully Booked (0% vacancy)" onclick="return uwScenChip(this)">Fully Booked</button></div>
-<h4>Key Metrics (<span data-scenm="name">Base Case</span>)</h4>
-<div class="srow"><span>Net Cash Flow</span><b data-scenm="net">$0/mo</b></div>
-<div class="srow"><span>Cash-on-Cash</span><b data-scenm="coc">—</b></div>
-<div class="srow"><span>DSCR</span><b data-scenm="dscr">—</b></div>
-<div class="srow"><span>Cap Rate</span><b data-scenm="cap">—</b></div>
 </div>
 {% endif %}
 <div class="sidecard"><h3>Loan Amortization</h3>

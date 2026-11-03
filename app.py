@@ -2,7 +2,7 @@
 Flask + SQLite, server-rendered. Free data only: ArcGIS geocoder, FEMA NFHL, HomeHarvest, US Census ACS.
 Run: .venv/bin/python app.py  ->  http://127.0.0.1:5050
 """
-import json, math, os, re, sqlite3, datetime, io, csv, threading, ast
+import json, math, os, re, sqlite3, datetime, io, csv, threading, ast, time
 from functools import wraps
 import requests
 from flask import Flask, request, redirect, url_for, render_template, jsonify, g, send_file, abort, flash, Response
@@ -523,7 +523,11 @@ def _norm_funding(f):
     """v1.5 funding-card normalization: legacy rows {type, amount, rate, term_years} gain the
     ReiSearch card fields (preset, loan type, position, term value+unit, points, fees,
     payment type, escrow). Defaults chosen so legacy payments are unchanged:
-    term present -> Amortized, no term -> Interest Only."""
+    term present -> Amortized, no term -> Interest Only.
+    v2.3 TWO-TERM MODEL (ReiSearch pass 2026-11-03): cards carry a Loan Term
+    (payment-invariant; amortization horizon/balloon only) AND an Amortization
+    Term (drives the payment). Legacy rows carry only the single term — it WAS
+    the payment term, so it migrates to BOTH fields and payments are unchanged."""
     f = dict(f or {})
     ty = f.get("type") or "Conventional"
     tv = f.get("term_value")
@@ -540,13 +544,33 @@ def _norm_funding(f):
     f["term_unit"] = f.get("term_unit") or "Months"
     months = (fnum(tv, 0) or 0) * (1 if f["term_unit"] == "Months" else 12)
     f["term_years"] = (months / 12) if months else ""
+    if "amort_value" not in f or f.get("amort_value") is None:
+        f["amort_value"] = tv
+        f["amort_unit"] = f["term_unit"]
+    else:
+        f["amort_unit"] = f.get("amort_unit") or "Months"
+    f["lender"] = f.get("lender") or ""
+    if f.get("pct") in (None, ""):
+        f["pct"] = ""
+    f["basis"] = f.get("basis") or "price"
+    f["interest_type"] = f.get("interest_type") or "simple"
     for k in ("points", "fees", "taxes_mo", "insurance_mo"):
         f[k] = fnum(f.get(k), 0) or 0
     if not f.get("payment_type"):
-        f["payment_type"] = "fixed" if fnum(f.get("fixed_payment"), 0) else ("amortized" if months else "interest_only")
+        a_months = (fnum(f["amort_value"], 0) or 0) * (1 if f["amort_unit"] == "Months" else 12)
+        f["payment_type"] = "fixed" if fnum(f.get("fixed_payment"), 0) else ("amortized" if a_months else "interest_only")
     if f.get("fixed_payment") in (None, ""):
         f["fixed_payment"] = ""
     return f
+
+def _amort_months(f):
+    """The AMORTIZATION term in months (v2.3: this is the payment term).
+    Rows that never passed _norm_funding fall back to the legacy single term."""
+    if "amort_value" in f and f.get("amort_value") is not None:
+        tv = fnum(f.get("amort_value"), 0) or 0
+        return tv if (f.get("amort_unit") or "Months") == "Months" else tv * 12
+    tv = fnum(f.get("term_value"), 0) or 0
+    return tv if (f.get("term_unit") or "Months") == "Months" else tv * 12
 
 def _row_payment(f):
     """(principal+interest payment, escrow taxes+insurance) for one funding card.
@@ -554,8 +578,7 @@ def _row_payment(f):
     if (f.get("type") or "") in ("Cash", "Equity"):
         return 0.0, 0.0
     rate = fnum(f.get("rate"), 0) or 0
-    tv = fnum(f.get("term_value"), 0) or 0
-    months = tv if (f.get("term_unit") or "Months") == "Months" else tv * 12
+    months = _amort_months(f)  # v2.3: the AMORTIZATION term drives the payment (Loan Term never does)
     pt = f.get("payment_type") or "amortized"
     # v1.8b: a Fixed payment IS the payment — it must not require a loan amount
     # (Subject-To cards have a blank amount by design; blank cards start at 0).
@@ -588,8 +611,7 @@ def _paydown_y1(f):
     amt = fnum(f.get("amount"), 0) or 0
     if amt <= 0: return 0.0
     rate = fnum(f.get("rate"), 0) or 0
-    tv = fnum(f.get("term_value"), 0) or 0
-    months = tv if (f.get("term_unit") or "Months") == "Months" else tv * 12
+    months = _amort_months(f)  # v2.3: payment (hence paydown) follows the AMORTIZATION term
     pt = f.get("payment_type") or "amortized"
     if pt == "interest_only":
         return 0.0
@@ -659,11 +681,11 @@ def score_rental(m, penalties):
     total = sum(parts.values())
     for p in penalties: total -= p["points"]
     total = max(1, min(99, round(total)))
-    label = "Strong" if total >= 75 else ("Workable" if total >= 55 else ("Thin" if total >= 40 else "Weak"))
+    label = "Strong" if total >= 75 else ("Good" if total >= 65 else ("Fair" if total >= 55 else "Weak"))
     return {"score": total, "label": label, "parts": parts, "penalties": penalties}
 
 def _score_label(total):
-    return "Strong" if total >= 75 else ("Workable" if total >= 55 else ("Thin" if total >= 40 else "Weak"))
+    return "Strong" if total >= 75 else ("Good" if total >= 65 else ("Fair" if total >= 55 else "Weak"))
 
 def compute_underwriting(strategy, raw_inp, prop):
     """v1.3 ReiSearch-mirrored shell: post-reno details, rehab (calculated rows or sqft estimate),
@@ -738,6 +760,10 @@ def compute_underwriting(strategy, raw_inp, prop):
         if md_payment > 0: piti_included = True
         paydown_y1 += _prin * 12
     debt_service = debt_rows_service + md_payment
+    # v2.3: ANY loan payment retires the OpEx taxes/insurance auto-estimates
+    # (mirrors uw.js; ReiSearch fixtures Conventional NOI $2,785 / NCF $782 /
+    # DSCR 1.39 only reproduce this way — see uw.js note).
+    if debt_service > 0: piti_included = True
     closing = fnum(inp.get("closing_costs"), 0) or 0
     financing_costs = closing + points_fees
     uses = total_project + holding_total
@@ -748,7 +774,12 @@ def compute_underwriting(strategy, raw_inp, prop):
     # the gap in Cash Needed — the flip buyer brings the gap in cash at closing
     # (Senisa fixture: gap $61,684 = Cash Needed $61,684).
     cash_in = cash_equity + points_fees + closing + entry_fee
-    cash_in += max(gap, 0)   # v2.1: any unfunded gap is cash YOU bring, for every strategy (was Fix & Flip only)
+    if strategy == "Fix & Flip":
+        cash_in += max(gap, 0)
+    # v2.3: the v2.1 "gap for every strategy" override is REVERTED on measured
+    # ReiSearch evidence (pass 2026-11-03): Hard Money Cash Needed $6,397 =
+    # financing costs alone against a $56,445 gap, and ReiSearch's Total ROI
+    # -27.7% = -$1,769 / $6,397 confirms gap-free Cash Needed on rentals.
     if funded <= 0:
         funding_status = "Not Funded"
     elif gap < -0.05 * max(uses, 1):
@@ -918,8 +949,11 @@ def compute_underwriting(strategy, raw_inp, prop):
                  "Cleaning Service": round(cleaning), "Maintenance": round(maint),
                  "Management": round(mgmt_lines), "Taxes, Insurance & HOA": round(taxes_mo + ins_mo + hoa)}
     opex = sum(opex_cats.values())
-    if util == 0 and maint == 0:
-        penalties.append({"points": 10, "reason": "No utilities/maintenance entered — expenses look unrealistically low"})
+    # v2.3: the old -10 "no utilities/maintenance" score penalty is REMOVED.
+    # It was an app-side invention: every ReiSearch state measured in the
+    # 2026-11-03 pass has BLANK utilities/maintenance, including its 93-Strong
+    # Cash state and its 73-Good Conventional state — ReiSearch demonstrably
+    # does not dock the score for blank expense lines. (Mirrors uw.js.)
     noi = egi - opex
     cf = noi - debt_service
     value = arv or price
@@ -1076,6 +1110,12 @@ def uw_state(strategy, prop, saved_inp, ctx):
                       "term_value": s.get("term_value") if s.get("term_value") not in (None,) else "",
                       "term_unit": s.get("term_unit") or "Months",
                       "term_years": s.get("term_years") or "",
+                      "amort_value": s.get("amort_value") if s.get("amort_value") not in (None,) else "",
+                      "amort_unit": s.get("amort_unit") or "Months",
+                      "lender": s.get("lender") or "",
+                      "pct": s.get("pct") if s.get("pct") not in (None,) else "",
+                      "basis": s.get("basis") or "price",
+                      "interest_type": s.get("interest_type") or "simple",
                       "points": s.get("points") or 0, "fees": s.get("fees") or 0,
                       "payment_type": s.get("payment_type") or "amortized",
                       "fixed_payment": s.get("fixed_payment") if s.get("fixed_payment") not in (None,) else "",
@@ -2685,7 +2725,7 @@ def pull_amenities(prop, radius_m=1609):
     lat, lon = prop["lat"], prop["lon"]
     if lat is None or lon is None:
         return {"error": "Not found — property has no stored coordinates (geocode it first).", "date": today, "source": src}
-    q = f"""[out:json][timeout:120];
+    q = f"""[out:json][timeout:60];
 (
   nwr["amenity"="school"](around:{radius_m},{lat},{lon});
   nwr["shop"~"^(supermarket|grocery)$"](around:{radius_m},{lat},{lon});
@@ -2697,14 +2737,41 @@ def pull_amenities(prop, radius_m=1609):
   nwr["public_transport"="station"](around:{radius_m},{lat},{lon});
 );
 out center tags;"""
-    try:
-        # GET, not POST: POST to Overpass stalls behind some proxies/firewalls; GET is equally supported.
-        r = requests.get("https://overpass-api.de/api/interpreter", params={"data": q},
-                         headers={"User-Agent": "HouseAble-DealAnalyzer/1.1"}, timeout=150)
-        r.raise_for_status()
-        elements = r.json().get("elements", [])
-    except Exception as e:
-        return {"error": f"Not found — OpenStreetMap Overpass pull failed ({e}). Use Refresh to retry.",
+    # v2.3 (P1): root cause of the Naples 502 (Sherif's screenshot, 2026-11-03)
+    # is Overpass capacity, not the query: overpass-api.de answers a small
+    # test query with "502 Gateway Timeout — this Overpass API server is
+    # currently at capacity. All query workers are busy and the request queue
+    # is full. Retry your request using exponential backoff" (measured live
+    # from this machine). POST was also tested: under load it QUEUES instead
+    # of failing, hanging past 120s per endpoint. So: GET (fails fast on a
+    # capacity 502, succeeds as soon as a worker frees) across the primary +
+    # two public mirrors, one backoff pass after 20s (as Overpass itself
+    # instructs), per-attempt timeout 60s. And ALL user-facing failure text
+    # is human — the old code interpolated the raw exception, which embeds
+    # the full query URL, straight into the page (the raw-URL dump in the
+    # screenshot). Technical detail goes to the server log only.
+    elements, last_err = None, None
+    for attempt in range(2):
+        for url in ("https://overpass-api.de/api/interpreter",
+                    "https://overpass.kumi.systems/api/interpreter",
+                    "https://overpass.nchc.org.tw/api/interpreter"):
+            try:
+                r = requests.get(url, params={"data": q},
+                                 headers={"User-Agent": "HouseAble-DealAnalyzer/1.1"}, timeout=60)
+                r.raise_for_status()
+                elements = r.json().get("elements", [])
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if elements is not None:
+            break
+        if attempt == 0:
+            time.sleep(20)
+    if elements is None:
+        print(f"[amenities] Overpass pull failed on all endpoints for ({lat},{lon}): {last_err}", flush=True)
+        return {"error": "Not found — nearby places couldn't be loaded from OpenStreetMap just now "
+                         "(the service may be busy). Use Refresh to retry.",
                 "date": today, "source": src}
     def cat_of(t):
         if t.get("amenity") == "school": return "Schools"
