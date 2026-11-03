@@ -680,11 +680,31 @@ def canon_inputs(strategy, inp, prop):
 # Cash-on-cash uses the same percent x 10 line — its only measured point
 # (-27.7% -> 0) sits on it, so the line beyond that point is an
 # extrapolation on the cap-rate pattern, flagged unverified.
+# v2.8 REFIT (evening measurement pass 2026-11-03, research/
+# reisearch-measurement-2026-11-03-evening.md): the curves are now
+# piecewise-linear through EVERY published (value -> displayed score)
+# point — the v2.4 knots plus R1-R8 and the Electric probes. Senisa's
+# CF/room is deliberately NOT a knot: it interpolates to 64.6 on the
+# (194.42,64)->(241.64,73) segment, which its total of 84 requires (a
+# knot there would push the total to 85). The CF saturation knot at
+# (571.15, 100) is DERIVED, not directly published: the $500 probe's
+# total of 90 forces CF(571) >= 99.7 and the $300 probe's 91 forces
+# CF(621) >= 98.5, while the $150 probe publishes CF(658.65) = 100
+# outright. All 17 fixtures (7 v2.4 + R1-R8 + 3 probes, factors AND
+# totals) reproduce exactly under these constants — full residual table
+# in research/v28-build-log.md.
 _SCORE_CURVES = {
-    "cf": [(-37, 0), (195, 64), (242, 73), (696, 100)],
-    "dscr": [(0.95, 15), (1.39, 79), (1.53, 91), (1.83, 97)],
-    "be": [(0, 100), (55.5, 95), (61.1, 89), (63.7, 86), (89.5, 32)],
-    "ds": [(-106, 0), (126, 81), (131, 83), (172, 93), (627, 100)],
+    "cf": [(-219.17, 0), (-56.45, 0), (-36.85, 0), (18.98, 8), (33.07, 13),
+           (68.98, 28), (125.15, 46), (194.42, 64), (195.44, 64), (241.64, 73),
+           (571.15, 100), (658.65, 100), (696.15, 100)],
+    "dscr": [(0.7312, 0), (0.925, 12), (0.9497, 15), (1.0303, 25), (1.0527, 29),
+             (1.11, 40), (1.1996, 56), (1.3903, 79), (1.5316, 91), (1.8265, 97)],
+    "be": [(0, 100), (4.58, 100), (55.5, 95), (61.14, 89), (63.68, 86),
+           (70.86, 78), (76.58, 67), (80.74, 58), (82.68, 52), (89.5, 32),
+           (91.89, 24), (111.76, 0)],
+    "ds": [(-288.78, 0), (-126.07, 0), (-106.47, 0), (-50.63, 0), (-32.95, 14),
+           (-0.63, 39), (49.92, 57), (124.8, 81), (125.83, 81), (130.62, 83),
+           (172.02, 93), (589.04, 100), (626.54, 100)],
 }
 
 def _pw_curve(x, knots):
@@ -771,6 +791,13 @@ def score_rental(m, penalties):
 def _score_label(total):
     return "Strong" if total >= 75 else ("Good" if total >= 65 else ("Fair" if total >= 55 else "Weak"))
 
+# v2.8 (A8, evening pass 2026-11-03): Add Funding Source dialog card kinds.
+# Amount-only types render a single Amount field and contribute it to
+# Funding Added only. Assumption types render the measured single-Term
+# anatomy and price through the standard debt branch.
+AMOUNT_ONLY_TYPES = ("Private Money Partner", "JV Equity", "Reserves")
+ASSUMP_TYPES = ("Loan Assumption", "Wraparound")
+
 def compute_underwriting(strategy, raw_inp, prop):
     """v1.3 ReiSearch-mirrored shell: post-reno details, rehab (calculated rows or sqft estimate),
     appliances, conversion, furnishing, revenue per strategy, detailed operating expenses,
@@ -807,11 +834,29 @@ def compute_underwriting(strategy, raw_inp, prop):
     for s in stack:
         amt = fnum(s.get("amount"), 0) or 0
         funded += amt
+        # v2.8 (A8): Amount-only cards (Private Money Partner / JV Equity /
+        # Reserves, from the Add Funding Source dialog) contribute their
+        # Amount to Funding Added ONLY — no financing costs, no cash-equity
+        # bucket, no debt service (measured anatomy: a single Amount field).
+        _kind = s.get("kind") or ("amount" if s.get("type") in AMOUNT_ONLY_TYPES else
+                                  "assump" if s.get("type") in ASSUMP_TYPES else "loan")
+        if _kind == "amount":
+            continue
         points_fees += amt * (fnum(s.get("points"), 0) or 0) / 100 + (fnum(s.get("fees"), 0) or 0)
         if s.get("type") in ("Cash", "Equity"):
             cash_equity += amt
         else:
             debt_amt += amt
+            if _kind == "assump":
+                # v2.8 (A8, FLAGGED INFERENCE — see v28 build log): Loan
+                # Assumption / Wraparound cards carry ONE Term field; the
+                # payment is priced by the standard engine using that Term
+                # as the amortization term (filled-card behavior was not
+                # directly measured; blank state shows $0 either way).
+                s = dict(s)
+                if not (fnum(s.get("amort_value"), 0) or 0) and (fnum(s.get("term_value"), 0) or 0):
+                    s["amort_value"] = s.get("term_value")
+                    s["amort_unit"] = s.get("term_unit") or "Years"
             pay, esc = _row_payment(s)
             debt_rows_service += pay + esc
             paydown_y1 += _paydown_y1(s)
@@ -872,6 +917,26 @@ def compute_underwriting(strategy, raw_inp, prop):
         funding_status = "Fully Funded"
     else:
         funding_status = "Partially Funded"
+    # v2.8 (A10, evening pass 2026-11-03): Override Total Uses. While an
+    # override is set, the Funding Snapshot's Total Uses / Remaining
+    # Funding Gap / status read the OVERRIDE; everything else (Cash
+    # Needed, debt service, CoC, the Details-pane uses) keeps the REAL
+    # computed uses — measured: a $400,000 override on the $376,300
+    # Cash-only state moved only the snapshot (Gap $23,700, Partially
+    # Funded, "$23,700 of funding requirement is not yet covered.") while
+    # Cash Contribution, Monthly Debt Service and the UW Summary Cash
+    # Needed line did not move.
+    uses_override = fnum(inp.get("uses_override"), None)
+    if uses_override:
+        snap_uses = uses_override
+        snap_gap = snap_uses - funded
+        if funded <= 0: snap_status = "Not Funded"
+        elif snap_gap < -0.05 * max(snap_uses, 1): snap_status = "Over-funded"
+        elif snap_gap <= 0: snap_status = "Fully Funded"
+        else: snap_status = "Partially Funded"
+    else:
+        uses_override = None
+        snap_uses, snap_gap, snap_status = uses, gap, funding_status
     out = {"strategy": strategy, "arv": arv, "purchase_price": price, "rehab": round(rehab),
            "rehab_calc": round(rehab_calc), "rehab_mode": rehab_mode, "appliances": round(appliances),
            "furnishing": round(furnishing), "conversion": round(conversion),
@@ -879,6 +944,8 @@ def compute_underwriting(strategy, raw_inp, prop):
            "holding_months": round(h_months, 2), "uses": round(uses), "funded": round(funded),
            "gap": round(gap), "cash_in": round(cash_in), "financing_costs": round(financing_costs),
            "funding_status": funding_status,
+           "uses_override": round(uses_override) if uses_override else None,
+           "snap_uses": round(snap_uses), "snap_gap": round(snap_gap), "snap_status": snap_status,
            "debt_service_mo": round(debt_service), "entry_fee": round(entry_fee),
            "cash_contrib": round(cash_equity), "points_fees": round(points_fees),
            "closing_costs": round(closing), "debt_lines": debt_lines,
@@ -1079,15 +1146,18 @@ def compute_underwriting(strategy, raw_inp, prop):
     scen["Fully Booked (0% vacancy)"] = _scen(1.0, no_vac=True)
     # v2.4 penalty (measured, Addendum 2; mirrors uw.js): ReiSearch docks 5
     # points when operating expenses are an unrealistically low share of
-    # revenue, with the note below. Measured firing at a 0% opex ratio (all
-    # four presets) and — via Addendum 2's Electric reconciliation — at
-    # 3.7%; measured ABSENT at Senisa's 35%. The exact threshold is
-    # UNMEASURED: 5% is the narrowest round bound consistent with both
-    # observations and is flagged as unverified in the v24 build log.
-    if egi > 0 and opex / egi < 0.05:
+    # revenue, with the note below. v2.8 (evening pass 2026-11-03): the
+    # threshold is now MEASURED to fire at opex/revenue 0%, 3.7%, 5.4%,
+    # 7.2%, 10.8%, 14.4% and 18.0%, and ABSENT at Senisa's 35% — the true
+    # threshold lies in (18%, 35%]; 20% is the narrowest round bound
+    # consistent with every anchor and is flagged as still unverified
+    # within that interval (v28 build log). The note renders the ratio
+    # rounded to the nearest INTEGER (measured: "only 5%" at 5.4%, "7%"
+    # at 7.2%, "11%" at 10.8%, "14%" at 14.4%, "18%" at 18.0%).
+    if egi > 0 and opex / egi < 0.20:
         _or = opex / egi * 100
         penalties.append({"points": 5, "reason": "Operating expenses are only " +
-                          ("0" if _or == 0 else str(round(_or, 1))) +
+                          str(_rhu(_or)) +
                           "% of revenue, which looks unrealistically low."})
     sc = score_rental(metrics, penalties)
     insight = _insight_from_factors(sc["factors"])
@@ -1201,7 +1271,8 @@ def uw_state(strategy, prop, saved_inp, ctx):
                              "qty": beds if gname == "Bedrooms" else 0, "unit": 0})
     st["furnishing"] = furn
     # funding (v1.5 card fields; canon_inputs already normalized legacy rows)
-    st["funding"] = [{"type": s.get("type") or "Conventional", "preset": s.get("preset") or s.get("type") or "Conventional",
+    st["funding"] = [{"kind": s.get("kind") or "",
+                      "type": s.get("type") or "Conventional", "preset": s.get("preset") or s.get("type") or "Conventional",
                       "loan_type": s.get("loan_type") or s.get("type") or "Conventional",
                       "position": s.get("position") or "1st Position",
                       "amount": s.get("amount") or 0, "rate": s.get("rate") or 0,
@@ -1219,6 +1290,8 @@ def uw_state(strategy, prop, saved_inp, ctx):
                       "fixed_payment": s.get("fixed_payment") if s.get("fixed_payment") not in (None,) else "",
                       "taxes_mo": s.get("taxes_mo") or 0, "insurance_mo": s.get("insurance_mo") or 0}
                      for s in (inp.get("funding_stack") or [])]
+    # v2.8 (A10): the Total Uses override rides along as panel state.
+    st["uses_override"] = g("uses_override", "")
     # holding
     if inp.get("holding_period") not in (None, ""):
         st["holding_period"] = inp.get("holding_period"); st["holding_unit"] = inp.get("holding_unit") or "Months"

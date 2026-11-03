@@ -119,12 +119,25 @@
      scores percent x 10 capped at 100 (measured 8.9->89, 8.6->86,
      14.9->100); Cash-on-cash uses the same percent x 10 line — its only
      measured point (-27.7% -> 0) sits on it, so the line beyond that point
-     is an extrapolation on the cap-rate pattern, flagged unverified. */
+     is an extrapolation on the cap-rate pattern, flagged unverified.
+     v2.8 REFIT (evening pass 2026-11-03): piecewise-linear through EVERY
+     published (value -> displayed score) point — v2.4 knots plus R1-R8
+     and the Electric probes. Senisa's CF/room is NOT a knot (it
+     interpolates to 64.6, which its total of 84 requires). The CF knot
+     at (571.15, 100) is DERIVED from the probe totals (see app.py note).
+     All 17 fixtures reproduce exactly; residual table in the v28 log. */
   var SCORE_CURVES = {
-    cf: [[-37, 0], [195, 64], [242, 73], [696, 100]],
-    dscr: [[0.95, 15], [1.39, 79], [1.53, 91], [1.83, 97]],
-    be: [[0, 100], [55.5, 95], [61.1, 89], [63.7, 86], [89.5, 32]],
-    ds: [[-106, 0], [126, 81], [131, 83], [172, 93], [627, 100]]
+    cf: [[-219.17, 0], [-56.45, 0], [-36.85, 0], [18.98, 8], [33.07, 13],
+         [68.98, 28], [125.15, 46], [194.42, 64], [195.44, 64], [241.64, 73],
+         [571.15, 100], [658.65, 100], [696.15, 100]],
+    dscr: [[0.7312, 0], [0.925, 12], [0.9497, 15], [1.0303, 25], [1.0527, 29],
+           [1.11, 40], [1.1996, 56], [1.3903, 79], [1.5316, 91], [1.8265, 97]],
+    be: [[0, 100], [4.58, 100], [55.5, 95], [61.14, 89], [63.68, 86],
+         [70.86, 78], [76.58, 67], [80.74, 58], [82.68, 52], [89.5, 32],
+         [91.89, 24], [111.76, 0]],
+    ds: [[-288.78, 0], [-126.07, 0], [-106.47, 0], [-50.63, 0], [-32.95, 14],
+         [-0.63, 39], [49.92, 57], [124.8, 81], [125.83, 81], [130.62, 83],
+         [172.02, 93], [589.04, 100], [626.54, 100]]
   };
   function pwCurve(x, knots) {
     var n = knots.length, i = 0;
@@ -241,15 +254,26 @@
     var debtLines = [];
     (s.funding || []).forEach(function (f) {
       var amt = N(f.amount); funded += amt;
+      /* v2.8 (A8): Amount-only cards (Private Money Partner / JV Equity /
+         Reserves) contribute their Amount to Funding Added ONLY — no
+         financing costs, no cash-equity bucket, no debt service. */
+      var kind = f.kind || (AMOUNT_ONLY_TYPES.indexOf(f.type) >= 0 ? "amount" : (ASSUMP_TYPES.indexOf(f.type) >= 0 ? "assump" : "loan"));
+      if (kind === "amount") return;
       pointsFees += amt * N(f.points) / 100 + N(f.fees);
       if (f.type === "Cash" || f.type === "Equity") cashEquity += amt;
       else {
         debtAmt += amt;
-        var rp = rowPayment(f); debtRows += rp.pay + rp.esc;
+        var rr = f;
+        /* v2.8 (A8, FLAGGED INFERENCE — see v28 build log): Loan Assumption /
+           Wraparound cards carry ONE Term; price the payment with the
+           standard engine using that Term as the amortization term. */
+        if (kind === "assump" && !N(f.amort_value) && N(f.term_value))
+          rr = Object.assign({}, f, { amort_value: f.term_value, amort_unit: f.term_unit || "Years" });
+        var rp = rowPayment(rr); debtRows += rp.pay + rp.esc;
         if (rp.esc > 0 || (f.payment_type === "fixed" && rp.pay > 0)) pitiIncluded = true;
         if (f.payment_type === "fixed") carryMo += rp.pay + rp.esc;
         else carryMo += amt * N(f.rate) / 100 / 12 + rp.esc;
-        paydownY1 += paydownY1For(f);
+        paydownY1 += paydownY1For(rr);
         var lab = f.loan_type || f.type || "Loan";
         if (f.preset && f.preset !== lab) lab += " · " + f.preset;
         debtLines.push({ label: lab, payment: Math.round(rp.pay + rp.esc) });
@@ -293,10 +317,21 @@
        superseded by this measured evidence; mirrors app.py.) */
     var cashIn = cashEquity + pointsFees + closing + entryFee + (strat === "Fix & Flip" ? Math.max(gap, 0) : 0);
     var fundingStatus = funded <= 0 ? "Not Funded" : (gap < -0.05 * Math.max(uses, 1) ? "Over-funded" : (gap <= 0 ? "Fully Funded" : "Partially Funded"));
+    /* v2.8 (A10, evening pass 2026-11-03): Override Total Uses — while set,
+       the Funding Snapshot's Total Uses / Gap / status read the OVERRIDE;
+       Cash Needed, debt service and everything else keep the REAL uses
+       (measured: they did not move under a $400,000 override). Mirrors app.py. */
+    var usesOverride = N(s.uses_override) || 0;
+    var snapUses = uses, snapGap = gap, snapStatus = fundingStatus;
+    if (usesOverride) {
+      snapUses = usesOverride; snapGap = snapUses - funded;
+      snapStatus = funded <= 0 ? "Not Funded" : (snapGap < -0.05 * Math.max(snapUses, 1) ? "Over-funded" : (snapGap <= 0 ? "Fully Funded" : "Partially Funded"));
+    }
     var out = { strategy: strat, arv: arv, purchase_price: price, rehab: rehab, rehab_calc: rehabCalc,
       rehab_mode: rehabMode, appliances: appliances, furnishing: furnishing, conversion: conversion,
       total_project: totalProject, holding_cost: holdingTotal, uses: uses, funded: funded, gap: gap,
       cash_in: cashIn, financing_costs: financingCosts, funding_status: fundingStatus,
+      uses_override: usesOverride || null, snap_uses: snapUses, snap_gap: snapGap, snap_status: snapStatus,
       debt_service_mo: debtService, entry_fee: entryFee,
       cash_contrib: cashEquity, points_fees: pointsFees, closing_costs: closing,
       debt_lines: debtLines, md_payment_mo: mdPayment, md_base_mo: mdBase, md_escrow_mo: mdEscrow, md_addons: mdAddons };
@@ -451,15 +486,18 @@
     scen2["Fully Booked (0% vacancy)"] = scenR(1.0, true);
     /* v2.4 penalty (measured, Addendum 2): ReiSearch docks 5 points when
        operating expenses are an unrealistically low share of revenue, with
-       the note below. Measured firing at a 0% opex ratio (all four
-       presets) and — via Addendum 2's Electric reconciliation — at 3.7%;
-       measured ABSENT at Senisa's 35%. The exact threshold is UNMEASURED:
-       5% is the narrowest round bound consistent with both observations
-       and is flagged as unverified in the v24 build log. */
-    if (egi > 0 && opex / egi < 0.05) {
+       the note below. v2.8 (evening pass 2026-11-03): the threshold is now
+       MEASURED to fire at opex/revenue 0%, 3.7%, 5.4%, 7.2%, 10.8%, 14.4%
+       and 18.0%, and ABSENT at Senisa's 35% — the true threshold lies in
+       (18%, 35%]; 20% is the narrowest round bound consistent with every
+       anchor, flagged as still unverified within that interval. The note
+       renders the ratio rounded to the nearest INTEGER (measured: "only
+       5%" at 5.4%, "7%" at 7.2%, "11%" at 10.8%, "14%" at 14.4%, "18%"
+       at 18.0%). Mirrors app.py. */
+    if (egi > 0 && opex / egi < 0.20) {
       var _or = opex / egi * 100;
       penalties.push({ points: 5, reason: "Operating expenses are only " +
-        (_or === 0 ? "0" : (Math.round(_or * 10) / 10)) +
+        roundHalfUp(_or) +
         "% of revenue, which looks unrealistically low." });
     }
     var sc = scoreRental(metrics, penalties);
@@ -491,6 +529,18 @@
 
   /* ---------------- DOM: rows ---------------- */
   var FUNDING_TYPES = ["Conventional", "DSCR", "Hard Money", "Private Money", "Bridge", "HELOC", "Seller Financing", "Subject-To", "Cash", "Equity"];
+  /* v2.8 (A8, evening pass 2026-11-03): Add Funding Source dialog card kinds —
+     Amount-only types (single Amount field; contribute to Funding Added only)
+     and single-Term assumption types (Loan Position + one Term, no
+     Amortization Term). Mirrors app.py. */
+  var AMOUNT_ONLY_TYPES = ["Private Money Partner", "JV Equity", "Reserves"];
+  var ASSUMP_TYPES = ["Loan Assumption", "Wraparound"];
+  function cardKind(f) {
+    if (f.kind) return f.kind;
+    if (AMOUNT_ONLY_TYPES.indexOf(f.type) >= 0) return "amount";
+    if (ASSUMP_TYPES.indexOf(f.type) >= 0) return "assump";
+    return "loan";
+  }
   var LOAN_TYPES = ["FHA", "Conventional", "DSCR", "Hard Money", "Private Money", "Seller Financing", "VA", "USDA", "Bridge", "HELOC", "Cash", "Other"];
   var PTYPES = [["amortized", "Amortized"], ["interest_only", "Interest Only"], ["principal_only", "Principal Only"], ["fixed", "Fixed Payment"]];
   function el(tag, cls, html) { var e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
@@ -558,6 +608,71 @@
     d.dataset.type = f.type || "Conventional"; d.dataset.preset = f.preset || f.type || "Conventional";
     d.dataset.ptype = f.payment_type || "amortized";
     d.dataset.itype = f.interest_type || "simple";
+    var kind = cardKind(f); d.dataset.cardkind = kind;
+    if (kind === "amount") {
+      /* v2.8 (A8, measured): Private Money Partner / JV Equity / Reserves —
+         ONE field only: Amount. No position, rate, terms, or payment type. */
+      var ahead = el("div", "fcard-h");
+      ahead.appendChild(el("span", "f-title", ""));
+      ahead.appendChild(delBtn());
+      d.appendChild(ahead);
+      var agrid = el("div", "fgrid");
+      var af = el("div", "ffield"); af.appendChild(el("label", "", "Amount $"));
+      af.appendChild(numInput("f-amt", f.amount)); agrid.appendChild(af);
+      d.appendChild(agrid);
+      return d;
+    }
+    if (kind === "assump") {
+      /* v2.8 (A8, measured): Loan Assumption / Wraparound — Loan Position
+         dropdown ("Select position" / 1st / 2nd / 3rd / Unrecorded), Amount,
+         Interest Rate 0%, Simple/Compound, ONE Term (Months/Years, Years
+         default), Points 0%, Fees, Payment Type segmented, Monthly payment
+         line. NO Amortization Term field. */
+      var uhead = el("div", "fcard-h");
+      uhead.appendChild(el("span", "f-title", ""));
+      uhead.appendChild(delBtn());
+      d.appendChild(uhead);
+      var ugrid = el("div", "fgrid");
+      function ufield(lab, node, cls) { var w = el("div", "ffield" + (cls ? " " + cls : "")); w.appendChild(el("label", "", lab)); w.appendChild(node); return w; }
+      var posSel = el("select", "f-pos");
+      [["", "Select position"], ["1st", "1st"], ["2nd", "2nd"], ["3rd", "3rd"], ["Unrecorded", "Unrecorded"]].forEach(function (o) {
+        var op = el("option", "", o[1]); op.value = o[0]; posSel.appendChild(op);
+      });
+      posSel.value = f.position || "";
+      ugrid.appendChild(ufield("Loan Position", posSel));
+      ugrid.appendChild(ufield("Amount $", numInput("f-amt", f.amount)));
+      ugrid.appendChild(ufield("Interest Rate %", numInput("f-rate", (f.rate === undefined || f.rate === null || f.rate === "") ? 0 : f.rate)));
+      var uitW = el("div", "fitype");
+      [["simple", "Simple"], ["compound", "Compound"]].forEach(function (it) {
+        var bb = el("button", "f-it" + (d.dataset.itype === it[0] ? " on" : ""), it[1]);
+        bb.type = "button"; bb.dataset.it = it[0]; uitW.appendChild(bb);
+      });
+      ugrid.appendChild(ufield("Interest Type", uitW));
+      ugrid.appendChild(ufield("Term", termControl("f-termval", "f-termunit", f.term_value, f.term_unit || "Years"), "fterm-field"));
+      ugrid.appendChild(ufield("Points %", numInput("f-points", (f.points === undefined || f.points === null || f.points === "") ? 0 : f.points)));
+      ugrid.appendChild(ufield("Fees $", numInput("f-fees", f.fees)));
+      d.appendChild(ugrid);
+      var useg = el("div", "fseg");
+      useg.appendChild(el("span", "fseg-lab", "Payment Type"));
+      PTYPES.forEach(function (pt) {
+        if (pt[0] === "fixed") {
+          var ufb = el("div", "f-pt f-pt-fixed" + (d.dataset.ptype === "fixed" ? " on" : ""));
+          ufb.dataset.pt = "fixed";
+          ufb.appendChild(el("span", "", pt[1]));
+          var ufx = numInput("f-fixed", f.fixed_payment); ufx.placeholder = "$/mo";
+          ufb.appendChild(ufx);
+          useg.appendChild(ufb);
+        } else {
+          var ub = el("button", "f-pt" + (d.dataset.ptype === pt[0] ? " on" : ""), pt[1]);
+          ub.type = "button"; ub.dataset.pt = pt[0]; useg.appendChild(ub);
+        }
+      });
+      d.appendChild(useg);
+      var upay = el("div", "fpay", "Monthly payment ");
+      upay.appendChild(el("b", "f-pay", "$0"));
+      d.appendChild(upay);
+      return d;
+    }
     var head = el("div", "fcard-h");
     head.appendChild(el("span", "f-title", ""));
     var lender = el("input", "f-lender"); lender.type = "text"; lender.placeholder = "Lender name";
@@ -618,6 +733,28 @@
     return d;
   }
   function readCard(d) {
+    /* v2.8 (A8): variant cards read only the fields they render. */
+    if (d.dataset.cardkind === "amount") {
+      return { kind: "amount", type: d.dataset.type, preset: d.dataset.preset || d.dataset.type,
+        loan_type: d.dataset.type, amount: N(d.querySelector(".f-amt").value) };
+    }
+    if (d.dataset.cardkind === "assump") {
+      var utv = d.querySelector(".f-termval").value;
+      var utu = d.querySelector(".f-termunit").value;
+      var ufx2 = d.querySelector(".f-fixed");
+      return { kind: "assump", type: d.dataset.type, preset: d.dataset.preset || d.dataset.type,
+        loan_type: d.dataset.type, position: d.querySelector(".f-pos").value,
+        amount: N(d.querySelector(".f-amt").value), rate: N(d.querySelector(".f-rate").value),
+        interest_type: d.dataset.itype || "simple",
+        /* the single Term is stored as BOTH term fields so the standard
+           engine prices it (the flagged inference, mirrored in app.py) */
+        term_value: utv === "" ? "" : N(utv), term_unit: utu,
+        amort_value: utv === "" ? "" : N(utv), amort_unit: utu,
+        points: N(d.querySelector(".f-points").value), fees: N(d.querySelector(".f-fees").value),
+        payment_type: d.dataset.ptype || "amortized",
+        fixed_payment: (ufx2 && ufx2.value !== "") ? N(ufx2.value) : "",
+        taxes_mo: 0, insurance_mo: 0 };
+    }
     var tv = d.querySelector(".f-termval").value;
     var av = d.querySelector(".f-amortval").value;
     var basisEl = d.querySelector(".f-basis");
@@ -712,6 +849,8 @@
     });
     /* auto-estimate flags ride along (hidden inputs the main loop skips) */
     panel.querySelectorAll("input[data-estflag]").forEach(function (e) { s[e.name] = e.value; });
+    /* v2.8 (A10): state-carrying hidden inputs (e.g. uses_override) */
+    panel.querySelectorAll("input[data-stateval]").forEach(function (e) { s[e.name] = e.value; });
     s.rehab_rooms = readRows(panel, "rehab_rooms");
     s.rehab_flats = readRows(panel, "rehab_flats");
     s.appliances = readRows(panel, "appliances");
@@ -774,7 +913,9 @@
       rev_other_fees: M(raw.rev_other_fees), rev_amenity: M(raw.rev_amenity),
       rev_rent_yr: M((r.gross_mo || 0) * 12), rev_vac_yr: M(-(r.vacancy_loss_mo || 0) * 12), rev_egi_yr: M((r.egi_mo || 0) * 12),
       egi_wk: M((r.egi_mo || 0) * 12 / 52), amenity_total: M(r.amenity_mo || 0), amenity_wk: M((r.amenity_mo || 0) * 12 / 52),
-      funding_status: r.funding_status || "",
+      funding_status: r.snap_status || r.funding_status || "",
+      uses: M(r.snap_uses !== undefined && r.snap_uses !== null ? r.snap_uses : r.uses),
+      gap: M(r.snap_gap !== undefined && r.snap_gap !== null ? r.snap_gap : r.gap),
       score_insight: r.insight || "",
       payback_full: r.payback_yrs ? (r.payback_yrs + " yrs") : "—",
       cf_bar_legend: (function () {
@@ -802,7 +943,8 @@
       var txt = (key in special) ? special[key] : fmtFor(key, r, s);
       if (elm.tagName === "INPUT") elm.value = txt; else elm.textContent = txt;
       if (key === "funding_status") {
-        elm.className = "fbadge " + (r.funding_status === "Fully Funded" ? "full" : (r.funding_status === "Over-funded" ? "over" : (r.funding_status === "Partially Funded" ? "part" : "none")));
+        var fst = r.snap_status || r.funding_status;
+        elm.className = "fbadge " + (fst === "Fully Funded" ? "full" : (fst === "Over-funded" ? "over" : (fst === "Partially Funded" ? "part" : "none")));
       }
     });
     /* Month/Year summary panels (ReiSearch side panels) */
@@ -926,6 +1068,15 @@
       var t = d.querySelector(".f-title");
       if (t) t.textContent = f.loan_type === f.preset ? (f.loan_type || "") : ((f.loan_type || "") + " · " + (f.preset || ""));
     });
+    /* v2.8 (A10): the override note — "$X of funding requirement is not yet
+       covered." — shows only while an override is set AND leaves a gap. */
+    var usesNote = panel.querySelector("[data-uses-note]");
+    if (usesNote) {
+      if (r.uses_override && r.snap_gap > 0) {
+        usesNote.hidden = false;
+        usesNote.textContent = M(r.snap_gap) + " of funding requirement is not yet covered.";
+      } else { usesNote.hidden = true; usesNote.textContent = ""; }
+    }
     /* sidebar amortization mini-view: the first real loan card ONLY.
        v1.6: the schedule is simulated by the card's OWN payment type — an
        interest-only loan shows interest payments, $0 principal, balance flat.
@@ -936,7 +1087,7 @@
     var am = panel.querySelector("[data-amort='side']");
     if (am) {
       var loan = null;
-      (s.funding || []).forEach(function (f) { if (!loan && f.type !== "Cash" && f.type !== "Equity" && N(f.amount) > 0) loan = f; });
+      (s.funding || []).forEach(function (f) { if (!loan && f.type !== "Cash" && f.type !== "Equity" && AMOUNT_ONLY_TYPES.indexOf(f.type) < 0 && N(f.amount) > 0) loan = f; });
       var amt = 0, rate = 0;
       if (loan) { amt = N(loan.amount); rate = N(loan.rate); }
       if (amt > 0 && loanSchedule(loan).notset) {
@@ -1227,7 +1378,7 @@
       var v = state[k];
       if (v === null || typeof v === "object") return;
       var e = panel.querySelector('[name="' + k + '"]');
-      if (e && (e.type !== "hidden" || e.hasAttribute("data-estflag"))) e.value = v;
+      if (e && (e.type !== "hidden" || e.hasAttribute("data-estflag") || e.hasAttribute("data-stateval"))) e.value = v;
     });
     setRows(panel, "rehab_rooms", state.rehab_rooms);
     setRows(panel, "rehab_flats", state.rehab_flats);
@@ -1413,6 +1564,88 @@
     recalc(panel);
     return false;
   };
+  /* v2.8 (A8, evening pass 2026-11-03): the Add Funding Source DIALOG.
+     ReiSearch's button opens this dialog (it does not add a card directly);
+     every type in it adds a BLANK card — no prefilled defaults, unlike the
+     preset row above it, which stays exactly as it was. */
+  function blankDialogCard(type, loanType) {
+    var c = blankCard(type);
+    c.loan_type = loanType; c.preset = loanType;
+    c.amount = ""; c.rate = ""; c.points = ""; c.pct = "";
+    return c;
+  }
+  window.uwDlgOpen = function (btn) {
+    var dlg = btn.closest(".uw-panel").querySelector(".srcdlg");
+    if (dlg) dlg.hidden = false;
+    return false;
+  };
+  window.uwDlgClose = function (btn) {
+    var dlg = btn.closest(".srcdlg");
+    if (dlg) dlg.hidden = true;
+    return false;
+  };
+  window.uwDlgAdd = function (btn, label) {
+    var panel = btn.closest(".uw-panel");
+    var box = panel.querySelector('[data-rows="funding"]'); if (!box) return false;
+    var card = null;
+    if (label === "Conventional Loan") card = fundingCard(blankDialogCard("Conventional", "Conventional Loan"));
+    else if (label === "DSCR Loan") card = fundingCard(blankDialogCard("DSCR", "DSCR Loan"));
+    else if (label === "Hard Money Loan") card = fundingCard(blankDialogCard("Hard Money", "Hard Money Loan"));
+    else if (label === "Private Money Loan") card = fundingCard(blankDialogCard("Private Money", "Private Money Loan"));
+    else if (label === "Bridge Loan") card = fundingCard(blankDialogCard("Bridge", "Bridge Loan"));
+    else if (label === "HELOC") card = fundingCard(blankDialogCard("HELOC", "HELOC"));
+    else if (label === "Cash Contribution") card = fundingCard(blankDialogCard("Cash", "Cash"));
+    else if (label === "Seller Financing") card = fundingCard(blankDialogCard("Seller Financing", "Seller Financing"));
+    else if (label === "Subject-To") { var stc = blankDialogCard("Subject-To", "Subject-To"); stc.payment_type = "fixed"; card = fundingCard(stc); }
+    else if (AMOUNT_ONLY_TYPES.indexOf(label) >= 0) {
+      var ac = blankCard(label); ac.kind = "amount"; ac.amount = "";
+      card = fundingCard(ac);
+    } else if (ASSUMP_TYPES.indexOf(label) >= 0) {
+      var wc = blankCard(label); wc.kind = "assump";
+      wc.amount = ""; wc.rate = 0; wc.points = 0; wc.fees = "";
+      wc.position = ""; wc.term_unit = "Years"; wc.payment_type = "amortized";
+      card = fundingCard(wc);
+    }
+    if (card) box.appendChild(card);
+    var dlg = panel.querySelector(".srcdlg"); if (dlg) dlg.hidden = true;
+    recalc(panel);
+    return false;
+  };
+  /* v2.8 (A10, evening pass 2026-11-03): Override Total Uses — the pencil
+     opens an editor prefilled with the snapshot's current Total Uses;
+     Done stores the override in panel state (it persists like any other
+     UW state); Reset total uses clears it. Only the Funding Snapshot
+     reads the override (see compute). */
+  window.uwUsesEdit = function (btn) {
+    var panel = btn.closest(".uw-panel");
+    var ed = panel.querySelector("[data-uses-editor]"); if (!ed) return false;
+    var inp = panel.querySelector("[data-uses-input]");
+    var disp = panel.querySelector(".snapcard [data-out='uses']");
+    if (inp && disp) inp.value = String(parseFloat(String(disp.textContent).replace(/[^0-9.]/g, "")) || "");
+    ed.hidden = false;
+    if (inp) { inp.focus(); if (inp.select) inp.select(); }
+    return false;
+  };
+  window.uwUsesDone = function (btn) {
+    var panel = btn.closest(".uw-panel");
+    var inp = panel.querySelector("[data-uses-input]");
+    var hid = panel.querySelector("input[name='uses_override']");
+    if (hid) {
+      hid.value = (inp && inp.value !== "") ? String(Math.max(0, N(inp.value))) : "";
+      hid.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    var ed = panel.querySelector("[data-uses-editor]"); if (ed) ed.hidden = true;
+    recalc(panel);
+    return false;
+  };
+  window.uwUsesReset = function (btn) {
+    var panel = btn.closest(".uw-panel");
+    var hid = panel.querySelector("input[name='uses_override']");
+    if (hid) { hid.value = ""; hid.dispatchEvent(new Event("input", { bubbles: true })); }
+    var ed = panel.querySelector("[data-uses-editor]"); if (ed) ed.hidden = true;
+    recalc(panel);
+    return false;
+  };
   window.uwPreset = function (btn, name) {
     var panel = btn.closest(".uw-panel");
     var s = readState(panel);
@@ -1487,12 +1720,16 @@
             var cel = t.closest(".fcard");
             if (cel) {
               var pEl = cel.querySelector(".f-pct"), bEl = cel.querySelector(".f-basis"), aEl = cel.querySelector(".f-amt");
-              var st2 = readState(panel);
-              var base2 = bEl && bEl.value === "of ARV" ? N(st2.arv) : N(st2.purchase_price);
-              if (t.classList.contains("f-amt")) {
-                if (base2 > 0 && aEl.value !== "") pEl.value = Math.round(N(aEl.value) / base2 * 10000) / 100;
-              } else if (base2 > 0 && pEl.value !== "") {
-                aEl.value = Math.round(base2 * N(pEl.value) / 100);
+              /* v2.8: variant cards (Amount-only, Assumption) have no Use-% row —
+                 nothing to sync there; the guard keeps their Amount edits live. */
+              if (pEl && bEl && aEl) {
+                var st2 = readState(panel);
+                var base2 = bEl && bEl.value === "of ARV" ? N(st2.arv) : N(st2.purchase_price);
+                if (t.classList.contains("f-amt")) {
+                  if (base2 > 0 && aEl.value !== "") pEl.value = Math.round(N(aEl.value) / base2 * 10000) / 100;
+                } else if (base2 > 0 && pEl.value !== "") {
+                  aEl.value = Math.round(base2 * N(pEl.value) / 100);
+                }
               }
             }
           }

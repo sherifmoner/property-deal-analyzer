@@ -213,12 +213,39 @@
 </div>
 <div data-rows="funding"></div>
 <p class="small muted" data-funding-empty style="margin:6px 0 2px">No funding sources yet — Start with a common structure<br>Or build a custom stack</p>
-<button type="button" class="btn sm sec" onclick="return uwAddRow(this,'funding')">+ Add Funding Source</button>
+<button type="button" class="btn sm sec" onclick="return uwDlgOpen(this)">+ Add Funding Source</button>
+{# v2.8 (A8, evening pass 2026-11-03): ReiSearch's Add Funding Source dialog —
+   three sections, fourteen types, every type adds a BLANK card. #}
+<div class="srcdlg" hidden>
+<div class="srcdlg-card">
+<div class="srcdlg-head"><b>Add Funding Source</b><button type="button" class="btn sm sec" onclick="return uwDlgClose(this)">✕</button></div>
+<div class="dlgsec"><h5>Debt Financing</h5>
+{% for t in ['Conventional Loan','DSCR Loan','Hard Money Loan','Private Money Loan','Bridge Loan','HELOC'] %}<button type="button" class="dlgitem" onclick="return uwDlgAdd(this,'{{ t }}')">{{ t }}</button>{% endfor %}
+</div>
+<div class="dlgsec"><h5>Cash &amp; Equity</h5>
+{% for t in ['Cash Contribution','Private Money Partner','JV Equity','Reserves'] %}<button type="button" class="dlgitem" onclick="return uwDlgAdd(this,'{{ t }}')">{{ t }}</button>{% endfor %}
+</div>
+<div class="dlgsec"><h5>Creative Finance</h5>
+{% for t in ['Seller Financing','Subject-To','Loan Assumption','Wraparound'] %}<button type="button" class="dlgitem" onclick="return uwDlgAdd(this,'{{ t }}')">{{ t }}</button>{% endfor %}
+</div>
+</div>
+</div>
 <button type="button" class="btn sm sec" onclick="return uwClearFunding(this)">Clear all</button>
 <p class="small muted">You can combine multiple funding sources to match the deal.</p>
 </div>
 <div class="sumcard snapcard"><h4>Funding Snapshot <span class="fbadge" data-out="funding_status">Not Funded</span></h4>
-<div class="srow"><span>Total Uses (purchase + renovation + holding)</span><b data-out="uses">$0</b></div>
+<div class="srow"><span>Total Uses (purchase + renovation + holding)</span><b data-out="uses">$0</b> <button type="button" class="uses-pencil" data-uses-edit title="Override total uses" onclick="return uwUsesEdit(this)">✎</button></div>
+{# v2.8 (A10, evening pass 2026-11-03): Override Total Uses — pencil opens the
+   editor (prefilled with the current value); while overridden, the snapshot's
+   Total Uses / Gap / status and the "not yet covered" note read the override.
+   Cash Needed and debt service keep the real computed uses. #}
+<div class="uses-editor" data-uses-editor hidden>
+<label>Total Uses $ <input type="number" step="any" data-uses-input></label>
+<button type="button" class="btn sm" data-uses-done onclick="return uwUsesDone(this)">Done</button>
+<button type="button" class="btn sm sec" data-uses-reset onclick="return uwUsesReset(this)">Reset total uses</button>
+</div>
+<p class="uses-note" data-uses-note hidden></p>
+<input type="hidden" name="uses_override" data-stateval="1" value="{{ st.uses_override }}">
 <div class="srow"><span>Funding Added</span><b data-out="funded">$0</b></div>
 <div class="srow"><span>Remaining Funding Gap</span><b data-out="gap">$0</b></div>
 <div class="srow"><span>Cash Contributions</span><b data-out="cash_contrib">$0</b></div>

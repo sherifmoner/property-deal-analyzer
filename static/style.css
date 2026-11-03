@@ -463,3 +463,18 @@ button:focus-visible, a:focus-visible {
  body.navopen .sidenav{display:block}
 }
 .fbadge.over{background:#e0e7ff;color:#3730a3}
+
+/* v2.8: Add Funding Source dialog + Override Total Uses controls */
+.srcdlg{position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:200;display:flex;align-items:flex-start;justify-content:center;padding:48px 16px}
+.srcdlg[hidden]{display:none}
+.srcdlg-card{background:#fff;border-radius:12px;max-width:520px;width:100%;max-height:82vh;overflow:auto;padding:18px 20px;box-shadow:0 18px 50px rgba(2,6,23,.35)}
+.srcdlg-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.dlgsec h5{margin:14px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#64748b}
+.dlgitem{display:block;width:100%;text-align:left;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:4px 0;cursor:pointer;font-size:14px}
+.dlgitem:hover{background:#eef2ff;border-color:#c7d2fe}
+.uses-pencil{background:none;border:none;cursor:pointer;font-size:13px;color:#6366f1;padding:0 2px}
+.uses-editor{margin:4px 0 8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.uses-editor[hidden]{display:none}
+.uses-editor input{width:130px}
+.uses-note{color:#92400e;background:#fef3c7;border-radius:8px;padding:6px 10px;font-size:13px;margin:4px 0 8px}
+.uses-note[hidden]{display:none}
