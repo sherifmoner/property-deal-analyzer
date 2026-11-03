@@ -3440,6 +3440,15 @@ def property_page(pid):
         if _g == 0: rent_match["exact"] += 1
         elif _g == 1: rent_match["near"] += 1
     sold_stats = pinned_sold_stats(sold_view)
+    # v2.5: "Pinned #N" labels (ReiSearch comp-row anatomy) — rank among the
+    # pinned comps in each view's own display (match-first) order.
+    pinned_rank = {}
+    for _lst in (sold_view, rents_view):
+        _n = 0
+        for _c in _lst:
+            if _c["pinned"]:
+                _n += 1
+                pinned_rank[_c["id"]] = _n
     # v2.0: whole-filtered-set averages (the sold set the user is looking at —
     # window + radius applied) beside the pinned/top-3 line.
     _set_sold = [c for c in sold_view if c["kind"] == "sold"]
@@ -3522,6 +3531,7 @@ def property_page(pid):
                            uw_draft_meta=uw_draft_meta,
                            flip_pool=flip_pool, comp_weights=comp_weights(),
                            prop_notes=prop_notes, market_value=market_value, mv_basis=mv_basis,
+                           mv_count=len(est3), pinned_rank=pinned_rank,
                            added_pretty=added_pretty, trades_rows=trades_rows, dir_trades=dir_trades,
                            sold_years=sold_years, sold_zips=sold_zips,
                            flip_range=(min(flip_prices), max(flip_prices)) if flip_prices else None)
@@ -4129,6 +4139,13 @@ def money(v):
 def numf(v, dec=0):
     v = clean_num(v)
     return "—" if v is None else f"{v:,.{dec}f}"
+
+@app.template_filter("datefmt")
+def datefmt(v):
+    """ISO date -> ReiSearch's display form ('Oct 27, 2025')."""
+    if not v: return "—"
+    try: return datetime.datetime.strptime(str(v)[:10], "%Y-%m-%d").strftime("%b %d, %Y").replace(" 0", " ")
+    except Exception: return str(v)
 
 @app.template_filter("jload")
 def jload(v):

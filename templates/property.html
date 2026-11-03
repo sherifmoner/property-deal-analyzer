@@ -17,19 +17,23 @@
  <div class="cb">
  <div class="score">{{ c.match_score|num }}<small>MATCH</small></div>
  <div class="cprice">{% if mode=='rent' %}{{ c.price|money }}<span class="small muted">/mo rent</span>{% else %}{{ c.price|money }}{% endif %}</div>
- <div class="small"><b>{{ c.address }}</b>, {{ c.city }} {{ c.zip }}{% if c.pinned %} · <span class="pin">📌 PINNED</span>{% endif %}{% if c.kind=='active' %} · <span class="badge" style="background:#fef3c7;color:#92400e">● ACTIVE LISTING</span>{% endif %}</div>
- <div class="small muted">{{ c.beds|num }} bd · {{ c.baths|num }} ba · {{ c.sqft|num }} sqft · built {{ c.year_built or '—' }} · {{ c.distance_mi|num(2) }} mi away</div>
+ {% if mode=='sold' %}<div class="small" data-comp-status>{% if c.kind=='active' %}Listed · {{ c.event_date|datefmt }} (asking) · <span class="badge" style="background:#fef3c7;color:#92400e">● ACTIVE LISTING</span>{% else %}Sold · {{ c.event_date|datefmt }}{% endif %}</div>{% endif %}
+ {% if c.pinned %}<div class="small" data-comp-pin><span class="pin">📌 Pinned #{{ pinned_rank.get(c.id, '') }}</span></div>{% endif %}
+ <div class="small" data-comp-address><b>{{ c.address }}</b>, {{ c.city }} {{ c.zip }}</div>
+ <div class="small muted" data-comp-specs>{{ c.beds|num }}bd • {{ c.baths|num }}ba • {{ (c.sqft|int) if c.sqft else '—' }}sqft • Built {{ c.year_built or '—' }}</div>
  {% if mode=='sold' %}
- <div class="small">{% if c.kind=='active' %}Listed {{ c.event_date or '—' }} (asking){% else %}Sold {{ c.event_date or '—' }}{% endif %} · {{ ('$' ~ c.ppsf|round(0) ~ '/sqft') if c.ppsf else '—' }} · DOM {{ c.dom|num }}
- {% if p.list_price and c.price %}<br>Price vs subject list: <b class="{{ 'diffup' if c.price>p.list_price else 'diffdn' }}">{{ ((c.price - p.list_price)|money) if c.price>=p.list_price else ('−' ~ ((p.list_price - c.price)|money)) }}</b>{% endif %}
- {% if p.sqft and c.sqft %}<br>Size vs subject: <b>{{ ('+' if c.sqft>p.sqft else '') ~ ((c.sqft - p.sqft)|round(0)) }} sqft</b>{% endif %}
+ <div class="small" data-comp-diffs>
+ {% if p.list_price and c.price %}{% set pd = c.price - p.list_price %}<div data-comp-diff="price">Price Difference {% if pd > 0 %}↑{% elif pd < 0 %}↓{% endif %} {{ (pd|abs)|money }} ({{ ((pd|abs) / p.list_price * 100)|round|int }}%)</div>{% endif %}
+ {% if p.sqft and c.sqft %}{% set sd = c.sqft - p.sqft %}<div data-comp-diff="sqft">Sqft Difference {% if sd > 0 %}↑{% elif sd < 0 %}↓{% endif %} {{ (sd|abs)|num }} ({{ ((sd|abs) / p.sqft * 100)|round|int }}%)</div>{% endif %}
+ {% if p.year_built and c.year_built %}{% set ad = c.year_built - p.year_built %}<div data-comp-diff="age">Age Difference{% if ad %} {% if ad > 0 %}↑{% else %}↓{% endif %} {{ ad|abs }}{% else %} 0{% endif %}</div>{% endif %}
  </div>
  {% elif mode=='coliving' %}
  <div class="small">Whole-house rent {{ c.price|money }}/mo · {{ c.beds|num }} bedrooms<br>Estimated room rent: <b style="font-size:15px">${{ room_est[c.id] or '—' }}/wk per room</b> <span class="muted">(rent ÷ bedrooms)</span></div>
  {% elif mode=='rent' %}
  <div class="small">{{ ('$' ~ c.ppsf|round(2) ~ '/sqft/mo') if c.ppsf else '' }}{% if room_est[c.id] %} · est. ${{ room_est[c.id] }}/wk per room{% endif %}</div>
  {% endif %}
- <details><summary>Score breakdown</summary><div class="small muted">{% for k, val in breakdowns[c.id].items() %}{{ k }}: {{ val }} · {% endfor %}</div></details>
+ <details><summary>Score breakdown</summary><div class="small muted">{% for k, val in breakdowns[c.id].items() %}{{ k }}: {{ val }} · {% endfor %}</div>
+ <div class="small muted" data-comp-facts>Garage: Not found · Lot: {% if c.lot_sqft %}{{ c.lot_sqft|num }} sqft{% else %}Not found{% endif %} · Type: {{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }} · Distance: {% if c.distance_mi is not none %}{{ c.distance_mi|num(2) }} mi{% else %}Not found{% endif %}{% if mode=='sold' %} · DOM {% if c.dom is not none %}{{ c.dom|num }}{% else %}Not found{% endif %} · {% if c.ppsf %}${{ '%.2f'|format(c.ppsf) }}/sqft{% else %}$/sqft Not found{% endif %}{% endif %}</div></details>
  <div class="small muted">{{ c.source }} · <a href="#" onclick="return openMapOverlay({{ c.id }})">Show on map</a></div>
  {{ sitelinks(c.address, c.city, p.state, c.zip, c.source_url, c.source) }}
  <button type="button" class="pinbtn {{ '' if c.pinned else 'off' }}" data-pinbtn="{{ c.id }}" onclick="return togglePin(event, {{ c.id }})">{{ '📌 Pinned — tap to unpin' if c.pinned else '📌 Pin this comp' }}</button>
@@ -44,8 +48,9 @@
  <div class="cb">
  <div class="score" style="background:#2563eb">SUBJECT<small>THIS PROPERTY</small></div>
  <div class="cprice">{{ p.list_price|money }}<span class="small muted"> list</span></div>
- <div class="small"><b>{{ p.address }}</b></div>
- <div class="small muted">{{ p.beds|num }} bd · {{ p.baths|num }} ba · {{ p.sqft|num }} sqft · built {{ p.year_built or '—' }} · lot {{ p.lot_sqft|num }} sqft</div>
+ <div class="small" data-subj-address><b>{{ p.address }}</b></div>
+ <div class="small muted" data-subj-specs>{{ p.beds|num }}bd • {{ p.baths|num }}ba • {{ (p.sqft|int) if p.sqft else '—' }}sqft • Built {{ p.year_built or '—' }}</div>
+ {% if p.lot_sqft and p.list_price and p.sqft %}<div class="small muted" data-subj-lot>Lot size: {{ '%.2f'|format(p.lot_sqft / 43560) }} acres · Sqft Price: ${{ (p.list_price / p.sqft)|round|int }}</div>{% endif %}
  {% if mode=='sold' %}<div class="small">Status {{ p.status }} · {{ p.deal_method }} · Flood zone {{ p.flood_zone or 'Not found' }}</div>
  {% elif mode=='coliving' %}
  <div class="small"><b>ZIP {{ p.zip }} stats</b><br>
@@ -76,7 +81,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 {% else %}
 <div class="gallery"><div class="nophoto" data-photos-empty>📷 No photos found for this property in free listing sources (HomeHarvest — Realtor.com/Zillow/Redfin). When you pull comps, the app automatically looks for this property's own listing photos, including a 10-year sold-history lookup. If the property isn't currently/recently listed and has no listing row in those sources, no photos exist to show — nothing is substituted or faked.</div></div>
 {% endif %}
-<h1 style="margin-top:10px">{{ p.address }}</h1>
+<h1 style="margin-top:10px;cursor:pointer" title="Click to copy location" onclick="if(navigator.clipboard){navigator.clipboard.writeText(this.textContent.trim());}">{{ p.address }}</h1>
 <p class="muted"><span class="badge {% if p.deal_method=='Cash' %}cash{% elif p.deal_method=='Subject To' %}subto{% endif %}">{{ p.deal_method }}</span>
 <span class="badge">{{ p.status }}</span> <span class="badge">{{ p.stage }}</span>
 · List {{ p.list_price|money }} · Flood zone <b>{{ p.flood_zone or 'Not found' }}</b> <span class="small">({{ p.flood_source or '' }}, {{ p.flood_date or '' }})</span>
@@ -127,11 +132,22 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 </div></div></div>
 <div data-ovcol="details"><div class="card"><h2>Property Details</h2>
 <div class="kv">
-<div><span>Type</span><b>{{ p.property_type or 'Not found' }}</b></div>
-<div><span>Beds</span><b>{{ p.beds|num }}</b></div><div><span>Baths</span><b>{{ p.baths|num }}</b></div>
-<div><span>Sqft</span><b>{{ p.sqft|num }}</b></div><div><span>Lot sqft</span><b>{{ p.lot_sqft|num }}</b></div>
-<div><span>Year built</span><b>{{ p.year_built or '—' }}</b></div><div><span>APN</span><b>{{ p.apn or 'Not found' }}</b></div>
-<div><span>HOA</span><b>{% if p.hoa_dues is not none %}{{ p.hoa_dues|money }}/{{ p.hoa_freq or '' }}{% else %}Not found{% endif %}</b></div>
+<div data-pd="type"><span>Property Type</span><b>{{ p.property_type or 'Not found' }}</b></div>
+<div data-pd="year"><span>Year Built</span><b>{{ p.year_built or 'Not found' }}</b></div>
+<div data-pd="bed"><span>Bed</span><b>{{ p.beds|num }}</b></div>
+<div data-pd="bath"><span>Bath</span><b>{{ p.baths|num }}</b></div>
+<div data-pd="apn"><span>APN</span><b>{{ p.apn or 'Not found' }}</b></div>
+<div data-pd="sqft"><span>Property size (Sqft)</span><b>{{ p.sqft|num }}</b></div>
+<div data-pd="lot"><span>Lot size (Sqft)</span><b>{{ p.lot_sqft|num }}</b></div>
+<div data-pd="hoa_dues"><span>HOA Dues</span><b>{% if p.hoa_dues is not none %}{{ p.hoa_dues|money }}{% else %}Not found{% endif %}</b></div>
+<div data-pd="hoa_freq"><span>HOA Frequency</span><b>{{ p.hoa_freq or 'Not found' }}</b></div>
+<div data-pd="legal"><span>Legal Description</span><b>{{ p.legal_desc or 'Not found' }}</b></div>
+<div data-pd="subdivision"><span>Subdivision Name</span><b>{{ p.subdivision or 'Not found' }}</b></div>
+</div>
+<h3 data-pd-head="occupancy">Occupancy &amp; Access</h3>
+<div class="kv">
+<div data-pd="occ_now"><span>Current Occupancy</span><b>{{ p.occupancy_now or 'Not found' }}</b></div>
+<div data-pd="occ_closing"><span>Occupancy at Closing</span><b>{{ p.occupancy_closing or 'Not found' }}</b></div>
 <div><span>Flood zone</span><b>{{ p.flood_zone or 'Not found' }}</b></div>
 </div>
 <div class="rowflex">
@@ -161,7 +177,13 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>Occupancy now</label><input name="occupancy_now" value="{{ p.occupancy_now or '' }}"></div>
 <div><label>Occupancy at closing</label><input name="occupancy_closing" value="{{ p.occupancy_closing or '' }}"></div></div>
 <label>Legal description</label><textarea name="legal_desc" rows="2">{{ p.legal_desc or '' }}</textarea>
-<div class="mvheadline" data-mv-headline>Market Value: {% if market_value %}{{ market_value|money }}{% else %}Not found{% endif %}{% if mv_basis %}<span class="small muted"> ({{ mv_basis }})</span>{% endif %}</div>
+<div class="mvheadline" data-mv-headline>{% if mv_count %}Average market value from {{ mv_count }} available estimate{{ 's' if mv_count != 1 }}: {{ market_value|money }}{% elif market_value %}Market Value: {{ market_value|money }}{% if mv_basis %}<span class="small muted"> ({{ mv_basis }})</span>{% endif %}{% else %}Market Value: Not found{% endif %}</div>
+<div class="kv" data-mv-sources>
+<div data-mv-src="zillow"><span>Zillow</span><b>{{ (p.est_zillow|money) if p.est_zillow else 'Not found' }}</b></div>
+<div data-mv-src="realtor"><span>Realtor</span><b>{{ (p.est_realtor|money) if p.est_realtor else 'Not found' }}</b></div>
+<div data-mv-src="redfin"><span>Redfin</span><b>{{ (p.est_redfin|money) if p.est_redfin else 'Not found' }}</b></div>
+<div data-mv-src="county"><span>County appraiser</span><b>{{ (p.est_county|money) if p.est_county else 'Not found' }}</b></div>
+</div>
 <h3>Market Value estimates <span class="small muted">(source + date stamped; blank = Not found)</span></h3>
 <div class="rowflex">
 <div><label>Zillow $</label><input name="est_zillow" value="{{ p.est_zillow if p.est_zillow is not none else '' }}"></div>
@@ -172,27 +194,32 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 </div></div>
 
 <div data-ovcol="deal"><div class="card"><h2>Deal Structure</h2>
+<div data-ds-block="valuation"><h3 data-ds-section="valuation">Valuation &amp; Offer</h3>
 <div class="rowflex">
 <div><label>List price (MLS) $</label><input name="list_price" value="{{ p.list_price if p.list_price is not none else '' }}"></div>
 <div><label>As-is value $</label><input name="as_is_value" value="{{ p.as_is_value if p.as_is_value is not none else '' }}"></div>
 <div><label>ARV $ (blank = auto from comps)</label><input name="arv" value="{{ p.arv if p.arv is not none else '' }}"></div></div>
 <div class="rowflex">
-<div><label>Repair estimate $</label><input name="repairs" value="{{ p.repairs if p.repairs is not none else '' }}"></div>
+<div><label>Repair estimate $</label><input name="repairs" value="{{ p.repairs if p.repairs is not none else '' }}"></div></div>
+<div class="maorow" data-mao-row><span>Max Offer (MAO)</span><b>{{ v.mao|money }}</b><a href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">Open underwriting →</a></div>
+<p class="small muted" style="margin-top:2px">MAO = 70% of ARV − repairs. Read-only here — the formula lives in Underwriting.</p>
+</div>
+<div data-ds-block="purchase"><h3 data-ds-section="purchase">Purchase Contract</h3>
+<div class="rowflex">
 <div><label>Purchase price $</label><input name="purchase_price" value="{{ p.purchase_price if p.purchase_price is not none else '' }}"></div>
 <div><label>Purchase method</label><select name="deal_method">{% for m in ['Cash','Subject To','Hybrid','Seller Finance','Stack'] %}<option {% if p.deal_method==m %}selected{% endif %}>{{ m }}</option>{% endfor %}</select></div></div>
 <div class="rowflex">
+<div><label>Inspection period</label><input name="inspection_days" value="{{ p.inspection_days if p.inspection_days is not none else '' }}"></div>
+<div><label>Day Type</label><input name="inspection_unit" value="{{ p.inspection_unit or 'calendar days' }}"></div>
+<div><label>Inspection deadline</label><input name="inspection_deadline" value="{{ p.inspection_deadline or '' }}"></div></div>
+<div class="rowflex">
 <div><label>Cash to Seller $</label><input name="cash_to_seller" value="{{ p.cash_to_seller if p.cash_to_seller is not none else '' }}"></div>
 <div><label>Total Entry Fee $</label><input name="total_entry_fee" value="{{ p.total_entry_fee if p.total_entry_fee is not none else '' }}"></div></div>
-<div class="maorow" data-mao-row><span>Max Offer (MAO)</span><b>{{ v.mao|money }}</b><a href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">Open underwriting →</a></div>
-<p class="small muted" style="margin-top:2px">MAO = 70% of ARV − repairs. Read-only here — the formula lives in Underwriting.</p>
-<div class="rowflex">
-<div><label>Inspection period</label><input name="inspection_days" value="{{ p.inspection_days if p.inspection_days is not none else '' }}"></div>
-<div><label>Unit</label><input name="inspection_unit" value="{{ p.inspection_unit or 'calendar days' }}"></div>
-<div><label>Inspection deadline</label><input name="inspection_deadline" value="{{ p.inspection_deadline or '' }}"></div></div>
 <div class="rowflex">
 <div><label>Status</label><select name="status">{% for s in ['Draft','Shared','Published'] %}<option {% if p.status==s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></div>
 <div><label>Deal stage</label><select name="stage">{% for s in ['New','Analyzing','Offer','Under Contract','Dispo','Closed'] %}<option {% if p.stage==s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></div></div>
-<h3>Wholesale</h3>
+</div>
+<div data-ds-block="wholesale"><h3 data-ds-section="wholesale">Wholesale</h3>
 <div class="rowflex">
 <div><label>Buy It Now $</label><input name="buy_it_now" value="{{ p.buy_it_now if p.buy_it_now is not none else '' }}"></div>
 <div><label>Minimum offer $</label><input name="min_offer" value="{{ p.min_offer if p.min_offer is not none else '' }}"></div>
@@ -200,7 +227,8 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div class="rowflex">
 <div><label>EMD A→B $</label><input name="emd_ab" value="{{ p.emd_ab if p.emd_ab is not none else '' }}"></div>
 <div><label>EMD B→C $</label><input name="emd_bc" value="{{ p.emd_bc if p.emd_bc is not none else '' }}"></div></div>
-<h3>Closing</h3>
+</div>
+<div data-ds-block="closing"><h3 data-ds-section="closing">Closing</h3>
 <div class="rowflex">
 <div><label>Title company</label><input name="title_company" value="{{ p.title_company or '' }}"></div>
 <div><label>Escrow officer</label><input name="escrow_officer" value="{{ p.escrow_officer or '' }}"></div>
@@ -211,6 +239,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div class="rowflex">
 <div><label>Closing costs paid by</label><input name="closing_costs_paid_by" value="{{ p.closing_costs_paid_by or '' }}"></div>
 <div><label>Purchase deposit $</label><input name="purchase_deposit" value="{{ p.purchase_deposit if p.purchase_deposit is not none else '' }}"></div></div>
+</div>
 <p><button class="btn big">💾 Save property</button>
 <span class="small muted">Fields also save automatically as you edit — watch for “Last saved” by the Notes card.</span></p>
 </div></div>
@@ -392,6 +421,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div class="comptools">
 <input type="search" data-comp-search placeholder="Search comps…" aria-label="Search comps">
 <button type="button" class="btn sm sec" data-filters-btn>⚙ Filters <span data-filters-count hidden></span></button>
+<span class="small muted" data-ranking-ind>Ranking (match-first tiers active)</span>
 <span class="viewtoggle"><button type="button" class="btn sm blue" data-viewmode="grid">▦ Grid</button><button type="button" class="btn sm sec" data-viewmode="list">☰ List</button></span>
 </div>
 <div class="filterpanel" data-filter-panel hidden>
@@ -425,16 +455,18 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><div class="lab">Avg days on market</div><div class="val" data-stat="sold_dom">{{ sold_stats.avg_dom if sold_stats.avg_dom is not none else '—' }}</div><div class="lab">&nbsp;</div></div>
 <div><div class="lab">Reconciled ARV (from these comps)</div><div class="val" data-stat="arv">{{ v.rec.arv|money }}</div><div class="lab">MAO <span data-stat="mao">{{ v.mao|money }}</span></div></div>
 </div>
+{% if sold_stats %}<p class="small" data-comp-averages style="margin:6px 0 2px">Comps averages: Avg <b data-avg="price">{{ sold_stats.avg_price|money }}</b> · <b data-avg="ppsf">{% if sold_stats.avg_ppsf is not none %}${{ '%.2f'|format(sold_stats.avg_ppsf) }}/sqft{% else %}—{% endif %}</b> · <b data-avg="dom">{% if sold_stats.avg_dom is not none %}{{ sold_stats.avg_dom }} DOM{% else %}—{% endif %}</b> <span data-avg="basis">{% if sold_stats.basis=='pinned' %}(of {{ sold_stats.n }} pinned comps){% else %}(of top 3 comps){% endif %}</span></p>{% endif %}
 {% if set_stats %}<p class="small" data-setstat-line style="margin:2px 0 8px">Whole set: all <b data-setstat="n">{{ set_stats.n }}</b> sold comps in this view — avg sale <b data-setstat="avg">{{ set_stats.avg|money if set_stats.avg else '—' }}</b>{% if set_stats.ppsf %} · avg <b data-setstat="ppsf">${{ set_stats.ppsf }}</b>/sqft{% endif %}{% if set_stats.dom is not none %} · avg <b data-setstat="dom">{{ set_stats.dom }}</b> days on market{% endif %} <span class="muted">(the averages above are your pinned/top-3 set; this line is the whole filtered set)</span></p>{% endif %}
 <p class="small muted" data-stat="arv_note" style="margin-top:-6px">{{ v.rec.note }}</p>{% endif %}
 {% if sold_view %}<div class="compcards" data-comp-grid>{{ subjcard('sold') }}{% for c in sold_view %}{{ compcard(c, 'sold') }}{% endfor %}</div>
 <div class="pager" data-comp-pager><button type="button" class="btn sm sec" data-page-prev>‹ Previous</button> <span data-page-nums></span> <button type="button" class="btn sm sec" data-page-next>Next ›</button> <span class="small muted" data-comp-showing></span></div>
 <div data-comp-listwrap style="display:none">
+<p class="small muted" data-list-count>1–{{ [5, sold_view|length]|min }} of {{ sold_view|length }}</p>
 <table class="complist" data-comp-list>
 <thead><tr><th>Address</th><th data-sort="beds">Beds ⇅</th><th data-sort="baths">Baths ⇅</th><th data-sort="sqft">Area ⇅</th><th data-sort="lot">Lot ⇅</th><th data-sort="year">Year ⇅</th><th data-sort="price">Price ⇅</th><th data-sort="distance">Distance ⇅</th><th>Match</th></tr></thead>
 <tbody>
 <tr data-subject="1"><td><b>{{ p.address }}</b> <span class="badge" style="background:#dbeafe;color:#1e40af">SUBJECT</span></td><td>{{ p.beds|num }}</td><td>{{ p.baths|num }}</td><td>{{ p.sqft|num }}</td><td>{{ p.lot_sqft|num }}</td><td>{{ p.year_built or '—' }}</td><td>{{ p.list_price|money }}</td><td>—</td><td>—</td></tr>
-{% for c in sold_view %}<tr data-cid="{{ c.id }}" data-price="{{ c.price or 0 }}" data-beds="{{ c.beds or 0 }}" data-baths="{{ c.baths or 0 }}" data-sqft="{{ c.sqft or 0 }}" data-lot="{{ c.lot_sqft or 0 }}" data-year="{{ c.year_built or 0 }}" data-distance="{{ c.distance_mi if c.distance_mi is not none else 999 }}" data-dist="{{ c.distance_mi if c.distance_mi is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}" data-ysold="{{ (c.event_date or '')[:4] }}" data-kind="{{ c.kind }}" data-ptype="{{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }}" data-zip="{{ c.zip or '' }}"><td>{{ c.address }}, {{ c.city }}{% if c.pinned %} 📌{% endif %}</td><td>{{ c.beds|num }}</td><td>{{ c.baths|num }}</td><td>{{ c.sqft|num }}</td><td>{{ (c.lot_sqft|num) if c.lot_sqft else '—' }}</td><td>{{ c.year_built or '—' }}</td><td>{{ c.price|money }}</td><td>{{ c.distance_mi|num(2) }} mi</td><td>{{ c.match_score|num }}</td></tr>{% endfor %}
+{% for c in sold_view %}<tr data-cid="{{ c.id }}" data-price="{{ c.price or 0 }}" data-beds="{{ c.beds or 0 }}" data-baths="{{ c.baths or 0 }}" data-sqft="{{ c.sqft or 0 }}" data-lot="{{ c.lot_sqft or 0 }}" data-year="{{ c.year_built or 0 }}" data-distance="{{ c.distance_mi if c.distance_mi is not none else 999 }}" data-dist="{{ c.distance_mi if c.distance_mi is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}" data-ysold="{{ (c.event_date or '')[:4] }}" data-kind="{{ c.kind }}" data-ptype="{{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }}" data-zip="{{ c.zip or '' }}"><td>{{ c.address }}, {{ c.city }}{% if c.pinned %} 📌 Pinned #{{ pinned_rank.get(c.id, '') }}{% endif %}</td><td>{{ c.beds|num }}</td><td>{{ c.baths|num }}</td><td>{{ c.sqft|num }}</td><td>{{ (c.lot_sqft|num) if c.lot_sqft else '—' }}</td><td>{{ c.year_built or '—' }}</td><td>{{ c.price|money }}</td><td>{{ c.distance_mi|num(2) }} mi</td><td>{{ c.match_score|num }}</td></tr>{% endfor %}
 </tbody></table>
 <button type="button" class="btn sec" data-viewmore>View More</button>
 </div>
@@ -500,6 +532,21 @@ function pinColor(c){ return c.pinned ? '#f59e0b' : (c.kind === 'sold' ? '#16a34
 function compById(id){ for (var i = 0; i < COMPS.length; i++) if (COMPS[i].id === id) return COMPS[i]; return null; }
 function money(x){ return (x === null || x === undefined) ? 'Not found' : '$' + Math.round(x).toLocaleString('en-US'); }
 function setStat(name, txt){ document.querySelectorAll('[data-stat="' + name + '"]').forEach(function(e){ e.textContent = txt; }); }
+function setAvgLine(price, ppsf, dom, basisTxt){
+  var pe = document.querySelector('[data-avg="price"]'), fe = document.querySelector('[data-avg="ppsf"]'),
+      de = document.querySelector('[data-avg="dom"]'), be = document.querySelector('[data-avg="basis"]');
+  if (pe) pe.textContent = (price === null || price === undefined) ? '—' : money(price);
+  if (fe) fe.textContent = (ppsf === null || ppsf === undefined) ? '—' : ('$' + Number(ppsf).toFixed(2) + '/sqft');
+  if (de) de.textContent = (dom === null || dom === undefined) ? '—' : (Math.round(dom) + ' DOM');
+  if (be && basisTxt) be.textContent = basisTxt;
+}
+function setAvgLineTexts(o){
+  var pe = document.querySelector('[data-avg="price"]'), fe = document.querySelector('[data-avg="ppsf"]'),
+      de = document.querySelector('[data-avg="dom"]'), be = document.querySelector('[data-avg="basis"]');
+  if (!o) return;
+  if (pe) pe.textContent = o.price; if (fe) fe.textContent = o.ppsf;
+  if (de) de.textContent = o.dom; if (be) be.textContent = o.basis;
+}
 
 function highlightComp(id){
   var c = compById(id);
@@ -583,6 +630,7 @@ function applyPin(cid, j){
     setStat('sold_avg', money(s.avg_price));
     setStat('sold_ppsf', s.avg_ppsf ? ('$' + s.avg_ppsf) : '—');
     setStat('sold_dom', (s.avg_dom === null || s.avg_dom === undefined) ? '—' : s.avg_dom);
+    setAvgLine(s.avg_price, s.avg_ppsf, s.avg_dom, s.basis === 'pinned' ? ('(of ' + s.n + ' pinned comps)') : '(of top 3 comps)');
   }
   if (j.ltr){
     setStat('ltr_basis', j.ltr.basis === 'pinned' ? ('Average rent of your ' + j.ltr.basis_n + ' pinned rental comps') : 'Average rent — top 3 by score (pin rentals to choose your own)');
@@ -616,6 +664,9 @@ function captureOrigStats(){
   var bEl = document.querySelector('[data-stat="sold_basis"]'), aEl = document.querySelector('[data-stat="sold_avg"]'),
       pEl = document.querySelector('[data-stat="sold_ppsf"]'), dEl = document.querySelector('[data-stat="sold_dom"]');
   if (bEl && aEl) ORIG_STATS = {basis: bEl.textContent, avg: aEl.textContent, ppsf: pEl ? pEl.textContent : '—', dom: dEl ? dEl.textContent : '—'};
+  var ape = document.querySelector('[data-avg="price"]'), afe = document.querySelector('[data-avg="ppsf"]'),
+      ade = document.querySelector('[data-avg="dom"]'), abe = document.querySelector('[data-avg="basis"]');
+  if (ORIG_STATS && ape) ORIG_STATS.avgline = {price: ape.textContent, ppsf: afe ? afe.textContent : '', dom: ade ? ade.textContent : '', basis: abe ? abe.textContent : ''};
 }
 function setSetStat(name, txt){ document.querySelectorAll('[data-setstat="' + name + '"]').forEach(function(e){ e.textContent = txt; }); }
 function refreshSetStats(){
@@ -633,19 +684,20 @@ function refreshSetStats(){
 function refreshCompStats(){
   refreshSetStats();
   if (!compQuery() && !COMP_FILTERS.active){
-    if (ORIG_STATS){ setStat('sold_basis', ORIG_STATS.basis); setStat('sold_avg', ORIG_STATS.avg); setStat('sold_ppsf', ORIG_STATS.ppsf); setStat('sold_dom', ORIG_STATS.dom); }
+    if (ORIG_STATS){ setStat('sold_basis', ORIG_STATS.basis); setStat('sold_avg', ORIG_STATS.avg); setStat('sold_ppsf', ORIG_STATS.ppsf); setStat('sold_dom', ORIG_STATS.dom); setAvgLineTexts(ORIG_STATS.avgline); }
     return;
   }
   var vis = filteredSoldCards();
   var pinned = vis.filter(function(cd){ return cd.classList.contains('pinned'); });
   var basis = pinned.length ? pinned : vis;
-  if (!basis.length){ setStat('sold_basis', 'No comps match your search'); setStat('sold_avg', '—'); setStat('sold_ppsf', '—'); setStat('sold_dom', '—'); return; }
+  if (!basis.length){ setStat('sold_basis', 'No comps match your search'); setStat('sold_avg', '—'); setStat('sold_ppsf', '—'); setStat('sold_dom', '—'); setAvgLine(null, null, null, '(no matching comps)'); return; }
   function avg(attr){ var xs = basis.map(function(cd){ return parseFloat(cd.getAttribute(attr)); }).filter(function(x){ return !isNaN(x); }); return xs.length ? xs.reduce(function(a, b){ return a + b; }, 0) / xs.length : null; }
   var ap = avg('data-price'), af = avg('data-ppsf'), ad = avg('data-dom');
   setStat('sold_basis', (pinned.length ? ('Averages of your ' + pinned.length + ' pinned comps') : ('Averages of ' + vis.length + ' matching comps')) + (compQuery() ? ' — search filter on' : ' — comp filters on'));
   setStat('sold_avg', ap === null ? '—' : money(ap));
   setStat('sold_ppsf', af === null ? '—' : ('$' + (Math.round(af * 100) / 100)));
   setStat('sold_dom', ad === null ? '—' : String(Math.round(ad)));
+  setAvgLine(ap, af, ad, pinned.length ? ('(of ' + pinned.length + ' pinned comps)') : ('(of ' + vis.length + ' matching comps)'));
 }
 /* ---- v1.7b: Sold-view filters popover (ReiSearch pass 2 — 3 groups with
    per-group selected counters, Clear all / Apply). Client-side over the
@@ -739,6 +791,8 @@ function applyCompView(){
     var rows = Array.prototype.slice.call(pn.querySelectorAll('[data-comp-list] tbody tr[data-cid]'));
     var q = compQuery();
     var match = rows.filter(function(tr){ return (!q || tr.textContent.toLowerCase().indexOf(q) >= 0) && passesFilters(tr); });
+    var lc = pn.querySelector('[data-list-count]');
+    if (lc) lc.textContent = match.length ? ('1–' + Math.min(compExpanded ? match.length : 5, match.length) + ' of ' + match.length) : '0 of 0';
     rows.forEach(function(tr){ tr.style.display = 'none'; });
     match.forEach(function(tr, i){ tr.style.display = (compExpanded || i < 5) ? '' : 'none'; });
     var vm = pn.querySelector('[data-viewmore]');
