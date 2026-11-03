@@ -175,8 +175,8 @@
     /* v1.6 Cash Needed (ReiSearch): cash contributions + points/fees + closing +
        entry fee. A loan-only funding GAP does not inflate Cash Needed on rentals;
        Fix & Flip keeps the gap (mirrors app.py compute_underwriting). */
-    var cashIn = cashEquity + pointsFees + closing + entryFee + (strat === "Fix & Flip" ? Math.max(gap, 0) : 0);
-    var fundingStatus = funded <= 0 ? "Not Funded" : (gap <= 0 ? "Fully Funded" : "Partially Funded");
+    var cashIn = cashEquity + pointsFees + closing + entryFee + Math.max(gap, 0);
+    var fundingStatus = funded <= 0 ? "Not Funded" : (gap < -0.05 * Math.max(uses, 1) ? "Over-funded" : (gap <= 0 ? "Fully Funded" : "Partially Funded"));
     var out = { strategy: strat, arv: arv, purchase_price: price, rehab: rehab, rehab_calc: rehabCalc,
       rehab_mode: rehabMode, appliances: appliances, furnishing: furnishing, conversion: conversion,
       total_project: totalProject, holding_cost: holdingTotal, uses: uses, funded: funded, gap: gap,
@@ -332,7 +332,7 @@
     out.taxes_est = taxesEst; out.insurance_est = insEst;
     out.noi_mo = noi; out.cashflow_mo = cf; out.cf_per_room = metrics.cf_per_room;
     out.cash_per_room = roomsN ? cashIn / roomsN : null;
-    out.dscr = Math.round(metrics.dscr * 100) / 100;
+    out.dscr = debtService ? Math.round(metrics.dscr * 100) / 100 : null; /* v2.1: N/A with no debt */
     out.coc_pct = cashIn ? metrics.coc * 100 : null; out.cap_rate_pct = metrics.cap_rate * 100;
     out.breakeven_pct = metrics.breakeven * 100;
     out.payback_yrs = metrics.coc > 0 ? Math.round(10 / metrics.coc) / 10 : null;
@@ -401,10 +401,7 @@
     var termW = el("div", "fterm");
     termW.appendChild(numInput("f-termval", f.term_value));
     termW.appendChild(selOf("f-termunit", ["Months", "Years"], f.term_unit || "Months"));
-    var termField = field("Remaining Term", termW);
-    termField.classList.add("fterm-field"); /* v22: term field spans 2 grid
-      columns so the value box has real width beside the unit selector */
-    grid.appendChild(termField);
+    grid.appendChild(field("Remaining Term", termW));
     grid.appendChild(field("Points %", numInput("f-points", f.points)));
     grid.appendChild(field("Fees $", numInput("f-fees", f.fees)));
     grid.appendChild(field("Taxes $/mo (escrow)", numInput("f-taxes", f.taxes_mo)));
@@ -529,7 +526,7 @@
     var v = r[key];
     if (key === "score") return (v === null || v === undefined) ? "—" : String(v);
     if (key === "score_label") return r.label || "";
-    if (key === "dscr") return (v === null || v === undefined) ? "—" : (Math.round(v * 100) / 100).toFixed(2);
+    if (key === "dscr") return (v === null || v === undefined) ? "N/A" : (Math.round(v * 100) / 100).toFixed(2);
     if (PCTKEYS[key]) return PC(v);
     if (key === "rooms") return (v === null || v === undefined) ? "—" : String(v);
     return M(v);
@@ -603,7 +600,7 @@
       var txt = (key in special) ? special[key] : fmtFor(key, r, s);
       if (elm.tagName === "INPUT") elm.value = txt; else elm.textContent = txt;
       if (key === "funding_status") {
-        elm.className = "fbadge " + (r.funding_status === "Fully Funded" ? "full" : (r.funding_status === "Partially Funded" ? "part" : "none"));
+        elm.className = "fbadge " + (r.funding_status === "Fully Funded" ? "full" : (r.funding_status === "Over-funded" ? "over" : (r.funding_status === "Partially Funded" ? "part" : "none")));
       }
     });
     /* Month/Year summary panels (ReiSearch side panels) */
@@ -644,7 +641,7 @@
       else if (k === "sale") elm.textContent = M(sc.sale);
       else if (k === "allin") elm.textContent = M(sc.all_in);
       else if (k === "coc") elm.textContent = PC(sc.coc_pct);
-      else if (k === "dscr") elm.textContent = (sc.dscr === null || sc.dscr === undefined) ? "—" : (Math.round(sc.dscr * 100) / 100).toFixed(2);
+      else if (k === "dscr") elm.textContent = (sc.dscr === null || sc.dscr === undefined) ? "N/A" : (Math.round(sc.dscr * 100) / 100).toFixed(2);
       else if (k === "cap") elm.textContent = PC(sc.cap_rate_pct);
     });
     var ncfBase = sc ? sc.net : r.cashflow_mo;
@@ -863,7 +860,7 @@
         R("Total Uses", M(r.uses)); R("Funding Added", M(r.funded)); R("Cash Needed", M(r.cash_in));
         H("Return Metrics");
         R("Net Cash Flow", M(r.cashflow_mo) + "/mo"); R("Cash-on-Cash", PC(r.coc_pct));
-        R("DSCR", (r.dscr === null || r.dscr === undefined) ? "—" : (Math.round(r.dscr * 100) / 100).toFixed(2));
+        R("DSCR", (r.dscr === null || r.dscr === undefined) ? "N/A" : (Math.round(r.dscr * 100) / 100).toFixed(2));
         R("Cap Rate", PC(r.cap_rate_pct));
         H("Break-Even");
         R("Break-Even Occupancy", PC(r.breakeven_pct));
@@ -1184,6 +1181,7 @@
     var r = compute(panel.dataset.strategy, s);
     var price = N(s.purchase_price), uses = r.uses;
     var box = panel.querySelector('[data-rows="funding"]'); if (!box) return false;
+    while (box.firstChild) box.removeChild(box.firstChild); /* v2.1: a preset REPLACES the stack instead of piling on */
     function card(type, amt, rate, tv, unit, ptype, extra) {
       var c = blankCard(type); c.amount = Math.round(amt); c.rate = rate;
       c.term_value = tv; c.term_unit = unit; c.payment_type = ptype;

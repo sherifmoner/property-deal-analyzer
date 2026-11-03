@@ -748,10 +748,11 @@ def compute_underwriting(strategy, raw_inp, prop):
     # the gap in Cash Needed — the flip buyer brings the gap in cash at closing
     # (Senisa fixture: gap $61,684 = Cash Needed $61,684).
     cash_in = cash_equity + points_fees + closing + entry_fee
-    if strategy == "Fix & Flip":
-        cash_in += max(gap, 0)
+    cash_in += max(gap, 0)   # v2.1: any unfunded gap is cash YOU bring, for every strategy (was Fix & Flip only)
     if funded <= 0:
         funding_status = "Not Funded"
+    elif gap < -0.05 * max(uses, 1):
+        funding_status = "Over-funded"
     elif gap <= 0:
         funding_status = "Fully Funded"
     else:
@@ -971,7 +972,7 @@ def compute_underwriting(strategy, raw_inp, prop):
                 "taxes_est": taxes_est, "insurance_est": ins_est, "noi_mo": round(noi),
                 "cashflow_mo": round(cf), "cf_per_room": round(metrics["cf_per_room"]),
                 "cash_per_room": round(cash_in / rooms_n) if rooms_n else None,
-                "dscr": round(metrics["dscr"], 2),
+                "dscr": round(metrics["dscr"], 2) if debt_service else None,   # v2.1: N/A when there is no debt
                 "coc_pct": round(metrics["coc"] * 100, 1) if cash_in else None,
                 "cap_rate_pct": round(metrics["cap_rate"] * 100, 2),
                 "breakeven_pct": round(metrics["breakeven"] * 100, 1),

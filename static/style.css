@@ -221,11 +221,8 @@ details.acc.sub{margin-top:10px;background:#f8fafc}
 .f-poslab{font-size:12px;color:var(--muted);margin-left:auto}
 .fgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px}
 .ffield label{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}
-.fterm{display:flex;gap:5px;flex-wrap:nowrap}
+.fterm{display:flex;gap:5px}
 .fterm input{flex:1}
-.fterm input.f-termval{flex:1 1 120px;min-width:120px}
-.fterm select.f-termunit{flex:0 0 110px;width:110px;min-width:110px}
-.fgrid .fterm-field{grid-column:span 2}
 .fseg{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:11px}
 .fseg-lab{font-size:12px;color:var(--muted);margin-right:4px}
 .f-pt{border:1px solid var(--line);background:#fff;padding:5px 11px;border-radius:99px;font-size:12px;font-weight:600;cursor:pointer}
@@ -438,3 +435,4 @@ button:focus-visible, a:focus-visible {
  .sidenav{position:fixed;top:0;left:0;bottom:0;z-index:70;width:240px;overflow:auto}
  body.navopen .sidenav{display:block}
 }
+.fbadge.over{background:#e0e7ff;color:#3730a3}
