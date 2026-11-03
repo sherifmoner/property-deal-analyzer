@@ -519,15 +519,32 @@ def _loan_payment(amount, rate_pct, term_years):
         return amt / n
     return amt * rate / 100 / 12
 
+def _eff_months(f):
+    """v3.1 UNIFIED TERM RULE (ReiSearch decisive probe 2026-11-03): the
+    effective amortization term in months = Amortization Term if set, else
+    Loan Term if set, else 0 (interest-only). A blank Amortization Term
+    (""/None/0) falls back to the Loan Term — it is NOT "not set".
+    "Not set" survives only for a blank AMOUNT / Fixed-with-blank-amount."""
+    av = f.get("amort_value")
+    if av not in (None, "") and (fnum(av, 0) or 0) > 0:
+        return (fnum(av, 0) or 0) * (1 if (f.get("amort_unit") or "Months") == "Months" else 12)
+    tv = f.get("term_value")
+    if tv not in (None, "") and (fnum(tv, 0) or 0) > 0:
+        return (fnum(tv, 0) or 0) * (1 if (f.get("term_unit") or "Months") == "Months" else 12)
+    return 0
+
 def _norm_funding(f):
     """v1.5 funding-card normalization: legacy rows {type, amount, rate, term_years} gain the
     ReiSearch card fields (preset, loan type, position, term value+unit, points, fees,
     payment type, escrow). Defaults chosen so legacy payments are unchanged:
-    term present -> Amortized, no term -> Interest Only.
+    either term present -> Amortized, neither term -> Interest Only.
     v2.3 TWO-TERM MODEL (ReiSearch pass 2026-11-03): cards carry a Loan Term
     (payment-invariant; amortization horizon/balloon only) AND an Amortization
     Term (drives the payment). Legacy rows carry only the single term — it WAS
-    the payment term, so it migrates to BOTH fields and payments are unchanged."""
+    the payment term, so it migrates to BOTH fields and payments are unchanged.
+    v3.1: a blank Amortization Term is NOT copied from the Loan Term at
+    normalization time — the fallback is computed at pricing time, so a later
+    Loan Term change still moves the payment (gate_v31 TM (j))."""
     f = dict(f or {})
     ty = f.get("type") or "Conventional"
     tv = f.get("term_value")
@@ -557,20 +574,18 @@ def _norm_funding(f):
     for k in ("points", "fees", "taxes_mo", "insurance_mo"):
         f[k] = fnum(f.get(k), 0) or 0
     if not f.get("payment_type"):
-        a_months = (fnum(f["amort_value"], 0) or 0) * (1 if f["amort_unit"] == "Months" else 12)
+        a_months = _eff_months(f)  # v3.1: inference keys on the EFFECTIVE term (Amort else Loan)
         f["payment_type"] = "fixed" if fnum(f.get("fixed_payment"), 0) else ("amortized" if a_months else "interest_only")
     if f.get("fixed_payment") in (None, ""):
         f["fixed_payment"] = ""
     return f
 
 def _amort_months(f):
-    """The AMORTIZATION term in months (v2.3: this is the payment term).
-    Rows that never passed _norm_funding fall back to the legacy single term."""
-    if "amort_value" in f and f.get("amort_value") is not None:
-        tv = fnum(f.get("amort_value"), 0) or 0
-        return tv if (f.get("amort_unit") or "Months") == "Months" else tv * 12
-    tv = fnum(f.get("term_value"), 0) or 0
-    return tv if (f.get("term_unit") or "Months") == "Months" else tv * 12
+    """The EFFECTIVE amortization term in months (v3.1 unified rule:
+    Amortization Term if set, else Loan Term if set, else 0 =
+    interest-only). This replaces the v2.3 amort-only reading; rows that
+    never passed _norm_funding get the same fallback."""
+    return _eff_months(f)
 
 def _row_payment(f):
     """(principal+interest payment, escrow taxes+insurance) for one funding card.
@@ -578,7 +593,7 @@ def _row_payment(f):
     if (f.get("type") or "") in ("Cash", "Equity"):
         return 0.0, 0.0
     rate = fnum(f.get("rate"), 0) or 0
-    months = _amort_months(f)  # v2.3: the AMORTIZATION term drives the payment (Loan Term never does)
+    months = _amort_months(f)  # v3.1: the EFFECTIVE term drives the payment (Amort else Loan else IO)
     pt = f.get("payment_type") or "amortized"
     # v1.8b: a Fixed payment IS the payment — it must not require a loan amount
     # (Subject-To cards have a blank amount by design; blank cards start at 0).
@@ -588,17 +603,18 @@ def _row_payment(f):
     amt = fnum(f.get("amount"), 0) or 0
     if amt <= 0: return 0.0, 0.0
     esc = (fnum(f.get("taxes_mo"), 0) or 0) + (fnum(f.get("insurance_mo"), 0) or 0)
-    if pt in ("amortized", "principal_only") and not months:
-        # v2.0 (P0-3, mirrors uw.js): no term typed -> NO payment. The old
-        # else-branch priced a term-less Amortized card as interest-only
-        # (_loan_payment with 0 years), so the term field looked dead.
-        return 0.0, esc
     if pt == "interest_only":
         pay = amt * rate / 100 / 12
     elif pt == "principal_only":
-        # ReiSearch: Principal Only = monthly interest + straight-line principal (balance / amort months)
-        pay = amt * rate / 100 / 12 + amt / months
+        # ReiSearch: Principal Only = monthly interest + straight-line principal
+        # over the EFFECTIVE term; with no term at all the payment is
+        # interest-only (v3.1 INFERRED — only Amortized measured, decisive
+        # probe 2026-11-03: $1,756 "(no term set)").
+        pay = amt * rate / 100 / 12 + (amt / months if months else 0)
     else:
+        # _loan_payment with 0 years IS interest-only (v1.2 fallback) — so a
+        # term-less Amortized card prices $1,756, exactly as ReiSearch does.
+        # (v2.0's "not set" branch is SUPERSEDED by the decisive probe.)
         pay = _loan_payment(amt, rate, months / 12)
     return pay, esc
 
@@ -611,7 +627,7 @@ def _paydown_y1(f):
     amt = fnum(f.get("amount"), 0) or 0
     if amt <= 0: return 0.0
     rate = fnum(f.get("rate"), 0) or 0
-    months = _amort_months(f)  # v2.3: payment (hence paydown) follows the AMORTIZATION term
+    months = _amort_months(f)  # v3.1: payment (hence paydown) follows the EFFECTIVE term
     pt = f.get("payment_type") or "amortized"
     if pt == "interest_only":
         return 0.0
@@ -620,7 +636,7 @@ def _paydown_y1(f):
     if pt == "fixed":
         pay = fnum(f.get("fixed_payment"), 0) or 0
     elif not months:
-        return 0.0  # v2.0: Amortized with no term -> no payment -> no paydown
+        return 0.0  # v3.1: no effective term -> interest-only pricing -> $0 paydown
     else:
         pay = _loan_payment(amt, rate, months / 12)
     if pay <= 0: return 0.0
@@ -870,6 +886,10 @@ def compute_underwriting(strategy, raw_inp, prop):
             else: carry_mo += amt * (fnum(s.get("rate"), 0) or 0) / 100 / 12 + esc
             lab = s.get("loan_type") or s.get("type") or "Loan"
             if s.get("preset") and s.get("preset") != lab: lab = f"{lab} · {s['preset']}"
+            if (s.get("payment_type") in ("amortized", "principal_only") and amt > 0
+                    and not (fnum(s.get("amort_value"), 0) or 0) and not (fnum(s.get("term_value"), 0) or 0)):
+                # v3.1: priced interest-only for lack of ANY term — ReiSearch's verbatim label.
+                lab = f"{lab} — Interest only (no term set)"
             debt_lines.append({"label": lab, "payment": round(pay + esc)})
     # existing mortgage data (all strategies except Fix & Flip)
     # v1.8a PITI wiring: the breakdown fields are LIVE components of the payment,

@@ -22,11 +22,19 @@
      payment; the LOAN term never touches the payment — it only sets the
      amortization table's horizon (balloon). Legacy cards saved with only the
      single term keep it as BOTH (server _norm_funding migrates on load; the
-     undefined-check here is the same rule for in-flight states). */
+     undefined-check here is the same rule for in-flight states).
+     v3.1 UNIFIED TERM RULE (ReiSearch decisive probe 2026-11-03): the
+     EFFECTIVE amortization term = Amortization Term if set, else Loan Term
+     if set, else 0 (interest-only). A blank Amortization Term falls back
+     to the Loan Term — it is NOT "not set" (that was the refuted v2.0 rule).
+     The fallback is computed here, at pricing time, so a later Loan Term
+     change still moves the payment. */
   function amortMonths(f) {
     if (!f) return 0;
-    if (f.amort_value === undefined || f.amort_value === null) return termMonths(f);
-    var tv = N(f.amort_value); return (f.amort_unit || "Months") === "Months" ? tv : tv * 12;
+    var av = N(f.amort_value);
+    if (f.amort_value !== undefined && f.amort_value !== null && f.amort_value !== "" && av > 0)
+      return (f.amort_unit || "Months") === "Months" ? av : av * 12;
+    return termMonths(f);
   }
   function rowPayment(f) {
     /* ReiSearch funding-card payment model. Returns {pay (P&I or fixed), esc (taxes+insurance)}. */
@@ -36,18 +44,17 @@
        (Subject-To cards have a blank amount by design; blank cards start at 0). */
     if (pt === "fixed") return { pay: N(f.fixed_payment), esc: N(f.taxes_mo) + N(f.insurance_mo) };
     var amt = N(f.amount); if (amt <= 0) return { pay: 0, esc: 0 };
-    /* v2.0 (P0-3 root cause): an Amortized/Principal-Only card with NO
-       amortization term typed silently priced as interest-only (loanPayment's
-       yrs<=0 fallback), so the term field looked dead and a loan number existed
-       that the user never agreed to. Now: no amortization term -> payment
-       "not set", $0 debt — the same honest state as a blank Fixed payment.
-       No term is ever invented. (v2.3: the rule keys on the AMORTIZATION term;
-       clearing the Loan Term alone never unsets a payment — ReiSearch.) */
+    /* v3.1 (decisive probe 2026-11-03, SUPERSEDES the v2.0 "not set" rule):
+       a card with NO term at all prices INTEREST-ONLY — $301,040 @7%
+       both-blank -> $1,756, NCF $1,029, Score 83, breakdown label
+       "Interest only (no term set)". Principal-Only with no term ->
+       interest-only is INFERRED (only Amortized measured). "Not set"
+       survives only for a blank amount / Fixed-with-blank-amount. */
     if ((pt === "amortized" || pt === "principal_only") && !months)
-      return { pay: 0, esc: N(f.taxes_mo) + N(f.insurance_mo), notset: true };
+      return { pay: amt * rate / 100 / 12, esc: N(f.taxes_mo) + N(f.insurance_mo), noterm: true };
     if (pt === "interest_only") pay = amt * rate / 100 / 12;
-    else if (pt === "principal_only") pay = amt * rate / 100 / 12 + (months ? amt / months : 0); // ReiSearch: interest + straight-line principal over the AMORTIZATION term
-    else pay = loanPayment(amt, rate, months / 12);
+    else if (pt === "principal_only") pay = amt * rate / 100 / 12 + (months ? amt / months : 0); // ReiSearch: interest + straight-line principal over the EFFECTIVE term
+    else pay = loanPayment(amt, rate, months / 12); // months 0 unreachable here (noterm branch above); loanPayment's yrs<=0 fallback is itself IO
     return { pay: pay, esc: N(f.taxes_mo) + N(f.insurance_mo) };
   }
   function paydownY1For(f) {
@@ -59,7 +66,7 @@
     var rate = N(f.rate), months = amortMonths(f), pt = f.payment_type || "amortized";
     if (pt === "interest_only") return 0;
     if (pt === "principal_only") return months ? Math.min(amt, amt / months * 12) : 0;
-    if (pt === "amortized" && !months) return 0; /* v2.0: no amortization term -> no payment -> no paydown (never invent 360) */
+    if (pt === "amortized" && !months) return 0; /* v3.1: no effective term -> interest-only pricing -> $0 paydown */
     var pay = pt === "fixed" ? N(f.fixed_payment) : loanPayment(amt, rate, months / 12);
     if (pay <= 0) return 0;
     var r = rate / 100 / 12, bal = amt, prin = 0;
@@ -74,12 +81,12 @@
        amortization term ends the table with a balloon balance, exactly as
        ReiSearch's table behaves (measured 2026-11-03). */
     var amt = N(f.amount), rate = N(f.rate), pt = f.payment_type || "amortized";
-    /* v2.0: an Amortized/Principal-Only card with no AMORTIZATION term has NO
-       schedule — the old || 360 invented a 30-year term the user never entered.
-       (Fixed cards keep a display horizon only; their payment is the user's amount.) */
-    if ((pt === "amortized" || pt === "principal_only") && !amortMonths(f) && amt > 0)
-      return { payment: 0, rows: [], notset: true };
+    /* v3.1: a card with no effective term prices interest-only (never
+       "not set") — its schedule is the IO schedule (interest, $0
+       principal, balance flat). The old notset early return is gone. */
     var aMonths = amortMonths(f);
+    var effPt = pt;
+    if ((pt === "amortized" || pt === "principal_only") && !aMonths && amt > 0) effPt = "interest_only";
     var months = termMonths(f) || aMonths || 360;
     var rp = rowPayment(f);
     var r = rate / 100 / 12, bal = amt, rows = [];
@@ -90,14 +97,14 @@
       var mInYear = Math.min(12, months - (y - 1) * 12);
       for (var i = 0; i < mInYear; i++) {
         var inter = bal * r, prin = 0;
-        if (pt === "interest_only") { inter = amt * r; prin = 0; }
-        else if (pt === "principal_only") prin = aMonths ? Math.min(amt / aMonths, bal) : 0;
-        else if (pt === "fixed") prin = Math.min(Math.max(rp.pay - inter, 0), bal);
+        if (effPt === "interest_only") { inter = amt * r; prin = 0; }
+        else if (effPt === "principal_only") prin = aMonths ? Math.min(amt / aMonths, bal) : 0;
+        else if (effPt === "fixed") prin = Math.min(Math.max(rp.pay - inter, 0), bal);
         else prin = Math.min(Math.max(pmtAm - inter, 0), bal);
         ti += inter; tp += prin; bal -= prin; if (bal < 0) bal = 0;
       }
       rows.push({ year: y, interest: ti, principal: tp, balance: Math.max(bal, 0) });
-      if (pt === "interest_only") { if (y >= 10) break; }
+      if (effPt === "interest_only") { if (y >= 10) break; }
       else if (bal <= 0.5) break;
     }
     return { payment: rp.pay + rp.esc, rows: rows };
@@ -280,6 +287,8 @@
         paydownY1 += paydownY1For(rr);
         var lab = f.loan_type || f.type || "Loan";
         if (f.preset && f.preset !== lab) lab += " · " + f.preset;
+        if ((f.payment_type === "amortized" || f.payment_type === "principal_only") && amt > 0 && !N(rr.amort_value) && !N(rr.term_value))
+          lab += " — Interest only (no term set)"; /* v3.1: priced IO for lack of ANY term — ReiSearch's verbatim label */
         debtLines.push({ label: lab, payment: Math.round(rp.pay + rp.esc) });
       }
     });
