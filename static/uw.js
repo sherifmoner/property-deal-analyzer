@@ -1116,6 +1116,16 @@
   function recalc(panel) {
     var s = readState(panel);
     var r = compute(panel.dataset.strategy, s);
+    /* v2.7 (audit lap): ReiSearch's measured funding EMPTY STATE — the
+       "No funding sources yet" note shows exactly when the stack is empty.
+       recalc is the funnel every funding mutation passes through (preset
+       add, per-card remove, Clear all, state load), so toggling here
+       keeps the note correct on every path. */
+    var fEmpty = panel.querySelector("[data-funding-empty]");
+    if (fEmpty) {
+      var fBox = panel.querySelector('[data-rows="funding"]');
+      fEmpty.style.display = (fBox && fBox.querySelector(".fcard")) ? "none" : "";
+    }
     /* v1.8b: writeOutputs withdraws flagged auto-estimates when a loan payment
        takes over (taxes/insurance then live inside PITI). If it cleared a field,
        recompute in the SAME interaction — otherwise totals land one input late:

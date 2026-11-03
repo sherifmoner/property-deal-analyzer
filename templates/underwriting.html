@@ -212,6 +212,7 @@
 {% for pr in ['Cash','Conventional','DSCR','Hard Money','Private Money','Seller Financing','Subject-To','Custom Stack'] %}<button type="button" class="btn sm sec" data-preset="{{ pr }}" onclick="return uwPreset(this,'{{ pr }}')">{{ pr }}</button>{% endfor %}
 </div>
 <div data-rows="funding"></div>
+<p class="small muted" data-funding-empty style="margin:6px 0 2px">No funding sources yet — Start with a common structure<br>Or build a custom stack</p>
 <button type="button" class="btn sm sec" onclick="return uwAddRow(this,'funding')">+ Add Funding Source</button>
 <button type="button" class="btn sm sec" onclick="return uwClearFunding(this)">Clear all</button>
 <p class="small muted">You can combine multiple funding sources to match the deal.</p>
