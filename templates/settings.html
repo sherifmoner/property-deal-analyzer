@@ -18,6 +18,10 @@
 <form method="post"><label>US Census API key (keyless works too; key raises limits)</label><input name="census_key" value="{{ census_key }}">
 <label>RentCast API key (free 50/mo — backup estimates only)</label><input name="rentcast_key" value="{{ rentcast_key }}">
 <label>apillow API key (free 50/mo — backup)</label><input name="apillow_key" value="{{ apillow_key }}">
+<label>RapidAPI key (free — one key covers Realty in US + Zillow; unlocks comp pulls on hosts that can't reach the listing sites)</label>
+<input type="password" name="rapidapi_key" value="" autocomplete="off" placeholder="{{ '•••••••••• — a key is saved; paste a new one to replace it' if rapidapi_key_set else 'Paste your RapidAPI key' }}">
+<label style="font-weight:normal"><input type="checkbox" name="rapidapi_key_clear" value="1" style="width:auto"> Clear the saved RapidAPI key</label>
+{% if rapidapi_env_set %}<p class="small muted">RAPIDAPI_API_KEY is set in this server's environment and overrides the saved key.</p>{% endif %}
 <p><button class="btn">Save keys</button></p></form></div>
 <div class="card"><h2>Export / Import <span class="small muted">(the migration path to the hosted + PC versions)</span></h2>
 <p><a class="btn sec" href="{{ url_for('export_json') }}">Export full JSON</a> <a class="btn sec" href="{{ url_for('export_csv') }}">Export CSV</a></p>

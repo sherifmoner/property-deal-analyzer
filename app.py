@@ -1507,13 +1507,15 @@ def _find_existing_comp(d, pid, kind, addr, price):
         if _norm_addr(r["address"]) == want: return r["id"]
     return None
 
-def _merge_sold_frame(d, prop, df, radius_mi, subj):
+def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None):
     """Merge one HomeHarvest sold frame into the comps table. Returns
     (added, updated, usable). v3.4: DISTANCE from the subject governs
     inclusion — the ZIP-equality post-filter is gone (a capped whole-ZIP
     frame plus the ZIP gate crowded out / dropped nearer same-street sales
     across ZIP lines, Sherif 2026-11-04). Insert-only: an existing
-    (normalized address, price) row updates in place, never duplicates."""
+    (normalized address, price) row updates in place, never duplicates.
+    source_override (RapidAPI frames): the honest transport label for the
+    whole frame; default None keeps the per-row URL-derived label."""
     added = updated = n = 0
     if df is None: return added, updated, n
     for _, r in df.iterrows():
@@ -1535,7 +1537,7 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj):
                     dom=_nn(r.get("days_on_mls")), lat=float(lat), lon=float(lon), distance_mi=dist,
                     lot_sqft=_nn(r.get("lot_sqft")),
                     ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
-                    source=_source_label(_s(r.get("property_url"))), source_url=_s(r.get("property_url")),
+                    source=source_override or _source_label(_s(r.get("property_url"))), source_url=_s(r.get("property_url")),
                     photo_url=_s(r.get("primary_photo")))
         vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
                                                  "baths": vals["baths"], "year_built": vals["year_built"],
@@ -1548,9 +1550,10 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj):
             d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
     return added, updated, n
 
-def _merge_rent_frame(d, prop, df, radius_mi, subj):
+def _merge_rent_frame(d, prop, df, radius_mi, subj, source_override=None):
     """Merge one HomeHarvest for_rent frame. Returns (added, usable).
-    v3.4: same distance-governs rule as the sold merge (no ZIP gate)."""
+    v3.4: same distance-governs rule as the sold merge (no ZIP gate).
+    source_override: see _merge_sold_frame."""
     added = n = 0
     if df is None: return added, n
     for _, r in df.iterrows():
@@ -1570,7 +1573,7 @@ def _merge_rent_frame(d, prop, df, radius_mi, subj):
                     lat=float(lat), lon=float(lon), distance_mi=dist,
                     lot_sqft=_nn(r.get("lot_sqft")),
                     ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
-                    source=_source_label(_s(r.get("property_url")), rent=True), source_url=_s(r.get("property_url")),
+                    source=source_override or _source_label(_s(r.get("property_url")), rent=True), source_url=_s(r.get("property_url")),
                     photo_url=_s(r.get("primary_photo")))
         vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
                                                  "baths": vals["baths"], "year_built": vals["year_built"],
@@ -1716,6 +1719,291 @@ def _is_unreachable_err(e):
     low = str(e).lower()
     return any(k in low for k in _CONN_ERR_MARKERS)
 
+# ---------------------------------------------------------------- RapidAPI frames (v3.8 prep)
+# A second frame source for hosts whose egress cannot reach the listing
+# sites directly (PythonAnywhere free tier blocks realtor.com, but
+# p.rapidapi.com IS whitelisted — hosting-options-2026-11-04). Endpoints
+# per the public apidojo docs (see research/rapidapi-lap-prep-2026-11-04.md):
+#   Realty in US (host realty-in-us.p.rapidapi.com):
+#     GET  /locations/v2/auto-complete        address -> property_id (mpr_id)
+#     GET  /properties/v3/list-similar-homes  subject-centered comps
+#     POST /properties/v3/list                ZIP search, status sold/for_rent
+#   Zillow (host zillow-com1.p.rapidapi.com):
+#     GET  /propertyExtendedSearch            status_type=RecentlySold search
+# Responses are normalized into the standard HomeHarvest columns and fed
+# through the SAME merge (distance gate, dedupe, match tiers) — no merge,
+# tiering, or UI changes. The sources form an ordered FAILOVER POOL (see
+# _rapidapi_rotate below): the first source that returns rows serves,
+# and a switch is always surfaced in the pull's warnings. Call budget
+# (Realty in US Basic = 500 req/mo, Zillow's quota is separate): a
+# healthy pull costs 3 calls (auto-complete + similar-homes + one rent
+# list); a full failover walk costs at most 5. Results persist in the
+# comps table, so repeat pulls of the same property are what the cache
+# already makes them — the pool is only walked on a fresh pull. With NO
+# key configured, nothing in this section ever runs and the pull is the
+# pre-RapidAPI one.
+RAPIDAPI_REALTY_HOST = "realty-in-us.p.rapidapi.com"
+RAPIDAPI_ZILLOW_HOST = "zillow-com1.p.rapidapi.com"
+RAPIDAPI_SRC_REALTY = "RapidAPI (Realtor.com)"
+RAPIDAPI_SRC_ZILLOW = "RapidAPI (Zillow)"
+
+def _rapidapi_key():
+    """RapidAPI key: env RAPIDAPI_API_KEY first, then the rapidapi_key
+    settings store — the _census_key pattern. The key is only ever sent
+    as the X-RapidAPI-Key header: never in a URL, a log line, or a
+    rendered page (Settings displays it masked)."""
+    return os.environ.get("RAPIDAPI_API_KEY") or get_setting("rapidapi_key") or ""
+
+def _rapidapi_get(host, path, params=None):
+    """One RapidAPI GET. Returns (json, None) or (None, err). No key ->
+    (None, None) without any request."""
+    if not _rapidapi_key(): return None, None
+    try:
+        r = requests.get(f"https://{host}{path}", params=params or {},
+                         headers={"X-RapidAPI-Key": _rapidapi_key(), "X-RapidAPI-Host": host},
+                         timeout=30)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, e
+
+def _rapidapi_post(host, path, body):
+    """One RapidAPI POST (v3/list takes a JSON body). Same contract as
+    _rapidapi_get."""
+    if not _rapidapi_key(): return None, None
+    try:
+        r = requests.post(f"https://{host}{path}", json=body,
+                          headers={"X-RapidAPI-Key": _rapidapi_key(), "X-RapidAPI-Host": host},
+                          timeout=30)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, e
+
+def _rapi_dig(obj, *keys):
+    cur = obj
+    for k in keys:
+        if not isinstance(cur, dict): return None
+        cur = cur.get(k)
+    return cur
+
+_HH_FRAME_COLS = ("street", "city", "zip_code", "sold_price", "list_price", "sqft",
+                  "beds", "full_baths", "year_built", "last_sold_date", "days_on_mls",
+                  "latitude", "longitude", "lot_sqft", "style", "property_type",
+                  "property_url", "primary_photo", "alt_photos", "estimated_value",
+                  "price_per_sqft")
+
+def _hh_frame(rows):
+    """Normalized row dicts -> a DataFrame carrying the standard
+    HomeHarvest columns the merges and find_subject_row read."""
+    import pandas as pd
+    return pd.DataFrame([{c: r.get(c) for c in _HH_FRAME_COLS} for r in rows],
+                        columns=list(_HH_FRAME_COLS))
+
+def _rapi_photos(item):
+    """(primary_photo, [all photo urls]) from a Realty v3 item:
+    primary_photo is {"href": ...}; photos is a list of {"href": ...}."""
+    pp = item.get("primary_photo")
+    first = pp.get("href") if isinstance(pp, dict) else (pp if isinstance(pp, str) else None)
+    alts = []
+    for ph in item.get("photos") or []:
+        href = ph.get("href") if isinstance(ph, dict) else (ph if isinstance(ph, str) else None)
+        if href and href not in alts: alts.append(href)
+    if first and first not in alts: alts.insert(0, first)
+    return (alts[0] if alts else None), alts
+
+def _realty_item_to_row(item):
+    """One Realty-in-US v3 result item -> the standard HomeHarvest columns.
+    Sold price comes ONLY from last_sold_price: a sold-search row without
+    one keeps sold_price=None and the merge drops it — the list price of a
+    sold home is not its sale price and is never substituted."""
+    addr = _rapi_dig(item, "location", "address") or {}
+    desc = item.get("description") or {}
+    coord = addr.get("coordinate") or {}
+    perma = _s(item.get("permalink"))
+    if perma.startswith("http"): url = perma
+    elif perma: url = "https://www.realtor.com/realestateandhomes-detail/" + perma.lstrip("/")
+    else: url = _s(item.get("href"))
+    photo, alts = _rapi_photos(item)
+    return dict(street=_s(addr.get("line")), city=_s(addr.get("city")),
+                zip_code=_s(addr.get("postal_code")),
+                sold_price=item.get("last_sold_price", item.get("sold_price")),
+                list_price=item.get("list_price"),
+                sqft=desc.get("sqft"), beds=desc.get("beds"),
+                full_baths=desc.get("baths_full", desc.get("baths_consolidated", desc.get("baths"))),
+                year_built=desc.get("year_built"), lot_sqft=desc.get("lot_sqft"),
+                last_sold_date=_s(item.get("last_sold_date"))[:10] or None,
+                days_on_mls=item.get("days_on_market"),
+                latitude=coord.get("lat"), longitude=coord.get("lon"),
+                style=_s(desc.get("type")), property_type=_s(desc.get("type")),
+                property_url=url, primary_photo=photo, alt_photos=alts,
+                estimated_value=None, price_per_sqft=None)
+
+def _zillow_item_to_row(item, rent=False):
+    """One Zillow propertyExtendedSearch 'props' item -> the standard
+    HomeHarvest columns. dateSold arrives as an epoch (ms) timestamp in
+    Zillow's data model; a string date is taken as-is. rent=True: the
+    price is a monthly rent (list_price only, never a sold price)."""
+    full = _s(item.get("address"))
+    parts = [p.strip() for p in full.split(",")]
+    street = parts[0] if parts else full
+    city = parts[1] if len(parts) > 2 else None
+    zip_code = None
+    if parts:
+        import re as _re
+        m = _re.search(r"\b(\d{5})\b", parts[-1])
+        if m: zip_code = m.group(1)
+    ds = item.get("dateSold")
+    sold_date = None
+    if isinstance(ds, (int, float)) and ds:
+        secs = ds / 1000.0 if ds > 1e11 else float(ds)
+        sold_date = datetime.datetime.fromtimestamp(secs, datetime.timezone.utc).date().isoformat()
+    elif ds:
+        sold_date = _s(ds)[:10] or None
+    lot = item.get("lotAreaValue")
+    if lot is not None and "acre" in _s(item.get("lotAreaUnit")).lower():
+        lot = lot * 43560  # acres -> sqft
+    return dict(street=street, city=city, zip_code=zip_code,
+                sold_price=None if rent else item.get("price"), list_price=item.get("price"),
+                sqft=item.get("livingArea"), beds=item.get("bedrooms"),
+                full_baths=item.get("bathrooms"), year_built=item.get("yearBuilt"),
+                lot_sqft=lot, last_sold_date=None if rent else sold_date,
+                days_on_mls=item.get("daysOnZillow"),
+                latitude=item.get("latitude"), longitude=item.get("longitude"),
+                style=_s(item.get("homeType")), property_type=_s(item.get("homeType")),
+                property_url=_s(item.get("detailUrl")),
+                primary_photo=_s(item.get("imgSrc")), alt_photos=[],
+                estimated_value=None, price_per_sqft=None)
+
+def _realty_results(data):
+    """Result items from a Realty v3 envelope: data.results (with a bare
+    results / home_search.results tolerated — the provider generates its
+    payload from the source and the wrapper has shifted across versions;
+    unconfirmed shapes normalize to an empty list, never a guess)."""
+    if not isinstance(data, dict): return []
+    for cand in (_rapi_dig(data, "data", "results"), data.get("results"),
+                 _rapi_dig(data, "data", "home_search", "results")):
+        if isinstance(cand, list): return cand
+    return []
+
+def _rapidapi_subject_pid(prop):
+    """The subject's own Realtor property_id via auto-complete (one call)
+    — what list-similar-homes and detail key on. Returns (pid, err);
+    pid is None when the address doesn't resolve."""
+    data, err = _rapidapi_get(RAPIDAPI_REALTY_HOST, "/locations/v2/auto-complete",
+                               {"input": prop["address"]})
+    if not isinstance(data, dict): return None, err
+    for ent in data.get("autocomplete") or []:
+        if not isinstance(ent, dict): continue
+        pid = ent.get("property_id") or ent.get("mpr_id") or ent.get("_id")
+        if pid: return pid, None
+    return None, err
+
+def _rapi_fail_reason(err):
+    """Short human reason class for one source's failure, used in the
+    failover note the pull surfaces. Never carries a URL or the key."""
+    if err is None: return "no results"
+    resp = getattr(err, "response", None)
+    code = getattr(resp, "status_code", None)
+    if code is None and "429" in str(err): code = 429
+    if code == 429: return "quota reached (HTTP 429)"
+    if isinstance(code, int): return f"HTTP {code}"
+    if _is_unreachable_err(err): return "unreachable"
+    return "error"
+
+# --- the failover pool (Sherif 2026-11-04: subscribe to all the useful
+# free APIs and SWITCH automatically when one hits its quota or fails).
+# RapidAPI quotas are PER-API, so moving down the list moves to a fresh
+# monthly quota behind the SAME account key. Adapter contract:
+# fn(prop, past_days) -> (rows, err, source_label); rows empty means
+# "this source didn't serve" (quota / unreachable / empty / broken
+# response are all just reasons to move on). The wider researched pool
+# and the order rationale: research/rapidapi-lap-prep-2026-11-04.md.
+def _src_realty_similar(prop, past_days):
+    pid, err = _rapidapi_subject_pid(prop)
+    if not pid: return [], err, RAPIDAPI_SRC_REALTY
+    data, err = _rapidapi_get(RAPIDAPI_REALTY_HOST, "/properties/v3/list-similar-homes",
+                              {"property_id": pid, "status": "sold", "limit": 200})
+    if err is not None: return [], err, RAPIDAPI_SRC_REALTY
+    return [_realty_item_to_row(it) for it in _realty_results(data)], None, RAPIDAPI_SRC_REALTY
+
+def _src_realty_list_sold(prop, past_days):
+    since = (datetime.date.today() - datetime.timedelta(days=max(past_days, 1095))).isoformat()
+    body = {"limit": 200, "offset": 0, "status": ["sold"],
+            "search_location": {"location": f"{prop['zip']}, {prop['city']}, {prop['state']}"},
+            "sold_date": {"min": since},
+            "sort": {"direction": "desc", "field": "sold_date"}}
+    data, err = _rapidapi_post(RAPIDAPI_REALTY_HOST, "/properties/v3/list", body)
+    if err is not None: return [], err, RAPIDAPI_SRC_REALTY
+    return [_realty_item_to_row(it) for it in _realty_results(data)], None, RAPIDAPI_SRC_REALTY
+
+def _src_zillow_sold(prop, past_days):
+    data, err = _rapidapi_get(RAPIDAPI_ZILLOW_HOST, "/propertyExtendedSearch",
+                              {"location": prop["zip"], "status_type": "RecentlySold"})
+    if err is not None: return [], err, RAPIDAPI_SRC_ZILLOW
+    return [_zillow_item_to_row(it) for it in ((data or {}).get("props") or [])], None, RAPIDAPI_SRC_ZILLOW
+
+def _src_realty_list_rent(prop, past_days):
+    body = {"limit": 200, "offset": 0, "status": ["for_rent"],
+            "search_location": {"location": f"{prop['zip']}, {prop['city']}, {prop['state']}"}}
+    data, err = _rapidapi_post(RAPIDAPI_REALTY_HOST, "/properties/v3/list", body)
+    if err is not None: return [], err, RAPIDAPI_SRC_REALTY
+    return [_realty_item_to_row(it) for it in _realty_results(data)], None, RAPIDAPI_SRC_REALTY
+
+def _src_zillow_rent(prop, past_days):
+    data, err = _rapidapi_get(RAPIDAPI_ZILLOW_HOST, "/propertyExtendedSearch",
+                              {"location": prop["zip"], "status_type": "ForRent"})
+    if err is not None: return [], err, RAPIDAPI_SRC_ZILLOW
+    return [_zillow_item_to_row(it, rent=True) for it in ((data or {}).get("props") or [])], None, RAPIDAPI_SRC_ZILLOW
+
+_RAPIDAPI_ADAPTERS = {"realty_similar": _src_realty_similar,
+                      "realty_list_sold": _src_realty_list_sold,
+                      "zillow_sold": _src_zillow_sold,
+                      "realty_list_rent": _src_realty_list_rent,
+                      "zillow_rent": _src_zillow_rent}
+_RAPIDAPI_SOURCE_NAMES = {"realty_similar": "Realty in US similar-homes",
+                          "realty_list_sold": "Realty in US search",
+                          "zillow_sold": "Zillow search",
+                          "realty_list_rent": "Realty in US search",
+                          "zillow_rent": "Zillow search"}
+RAPIDAPI_SOLD_SOURCES = ("realty_similar", "realty_list_sold", "zillow_sold")
+RAPIDAPI_RENT_SOURCES = ("realty_list_rent", "zillow_rent")
+
+def _rapidapi_rotate(order, prop, past_days):
+    """Walk the ordered source list; the first source returning rows
+    serves. Returns (rows, last_err, label, tried) — tried holds
+    (source name, reason) for every source passed over, so the caller
+    can surface the switch: a failover is never hidden."""
+    tried, last_err = [], None
+    for key in order:
+        rows, err, label = _RAPIDAPI_ADAPTERS[key](prop, past_days)
+        if rows: return rows, None, label, tried
+        if err is not None: last_err = err
+        tried.append((_RAPIDAPI_SOURCE_NAMES[key], _rapi_fail_reason(err)))
+    return [], last_err, None, tried
+
+def _rapi_switch_note(kind, tried, label):
+    """The user-visible failover note, or None when the first source
+    served and there is nothing to disclose."""
+    if not tried: return None
+    parts = "; ".join(f"{name} — {reason}" for name, reason in tried)
+    return f"RapidAPI failover: {parts}; {kind} comps served by {label}"
+
+def _rapidapi_sold_frame(prop, past_days=365):
+    """The RapidAPI sold frame for one pull: (df, err, source, tried).
+    df is None when the whole pool produced nothing."""
+    if not _rapidapi_key(): return None, None, None, []
+    rows, err, label, tried = _rapidapi_rotate(RAPIDAPI_SOLD_SOURCES, prop, past_days)
+    if not rows: return None, err, None, tried
+    return _hh_frame(rows), None, label, tried
+
+def _rapidapi_rent_frame(prop):
+    """The RapidAPI rental frame. Same contract as _rapidapi_sold_frame."""
+    if not _rapidapi_key(): return None, None, None, []
+    rows, err, label, tried = _rapidapi_rotate(RAPIDAPI_RENT_SOURCES, prop, 365)
+    if not rows: return None, err, None, tried
+    return _hh_frame(rows), None, label, tried
+
 def pull_comps(prop, radius_mi=1.0, past_days=365):
     """Multi-frame union pull (v3.4). Frames: a SUBJECT-CENTERED radius frame
     (the scraper's comps mode — address + radius) at a 3-year horizon, unioned
@@ -1742,8 +2030,21 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         try: return scrape_property(**kw), None
         except Exception as e: return None, e
     subj = {"sqft": prop["sqft"], "beds": prop["beds"], "baths": prop["baths"], "year_built": prop["year_built"], "lot_sqft": prop["lot_sqft"]}
+    # --- RapidAPI sold frame (v3.8): when a key is configured it is tried
+    # FIRST — on egress-whitelisted hosts it is the only frame source that
+    # can answer — and the HomeHarvest frames below still union in (dedupe
+    # is address+price). No key: this block never runs and the pull is
+    # byte-identical to the pre-RapidAPI behavior. ---
+    rapi_sold_df, rapi_sold_src, rapi_tried = None, None, []
+    if _rapidapi_key():
+        rapi_sold_df, _rapi_err, rapi_sold_src, rapi_tried = _rapidapi_sold_frame(prop, past_days)
+        if rapi_sold_df is None and _rapi_err is not None:
+            app.logger.warning(f"comp pull: RapidAPI sold frame failed for {addr_line}: {_rapi_err!r}")
     # --- sold frames: centered (3-yr horizon) UNION ZIP area (requested window) ---
     sold_frames = []
+    frame_sources = {}
+    if rapi_sold_df is not None:
+        sold_frames.append(rapi_sold_df); frame_sources[id(rapi_sold_df)] = rapi_sold_src
     centered, err_c = _scrape(location=addr_line, listing_type="sold",
                               past_days=max(past_days, 1095), radius=radius_mi)
     if centered is not None: sold_frames.append(centered)
@@ -1762,16 +2063,31 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                            "came back — nothing was added or changed; please try again")
     if err_c is not None:
         app.logger.warning(f"comp pull: centered sold frame failed for {addr_line}: {err_c!r}")
-        warnings.append("centered sold frame failed — results came from the ZIP-area frame")
+        if rapi_sold_df is None:
+            warnings.append("centered sold frame failed — results came from the ZIP-area frame")
     if err_a is not None:
         app.logger.warning(f"comp pull: ZIP sold frame failed for {addr_line}: {err_a!r}")
-        warnings.append("ZIP-area sold frame failed — results came from the address-centered frame")
+        if rapi_sold_df is None:
+            warnings.append("ZIP-area sold frame failed — results came from the address-centered frame")
+    if rapi_sold_df is not None:
+        _note = _rapi_switch_note("sold", rapi_tried, rapi_sold_src)
+        if _note: warnings.append(_note)
+        warnings.append(f"sold comps include results from {rapi_sold_src}")
     added = updated = n_sold = 0
     for fr in sold_frames:
-        a1, u1, n1 = _merge_sold_frame(d, prop, fr, radius_mi, subj)
+        a1, u1, n1 = _merge_sold_frame(d, prop, fr, radius_mi, subj,
+                                       source_override=frame_sources.get(id(fr)))
         added += a1; updated += u1; n_sold += n1
     # --- rentals: centered UNION ZIP (LTR / Co-Living / Affordable views read this set) ---
-    n_rent = 0; rent_frames = []
+    n_rent = 0; rent_frames = []; rent_sources = {}
+    if _rapidapi_key():
+        _rdf, _rerr, _rsrc, _rtried = _rapidapi_rent_frame(prop)
+        if _rdf is not None:
+            rent_frames.append(_rdf); rent_sources[id(_rdf)] = _rsrc
+            _rnote = _rapi_switch_note("rental", _rtried, _rsrc)
+            if _rnote: warnings.append(_rnote)
+        elif _rerr is not None:
+            app.logger.warning(f"rent pull: RapidAPI rent frame failed for {addr_line}: {_rerr!r}")
     rc, _ = _scrape(location=addr_line, listing_type="for_rent", past_days=90, radius=radius_mi)
     if rc is not None: rent_frames.append(rc)
     ra, err_r = _scrape(location=prop["zip"], listing_type="for_rent", past_days=90)
@@ -1780,7 +2096,8 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         warnings.append("rental comps couldn't be pulled this time")
         app.logger.warning(f"rent pull failed: {err_r}")
     for fr in rent_frames:
-        a2, n2 = _merge_rent_frame(d, prop, fr, radius_mi, subj)
+        a2, n2 = _merge_rent_frame(d, prop, fr, radius_mi, subj,
+                                   source_override=rent_sources.get(id(fr)))
         added += a2; n_rent += n2
     d.commit()
     # --- subject's own listing: photos + blank-fact fill (never overwrite user data) ---
@@ -4528,6 +4845,14 @@ def settings_page():
         if "census_key" in request.form:
             for k in ("census_key", "rentcast_key", "apillow_key"):
                 set_setting(k, request.form.get(k, ""))
+            # RapidAPI key (v3.8): the field renders MASKED (blank password
+            # input — the saved key is never sent to the page), so a
+            # non-empty submit is a NEW key, a blank submit keeps the saved
+            # one, and only the explicit clear checkbox removes it.
+            if request.form.get("rapidapi_key_clear"):
+                set_setting("rapidapi_key", "")
+            elif (request.form.get("rapidapi_key") or "").strip():
+                set_setting("rapidapi_key", request.form.get("rapidapi_key").strip())
             flash("API keys saved (stored server-side in local DB only).")
         elif "bb_name" in request.form:
             db().execute("""INSERT INTO buy_boxes(name,cities,max_price,min_beds,min_sqft,strategies,min_arv_spread_pct)
@@ -4539,7 +4864,9 @@ def settings_page():
         return redirect(url_for("settings_page"))
     return render_template("settings.html", boxes=all_boxes(),
                            census_key=get_setting("census_key"), rentcast_key=get_setting("rentcast_key"),
-                           apillow_key=get_setting("apillow_key"))
+                           apillow_key=get_setting("apillow_key"),
+                           rapidapi_key_set=bool(_rapidapi_key()),
+                           rapidapi_env_set=bool(os.environ.get("RAPIDAPI_API_KEY")))
 
 @app.route("/buybox/<int:bid>/toggle", methods=["POST"])
 def bb_toggle(bid):
