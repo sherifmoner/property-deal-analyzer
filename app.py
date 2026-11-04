@@ -1719,33 +1719,46 @@ def _is_unreachable_err(e):
     low = str(e).lower()
     return any(k in low for k in _CONN_ERR_MARKERS)
 
-# ---------------------------------------------------------------- RapidAPI frames (v3.8 prep)
+# ---------------------------------------------------------------- RapidAPI frames (v3.8; pool rebuilt v41)
 # A second frame source for hosts whose egress cannot reach the listing
 # sites directly (PythonAnywhere free tier blocks realtor.com, but
-# p.rapidapi.com IS whitelisted — hosting-options-2026-11-04). Endpoints
-# per the public apidojo docs (see research/rapidapi-lap-prep-2026-11-04.md):
-#   Realty in US (host realty-in-us.p.rapidapi.com):
-#     GET  /locations/v2/auto-complete        address -> property_id (mpr_id)
-#     GET  /properties/v3/list-similar-homes  subject-centered comps
-#     POST /properties/v3/list                ZIP search, status sold/for_rent
-#   Zillow (host zillow-com1.p.rapidapi.com):
-#     GET  /propertyExtendedSearch            status_type=RecentlySold search
+# p.rapidapi.com IS whitelisted — hosting-options-2026-11-04).
+# v41: the v38–v40 pool (apidojo "Realty in US" + "Zillow") is GONE —
+# both APIs were DELISTED from RapidAPI. The pool below is built ONLY
+# on APIs playground-verified from Sherif's own account on 2026-11-04
+# (real HTTP 200s with real data; shapes in research/v41-build-log.md):
+#   ReefAPI "Realtor.com Property Data API" (Basic free 100 req/mo):
+#     POST /realtor/v1/sold   {location, sort, limit, offset} -> data.results
+#                             (FLAT items, coordinates on every row)
+#   "Redfin.Com Data" by Nathan (Basic free 100 req/mo):
+#     GET  <auto-complete>    city/state -> regionId ("6_20109" verified)
+#     GET  /properties/search-sold?regionId&limit&soldWithin=365 -> data[]
+#   "Realtor" by Sabri (Basic free 30 req/mo — LAST, the quota is precious):
+#     GET  /search/forsold/coordinates?lat&lon   -> properties[]
+#     GET  /search/forrent/coordinates?lat&lon   -> properties[] (rent pool)
 # Responses are normalized into the standard HomeHarvest columns and fed
 # through the SAME merge (distance gate, dedupe, match tiers) — no merge,
 # tiering, or UI changes. The sources form an ordered FAILOVER POOL (see
 # _rapidapi_rotate below): the first source that returns rows serves,
-# and a switch is always surfaced in the pull's warnings. Call budget
-# (Realty in US Basic = 500 req/mo, Zillow's quota is separate): a
-# healthy pull costs 3 calls (auto-complete + similar-homes + one rent
-# list); a full failover walk costs at most 5. Results persist in the
-# comps table, so repeat pulls of the same property are what the cache
-# already makes them — the pool is only walked on a fresh pull. With NO
-# key configured, nothing in this section ever runs and the pull is the
-# pre-RapidAPI one.
-RAPIDAPI_REALTY_HOST = "realty-in-us.p.rapidapi.com"
-RAPIDAPI_ZILLOW_HOST = "zillow-com1.p.rapidapi.com"
-RAPIDAPI_SRC_REALTY = "RapidAPI (Realtor.com)"
-RAPIDAPI_SRC_ZILLOW = "RapidAPI (Zillow)"
+# and a switch is always surfaced in the pull's warnings. Call budget: a
+# healthy pull costs ONE sold call (ReefAPI); a full failover walk costs
+# at most 4 (ReefAPI + auto-complete + search-sold + Sabri). Results
+# persist in the comps table, so the pool is only walked on a fresh
+# pull. With NO key configured, nothing in this section ever runs and
+# the pull is the pre-RapidAPI one.
+RAPIDAPI_REEF_HOST = "realtor-com-property-data-api.p.rapidapi.com"
+RAPIDAPI_REDFIN_HOST = "redfin-com-data.p.rapidapi.com"
+RAPIDAPI_SABRI_HOST = "realtor16.p.rapidapi.com"
+RAPIDAPI_SRC_REEF = "RapidAPI (ReefAPI)"
+RAPIDAPI_SRC_REDFIN = "RapidAPI (Redfin)"
+RAPIDAPI_SRC_SABRI = "RapidAPI (Realtor16)"
+# The Redfin auto-complete endpoint path was NOT captured in the
+# playground test (only its result — a regionId of the form
+# <digits>_<digits>). The path lives in this one constant so a live 404
+# is a one-line fix; the response parse is a defensive deep-search
+# (_redfin_region_id) and a wrong or missing path can only classify the
+# source "didn't serve" — it can never produce data.
+RAPIDAPI_REDFIN_AC_PATH = "/properties/auto-complete"
 
 def _rapidapi_key():
     """RapidAPI key: env RAPIDAPI_API_KEY first, then the rapidapi_key
@@ -1768,8 +1781,8 @@ def _rapidapi_get(host, path, params=None):
         return None, e
 
 def _rapidapi_post(host, path, body):
-    """One RapidAPI POST (v3/list takes a JSON body). Same contract as
-    _rapidapi_get."""
+    """One RapidAPI POST (the ReefAPI sold search takes a JSON body).
+    Same contract as _rapidapi_get."""
     if not _rapidapi_key(): return None, None
     try:
         r = requests.post(f"https://{host}{path}", json=body,
@@ -1812,106 +1825,150 @@ def _rapi_photos(item):
     if first and first not in alts: alts.insert(0, first)
     return (alts[0] if alts else None), alts
 
-def _realty_item_to_row(item):
-    """One Realty-in-US v3 result item -> the standard HomeHarvest columns.
-    Sold price comes ONLY from last_sold_price: a sold-search row without
-    one keeps sold_price=None and the merge drops it — the list price of a
-    sold home is not its sale price and is never substituted."""
-    addr = _rapi_dig(item, "location", "address") or {}
+def _reef_item_to_row(item):
+    """One ReefAPI /realtor/v1/sold item -> the standard HomeHarvest
+    columns. The item is FLAT (playground-verified 2026-11-04): address,
+    price, specs and coordinates are all top-level. Sold price comes
+    ONLY from last_sold_price — a sold row without one keeps
+    sold_price=None and the merge drops it; a sold home's list price
+    is not its sale price and is never substituted."""
+    brand = item.get("branding") or {}
+    photo = _s(item.get("primary_photo_url")) or None
+    return dict(street=_s(item.get("address_line")), city=_s(item.get("city")),
+                zip_code=_s(item.get("zip_code")),
+                sold_price=item.get("last_sold_price"),
+                list_price=item.get("list_price"),
+                sqft=item.get("sqft"), beds=item.get("beds"),
+                full_baths=item.get("baths"),
+                year_built=item.get("year_built"), lot_sqft=None,
+                last_sold_date=_s(item.get("last_sold_date"))[:10] or None,
+                days_on_mls=None,
+                latitude=item.get("latitude"), longitude=item.get("longitude"),
+                style=None, property_type=None,
+                property_url=_s(brand.get("url")) if isinstance(brand, dict) else "",
+                primary_photo=photo, alt_photos=[photo] if photo else [],
+                estimated_value=None, price_per_sqft=None)
+
+def _rapi_horizon_cutoff(past_days):
+    """Client-side sold-date horizon for the pool frames. The pool APIs
+    return recency-sorted AREA lists (ReefAPI's city search spans
+    thousands of sales), so the date bound is applied here, at
+    max(past_days, 1095) — the same 3-year floor the retired v3/list
+    route used server-side, keeping the depth the views window over.
+    Rows whose sold date cannot be read are kept (a dateless row is
+    stored dateless, never re-dated)."""
+    return (datetime.date.today() - datetime.timedelta(days=max(past_days, 1095))).isoformat()
+
+def _rapi_in_horizon(rows, past_days):
+    cut = _rapi_horizon_cutoff(past_days)
+    return [r for r in rows if not r.get("last_sold_date") or r["last_sold_date"] >= cut]
+
+def _redfin_region_id(prop):
+    """Resolve the property's city to a Redfin regionId via Nathan's
+    auto-complete. Returns (region_id, err). The auto-complete RESPONSE
+    SHAPE was not captured in the playground test (only its result — a
+    regionId of the form <digits>_<digits>, e.g. "6_20109" for West
+    Chicago, IL), so the parse is a defensive deep-search: walk the
+    whole document for strings of that form, scoring entries whose key
+    mentions "region" and whose sibling text names the property's city
+    above bare matches (Redfin property ids share the same form and
+    must not win). Nothing found -> (None, None): the source simply
+    didn't serve. An id is NEVER guessed or constructed, and any wrong
+    hit is backstopped by the merge's distance gate (a wrong region's
+    rows land miles from the subject and are discarded there)."""
+    data, err = _rapidapi_get(RAPIDAPI_REDFIN_HOST, RAPIDAPI_REDFIN_AC_PATH,
+                              {"location": f"{prop['city']}, {prop['state']}"})
+    if err is not None or data is None: return None, err
+    import re as _re
+    pat = _re.compile(r"^\d+_\d+$")
+    city = (prop["city"] or "").lower()
+    hits = []
+    def walk(node):
+        if isinstance(node, dict):
+            text = " ".join(v for v in node.values() if isinstance(v, str)).lower()
+            for k, v in node.items():
+                if isinstance(v, str) and pat.match(v.strip()):
+                    score = (2 if "region" in k.lower() else 0) \
+                          + (1 if city and city in text else 0)
+                    hits.append((score, v.strip()))
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for v in node: walk(v)
+    walk(data)
+    if not hits: return None, None
+    hits.sort(key=lambda t: -t[0])
+    return hits[0][1], None
+
+def _redfin_item_to_row(item):
+    """One Redfin.Com Data search-sold item -> the standard HomeHarvest
+    columns. Nested shape (playground-verified 2026-11-04): the sold
+    price is priceInfo.amount, the date lastSaleData.lastSoldDate,
+    specs under listingMetadata / sqftInfo / yearBuilt, the address and
+    centroid under addressInfo, photos under photos.bigPhotos (small
+    Photos as fallback), and homeData.url is a RELATIVE Redfin path,
+    prefixed here with the site origin."""
+    meta = item.get("listingMetadata") or {}
+    addr = item.get("addressInfo") or {}
+    cent = addr.get("centroid") or {}
+    photos = item.get("photos") or {}
+    alts = []
+    for group in ("bigPhotos", "smallPhotos"):
+        for ph in photos.get(group) or []:
+            href = ph.get("photoUrlHref") if isinstance(ph, dict) else None
+            if href and href not in alts: alts.append(href)
+        if alts: break
+    url = _s(_rapi_dig(item, "homeData", "url"))
+    if url and not url.startswith("http"):
+        url = "https://www.redfin.com" + ("" if url.startswith("/") else "/") + url
+    amount = _rapi_dig(item, "priceInfo", "amount")
+    return dict(street=_s(addr.get("formattedStreetLine")), city=_s(addr.get("city")),
+                zip_code=_s(addr.get("zip")),
+                sold_price=amount, list_price=amount,
+                sqft=_rapi_dig(item, "sqftInfo", "amount"),
+                beds=meta.get("beds"), full_baths=meta.get("baths"),
+                year_built=_rapi_dig(item, "yearBuilt", "yearBuilt"), lot_sqft=None,
+                last_sold_date=_s(_rapi_dig(item, "lastSaleData", "lastSoldDate"))[:10] or None,
+                days_on_mls=None,
+                latitude=cent.get("lat"), longitude=cent.get("lng"),
+                style=None, property_type=None,
+                property_url=url,
+                primary_photo=(alts[0] if alts else None), alt_photos=alts,
+                estimated_value=None, price_per_sqft=None)
+
+def _sabri_item_to_row(item, rent=False):
+    """One Sabri realtor16 item -> the standard HomeHarvest columns.
+    The item is the Realtor data model (playground-verified for
+    /search/forsold/coordinates 2026-11-04; year_built is read when
+    present — it was not observed in the captured first item — else
+    None). Sold price comes ONLY from description.sold_price, never
+    the list price. rent=True reads the /search/forrent sibling, whose
+    item shape was NOT separately captured: the rent is
+    description.list_price, normalized defensively — a row without a
+    usable list price reaches the merge with list_price=None and is
+    stored as nothing."""
     desc = item.get("description") or {}
+    addr = _rapi_dig(item, "location", "address") or {}
     coord = addr.get("coordinate") or {}
     perma = _s(item.get("permalink"))
     if perma.startswith("http"): url = perma
     elif perma: url = "https://www.realtor.com/realestateandhomes-detail/" + perma.lstrip("/")
-    else: url = _s(item.get("href"))
+    else: url = ""
     photo, alts = _rapi_photos(item)
     return dict(street=_s(addr.get("line")), city=_s(addr.get("city")),
                 zip_code=_s(addr.get("postal_code")),
-                sold_price=item.get("last_sold_price", item.get("sold_price")),
-                list_price=item.get("list_price"),
+                sold_price=None if rent else desc.get("sold_price"),
+                list_price=desc.get("list_price"),
                 sqft=desc.get("sqft"), beds=desc.get("beds"),
-                full_baths=desc.get("baths_full", desc.get("baths_consolidated", desc.get("baths"))),
+                full_baths=desc.get("baths_consolidated",
+                                     desc.get("baths_full", desc.get("baths"))),
                 year_built=desc.get("year_built"), lot_sqft=desc.get("lot_sqft"),
-                last_sold_date=_s(item.get("last_sold_date"))[:10] or None,
-                days_on_mls=item.get("days_on_market"),
+                last_sold_date=None if rent else (_s(desc.get("sold_date"))[:10] or None),
+                days_on_mls=desc.get("days_on_market"),
                 latitude=coord.get("lat"), longitude=coord.get("lon"),
                 style=_s(desc.get("type")), property_type=_s(desc.get("type")),
                 property_url=url, primary_photo=photo, alt_photos=alts,
                 estimated_value=None, price_per_sqft=None)
-
-def _zillow_item_to_row(item, rent=False):
-    """One Zillow propertyExtendedSearch 'props' item -> the standard
-    HomeHarvest columns. dateSold is datetime-typed in the API's own
-    spec (research/rapidapi-live-shapes-2026-11-04.md): an ISO string
-    is taken as-is, an epoch (ms) timestamp is converted. The spec's
-    type key is propertyType (homeType is read first for back-compat
-    with pre-spec captures). rent=True: the price is a monthly rent
-    (list_price only, never a sold price)."""
-    full = _s(item.get("address"))
-    parts = [p.strip() for p in full.split(",")]
-    street = parts[0] if parts else full
-    city = parts[1] if len(parts) > 2 else None
-    zip_code = None
-    if parts:
-        import re as _re
-        m = _re.search(r"\b(\d{5})\b", parts[-1])
-        if m: zip_code = m.group(1)
-    ds = item.get("dateSold")
-    sold_date = None
-    if isinstance(ds, (int, float)) and ds:
-        secs = ds / 1000.0 if ds > 1e11 else float(ds)
-        sold_date = datetime.datetime.fromtimestamp(secs, datetime.timezone.utc).date().isoformat()
-    elif ds:
-        sold_date = _s(ds)[:10] or None
-    lot = item.get("lotAreaValue")
-    if lot is not None and "acre" in _s(item.get("lotAreaUnit")).lower():
-        lot = lot * 43560  # acres -> sqft
-    return dict(street=street, city=city, zip_code=zip_code,
-                sold_price=None if rent else item.get("price"), list_price=item.get("price"),
-                sqft=item.get("livingArea"), beds=item.get("bedrooms"),
-                full_baths=item.get("bathrooms"), year_built=item.get("yearBuilt"),
-                lot_sqft=lot, last_sold_date=None if rent else sold_date,
-                days_on_mls=item.get("daysOnZillow"),
-                latitude=item.get("latitude"), longitude=item.get("longitude"),
-                style=_s(item.get("homeType") or item.get("propertyType")),
-                property_type=_s(item.get("homeType") or item.get("propertyType")),
-                property_url=_s(item.get("detailUrl")),
-                primary_photo=_s(item.get("imgSrc")), alt_photos=[],
-                estimated_value=None, price_per_sqft=None)
-
-def _realty_results(data):
-    """Result items from a Realty v3 envelope: data.results (with a bare
-    results / home_search.results tolerated — the provider generates its
-    payload from the source and the wrapper has shifted across versions;
-    unconfirmed shapes normalize to an empty list, never a guess). v40:
-    the top-level home_search variant and a bare-list data are read too
-    (the Realtor-family wrappers seen in the wild — a candidate only
-    matches where a list actually sits, so this can never invent rows;
-    research/rapidapi-live-shapes-2026-11-04.md)."""
-    if not isinstance(data, dict): return []
-    for cand in (_rapi_dig(data, "data", "results"), data.get("results"),
-                 _rapi_dig(data, "data", "home_search", "results"),
-                 _rapi_dig(data, "home_search", "results")):
-        if isinstance(cand, list): return cand
-    inner = data.get("data")
-    if isinstance(inner, list): return inner
-    return []
-
-def _rapidapi_subject_pid(prop):
-    """The subject's own Realtor property_id via auto-complete (one call)
-    — what list-similar-homes and detail key on. Returns (pid, err);
-    pid is None when the address doesn't resolve."""
-    data, err = _rapidapi_get(RAPIDAPI_REALTY_HOST, "/locations/v2/auto-complete",
-                               {"input": prop["address"]})
-    if not isinstance(data, dict): return None, err
-    ents = data.get("autocomplete")
-    if not isinstance(ents, list):
-        ents = _rapi_dig(data, "data", "autocomplete")  # v40: data-wrapped variant
-    for ent in ents or []:
-        if not isinstance(ent, dict): continue
-        pid = ent.get("property_id") or ent.get("mpr_id") or ent.get("_id")
-        if pid: return pid, None
-    return None, err
 
 def _rapi_fail_reason(err):
     """Short human reason class for one source's failure, used in the
@@ -1945,58 +2002,57 @@ def _rapi_rows(items, fn):
 # monthly quota behind the SAME account key. Adapter contract:
 # fn(prop, past_days) -> (rows, err, source_label); rows empty means
 # "this source didn't serve" (quota / unreachable / empty / broken
-# response are all just reasons to move on). The wider researched pool
-# and the order rationale: research/rapidapi-lap-prep-2026-11-04.md.
-def _src_realty_similar(prop, past_days):
-    pid, err = _rapidapi_subject_pid(prop)
-    if not pid: return [], err, RAPIDAPI_SRC_REALTY
-    data, err = _rapidapi_get(RAPIDAPI_REALTY_HOST, "/properties/v3/list-similar-homes",
-                              {"property_id": pid, "status": "sold", "limit": 200})
-    if err is not None: return [], err, RAPIDAPI_SRC_REALTY
-    return _rapi_rows(_realty_results(data), _realty_item_to_row), None, RAPIDAPI_SRC_REALTY
+# response are all just reasons to move on). v41 pool — every member
+# playground-verified from Sherif's account 2026-11-04, in quota order:
+# ReefAPI first (100/mo, ONE call, coordinates on every row), Redfin
+# second (100/mo, two calls), Sabri LAST (30/mo — precious; one call).
+def _src_reefapi_sold(prop, past_days):
+    body = {"location": f"{prop['city']}, {prop['state']}", "sort": "newest",
+            "limit": 100, "offset": 0}
+    data, err = _rapidapi_post(RAPIDAPI_REEF_HOST, "/realtor/v1/sold", body)
+    if err is not None: return [], err, RAPIDAPI_SRC_REEF
+    items = _rapi_dig(data, "data", "results")
+    rows = _rapi_rows(items if isinstance(items, list) else [], _reef_item_to_row)
+    return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_REEF
 
-def _src_realty_list_sold(prop, past_days):
-    since = (datetime.date.today() - datetime.timedelta(days=max(past_days, 1095))).isoformat()
-    body = {"limit": 200, "offset": 0, "status": ["sold"],
-            "search_location": {"location": f"{prop['zip']}, {prop['city']}, {prop['state']}"},
-            "sold_date": {"min": since},
-            "sort": {"direction": "desc", "field": "sold_date"}}
-    data, err = _rapidapi_post(RAPIDAPI_REALTY_HOST, "/properties/v3/list", body)
-    if err is not None: return [], err, RAPIDAPI_SRC_REALTY
-    return _rapi_rows(_realty_results(data), _realty_item_to_row), None, RAPIDAPI_SRC_REALTY
+def _src_redfin_sold(prop, past_days):
+    rid, err = _redfin_region_id(prop)
+    if err is not None: return [], err, RAPIDAPI_SRC_REDFIN
+    if not rid: return [], None, RAPIDAPI_SRC_REDFIN
+    data, err = _rapidapi_get(RAPIDAPI_REDFIN_HOST, "/properties/search-sold",
+                              {"regionId": rid, "limit": 100, "soldWithin": 365})
+    if err is not None: return [], err, RAPIDAPI_SRC_REDFIN
+    items = data.get("data") if isinstance(data, dict) else None
+    rows = _rapi_rows(items if isinstance(items, list) else [], _redfin_item_to_row)
+    return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_REDFIN
 
-def _src_zillow_sold(prop, past_days):
-    data, err = _rapidapi_get(RAPIDAPI_ZILLOW_HOST, "/propertyExtendedSearch",
-                              {"location": prop["zip"], "status_type": "RecentlySold"})
-    if err is not None: return [], err, RAPIDAPI_SRC_ZILLOW
-    return _rapi_rows((data or {}).get("props"), _zillow_item_to_row), None, RAPIDAPI_SRC_ZILLOW
+def _src_sabri_forsold(prop, past_days):
+    data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forsold/coordinates",
+                              {"lat": prop["lat"], "lon": prop["lon"]})
+    if err is not None: return [], err, RAPIDAPI_SRC_SABRI
+    items = data.get("properties") if isinstance(data, dict) else None
+    rows = _rapi_rows(items if isinstance(items, list) else [], _sabri_item_to_row)
+    return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_SABRI
 
-def _src_realty_list_rent(prop, past_days):
-    body = {"limit": 200, "offset": 0, "status": ["for_rent"],
-            "search_location": {"location": f"{prop['zip']}, {prop['city']}, {prop['state']}"}}
-    data, err = _rapidapi_post(RAPIDAPI_REALTY_HOST, "/properties/v3/list", body)
-    if err is not None: return [], err, RAPIDAPI_SRC_REALTY
-    return _rapi_rows(_realty_results(data), _realty_item_to_row), None, RAPIDAPI_SRC_REALTY
+def _src_sabri_forrent(prop, past_days):
+    data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forrent/coordinates",
+                              {"lat": prop["lat"], "lon": prop["lon"]})
+    if err is not None: return [], err, RAPIDAPI_SRC_SABRI
+    items = data.get("properties") if isinstance(data, dict) else None
+    rows = _rapi_rows(items if isinstance(items, list) else [],
+                      lambda it: _sabri_item_to_row(it, rent=True))
+    return rows, None, RAPIDAPI_SRC_SABRI
 
-def _src_zillow_rent(prop, past_days):
-    data, err = _rapidapi_get(RAPIDAPI_ZILLOW_HOST, "/propertyExtendedSearch",
-                              {"location": prop["zip"], "status_type": "ForRent"})
-    if err is not None: return [], err, RAPIDAPI_SRC_ZILLOW
-    return _rapi_rows((data or {}).get("props"),
-                      lambda it: _zillow_item_to_row(it, rent=True)), None, RAPIDAPI_SRC_ZILLOW
-
-_RAPIDAPI_ADAPTERS = {"realty_similar": _src_realty_similar,
-                      "realty_list_sold": _src_realty_list_sold,
-                      "zillow_sold": _src_zillow_sold,
-                      "realty_list_rent": _src_realty_list_rent,
-                      "zillow_rent": _src_zillow_rent}
-_RAPIDAPI_SOURCE_NAMES = {"realty_similar": "Realty in US similar-homes",
-                          "realty_list_sold": "Realty in US search",
-                          "zillow_sold": "Zillow search",
-                          "realty_list_rent": "Realty in US search",
-                          "zillow_rent": "Zillow search"}
-RAPIDAPI_SOLD_SOURCES = ("realty_similar", "realty_list_sold", "zillow_sold")
-RAPIDAPI_RENT_SOURCES = ("realty_list_rent", "zillow_rent")
+_RAPIDAPI_ADAPTERS = {"reefapi_sold": _src_reefapi_sold,
+                      "redfin_sold": _src_redfin_sold,
+                      "sabri_forsold": _src_sabri_forsold,
+                      "sabri_forrent": _src_sabri_forrent}
+_RAPIDAPI_SOURCE_NAMES = {"reefapi_sold": "ReefAPI Realtor sold",
+                          "redfin_sold": "Redfin.Com Data sold search",
+                          "sabri_forsold": "Realtor16 (Sabri) sold search",
+                          "sabri_forrent": "Realtor16 (Sabri) rent search"}
+RAPIDAPI_SOLD_SOURCES = ("reefapi_sold", "redfin_sold", "sabri_forsold")
+RAPIDAPI_RENT_SOURCES = ("sabri_forrent",)
 
 def _rapidapi_rotate(order, prop, past_days):
     """Walk the ordered source list; the first source returning rows
@@ -2087,8 +2143,8 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             app.logger.warning(f"comp pull: RapidAPI sold frame failed for {addr_line}: {_rapi_err!r}")
         if rapi_sold_df is None and rapi_tried:
             # v40: name EVERY source's classified reason server-side.
-            # The PA incident logged only the pool's last error (a
-            # Zillow 404), which hid what the Realty sources did.
+            # The v39 PA incident logged only the pool's last error,
+            # which hid what the earlier sources in the walk did.
             app.logger.warning(f"comp pull: RapidAPI sold pool detail for {addr_line}: "
                                + "; ".join(f"{n} — {r}" for n, r in rapi_tried))
     # --- sold frames: centered (3-yr horizon) UNION ZIP area (requested window) ---
