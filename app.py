@@ -3778,7 +3778,10 @@ def property_page(pid):
     cview = request.args.get("view", "sold")
     if cview not in ("maps", "sold", "coliving", "str", "mtr", "ltr", "affordable"): cview = "sold"
     window = int(fnum(request.args.get("window"), 365) or 365)
-    if window not in (30, 90, 180, 365): window = 365
+    # v3.5: the view window extends to the stored horizon (v34 pulls 3 years
+    # of sold comps) — 730 = Last 2 years, 1095 = Last 3 years, 36500 = All
+    # time (a sentinel far beyond any real sale date). Default stays 365.
+    if window not in (30, 90, 180, 365, 730, 1095, 36500): window = 365
     rmax = fnum(request.args.get("rmax"), None)
     subj_d = {"sqft": p["sqft"], "beds": p["beds"], "baths": p["baths"], "year_built": p["year_built"], "lot_sqft": p["lot_sqft"]}
     def in_radius(c): return rmax is None or (c["distance_mi"] is not None and c["distance_mi"] <= rmax)
