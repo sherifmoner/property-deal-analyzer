@@ -259,14 +259,19 @@ def _street_key(street):
     core = [t for t in toks[1:] if t not in _STREET_SUFFIXES and not t.isdigit()]
     return num, " ".join(core)
 
-def find_subject_row(df, prop):
+def find_subject_row(df, prop, exact_only=False):
     """Locate the subject's own row in a HomeHarvest frame: exact house number + street name,
-    else the nearest row within 0.05 mi. Returns the row or None."""
+    else the nearest row within 0.05 mi. Returns the row or None.
+    v3.4: exact_only=True (the subject spec/photo FILL path) never falls back to a
+    neighbor — a near row with the wrong house's specs/photos is how a subject
+    record gets silently mutated (live Garland showed a neighbor's 2,172 sqft /
+    1976). In exact mode the ZIP pre-filter is also dropped: an exact house
+    number + street-name match is stronger evidence than a ZIP boundary."""
     if df is None or not len(df): return None
     pnum, pcore = _street_key(prop["street"] or prop["address"])
     best, best_dist = None, None
     for _, r in df.iterrows():
-        if str(r.get("zip_code")) != str(prop["zip"]): continue
+        if not exact_only and str(r.get("zip_code")) != str(prop["zip"]): continue
         lat, lon = r.get("latitude"), r.get("longitude")
         dist = None
         if lat is not None and lon is not None and not (isinstance(lat, float) and math.isnan(lat)):
@@ -274,6 +279,7 @@ def find_subject_row(df, prop):
         rnum, rcore = _street_key(_s(r.get("street")))
         if pnum and rnum == pnum and rcore and rcore == pcore:
             return r  # exact address match wins immediately
+        if exact_only: continue
         if dist is not None and dist < 0.05 and (best_dist is None or dist < best_dist):
             best, best_dist = r, dist
     return best
@@ -1461,77 +1467,106 @@ def _norm_ptype(raw):
     return None
 
 # ---------------------------------------------------------------- comps pull (HomeHarvest)
+def _nn(v):
+    """fnum with pandas NaN normalized to None (NaN is truthy — a NaN price
+    used to slip past the 'no price' guard and inflate usable counts)."""
+    x = fnum(v)
+    return None if (x is not None and isinstance(x, float) and math.isnan(x)) else x
+
+def _source_label(url, rent=False):
+    """Comp source label from the listing URL's own host, so a frame pulled
+    from any site labels itself honestly (frames today are Realtor's; the
+    merge accepts any frame with the standard HomeHarvest columns)."""
+    u = (url or "").lower()
+    if "zillow." in u: site = "Zillow"
+    elif "redfin." in u: site = "Redfin"
+    elif "realtor." in u: site = "Realtor.com"
+    else: site = None
+    if site is None: return "HomeHarvest (rentals)" if rent else "HomeHarvest"
+    return f"HomeHarvest ({site} rentals)" if rent else f"HomeHarvest ({site})"
+
+def _find_existing_comp(d, pid, kind, addr, price):
+    """Dedupe key: normalized address + price (v3.4). Address casing/spacing
+    differs between frames for the same house; the raw-string match used to
+    store the same sale twice."""
+    want = _norm_addr(addr)
+    for r in d.execute("SELECT id, address FROM comps WHERE property_id=? AND kind=? AND price=?",
+                       (pid, kind, price)).fetchall():
+        if _norm_addr(r["address"]) == want: return r["id"]
+    return None
+
 def _merge_sold_frame(d, prop, df, radius_mi, subj):
-    """Merge one HomeHarvest sold frame into the comps table (ZIP + radius
-    post-filter; never address mode). Returns (added, updated, usable)."""
+    """Merge one HomeHarvest sold frame into the comps table. Returns
+    (added, updated, usable). v3.4: DISTANCE from the subject governs
+    inclusion — the ZIP-equality post-filter is gone (a capped whole-ZIP
+    frame plus the ZIP gate crowded out / dropped nearer same-street sales
+    across ZIP lines, Sherif 2026-11-04). Insert-only: an existing
+    (normalized address, price) row updates in place, never duplicates."""
     added = updated = n = 0
     if df is None: return added, updated, n
     for _, r in df.iterrows():
-        if str(r.get("zip_code")) != str(prop["zip"]): continue
         lat, lon = r.get("latitude"), r.get("longitude")
         if lat is None or lon is None or (isinstance(lat, float) and math.isnan(lat)): continue
         dist = haversine_mi(prop["lat"], prop["lon"], float(lat), float(lon))
         if dist is None or dist > radius_mi: continue
         addr = _s(r.get("street")).strip()
         if not addr: continue
-        price = fnum(r.get("sold_price")); sqft = fnum(r.get("sqft"))
+        price = _nn(r.get("sold_price")); sqft = _nn(r.get("sqft"))
         if not price: continue  # a "sold" row with no price is not a usable comp
         n += 1
         vals = dict(kind="sold", address=addr, city=_s(r.get("city")) or prop["city"],
                     zip=_s(r.get("zip_code")), price=price,
-                    ppsf=(price / sqft) if price and sqft else fnum(r.get("price_per_sqft")),
-                    beds=fnum(r.get("beds")), baths=fnum(r.get("full_baths")), sqft=sqft,
-                    year_built=int(r["year_built"]) if fnum(r.get("year_built")) else None,
+                    ppsf=(price / sqft) if price and sqft else _nn(r.get("price_per_sqft")),
+                    beds=_nn(r.get("beds")), baths=_nn(r.get("full_baths")), sqft=sqft,
+                    year_built=int(_nn(r.get("year_built"))) if _nn(r.get("year_built")) else None,
                     event_date=_s(r.get("last_sold_date"))[:10] or None,
-                    dom=fnum(r.get("days_on_mls")), lat=float(lat), lon=float(lon), distance_mi=dist,
-                    lot_sqft=fnum(r.get("lot_sqft")),
+                    dom=_nn(r.get("days_on_mls")), lat=float(lat), lon=float(lon), distance_mi=dist,
+                    lot_sqft=_nn(r.get("lot_sqft")),
                     ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
-                    source="HomeHarvest (Realtor.com)", source_url=_s(r.get("property_url")),
+                    source=_source_label(_s(r.get("property_url"))), source_url=_s(r.get("property_url")),
                     photo_url=_s(r.get("primary_photo")))
         vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
                                                  "baths": vals["baths"], "year_built": vals["year_built"],
                                                  "lot_sqft": vals["lot_sqft"]})
-        ex = d.execute("SELECT id FROM comps WHERE property_id=? AND kind='sold' AND address=? AND price=?",
-                       (prop["id"], addr, price)).fetchone()
+        ex = _find_existing_comp(d, prop["id"], "sold", addr, price)
         cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
         if ex:
-            d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex["id"])); updated += 1
+            d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex)); updated += 1
         else:
             d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
     return added, updated, n
 
 def _merge_rent_frame(d, prop, df, radius_mi, subj):
-    """Merge one HomeHarvest for_rent frame. Returns (added, usable)."""
+    """Merge one HomeHarvest for_rent frame. Returns (added, usable).
+    v3.4: same distance-governs rule as the sold merge (no ZIP gate)."""
     added = n = 0
     if df is None: return added, n
     for _, r in df.iterrows():
-        if str(r.get("zip_code")) != str(prop["zip"]): continue
         lat, lon = r.get("latitude"), r.get("longitude")
         if lat is None or lon is None or (isinstance(lat, float) and math.isnan(lat)): continue
         dist = haversine_mi(prop["lat"], prop["lon"], float(lat), float(lon))
         if dist is None or dist > radius_mi: continue
-        addr = _s(r.get("street")).strip(); price = fnum(r.get("list_price"))
+        addr = _s(r.get("street")).strip(); price = _nn(r.get("list_price"))
         if not addr or not price: continue
-        sqft = fnum(r.get("sqft"))
+        sqft = _nn(r.get("sqft"))
         vals = dict(kind="rent", address=addr, city=_s(r.get("city")) or prop["city"],
                     zip=_s(r.get("zip_code")), price=price,
                     ppsf=(price / sqft) if sqft else None,
-                    beds=fnum(r.get("beds")), baths=fnum(r.get("full_baths")), sqft=sqft,
-                    year_built=int(r["year_built"]) if fnum(r.get("year_built")) else None,
-                    event_date=None, dom=fnum(r.get("days_on_mls")),
+                    beds=_nn(r.get("beds")), baths=_nn(r.get("full_baths")), sqft=sqft,
+                    year_built=int(_nn(r.get("year_built"))) if _nn(r.get("year_built")) else None,
+                    event_date=None, dom=_nn(r.get("days_on_mls")),
                     lat=float(lat), lon=float(lon), distance_mi=dist,
-                    lot_sqft=fnum(r.get("lot_sqft")),
+                    lot_sqft=_nn(r.get("lot_sqft")),
                     ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
-                    source="HomeHarvest (Realtor.com rentals)", source_url=_s(r.get("property_url")),
+                    source=_source_label(_s(r.get("property_url")), rent=True), source_url=_s(r.get("property_url")),
                     photo_url=_s(r.get("primary_photo")))
         vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
                                                  "baths": vals["baths"], "year_built": vals["year_built"],
                                                  "lot_sqft": vals["lot_sqft"]})
-        ex = d.execute("SELECT id FROM comps WHERE property_id=? AND kind='rent' AND address=? AND price=?",
-                       (prop["id"], addr, price)).fetchone()
+        ex = _find_existing_comp(d, prop["id"], "rent", addr, price)
         cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
         if ex:
-            d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex["id"]))
+            d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex))
         else:
             d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
         n += 1
@@ -1562,49 +1597,168 @@ def rent_match_group(subj, c):
     if (b is not None and abs(b - sb) <= 1) or (ba is not None and abs(ba - sba) <= 1): return 1
     return 2
 
+# ---------------------------------------------------------------- county GIS parcels (v3.4)
+# Subject facts from the county's own parcel record — the assessor carries
+# sales the listing frames never see (110 Garland Ct's own sale is from 2016:
+# no HomeHarvest frame reaches it, the Hillsborough parcel record does).
+# Registry entries are added only for endpoints PROBED live (2026-11-04):
+#   DuPage County IL  — ParcelSearch/DuPageAssessmentParcelSearch layer 3.
+#     (Sherif's spec named OpenData/Parcels/MapServer/0 — that path 404s on
+#     the live server; this is the county's real parcel service.)
+#     Fields: PIN, FCVTOTAL (assessor total fair cash value). No living specs.
+#   Hillsborough County FL — Webmaps/HillsboroughFL_WebParcels layer 0.
+#     Fields: folio (APN), TopSaleDate/TopSalePrice. No living specs.
+# Fills are BLANK-ONLY, like the listing fill: a county value never
+# overwrites anything already on the record. No registry match = Not found.
+_DUPAGE_CITIES = {"downers grove", "naperville", "lisle", "lombard", "elmhurst", "wheaton",
+                  "glen ellyn", "oak brook", "woodridge", "westmont", "darien",
+                  "clarendon hills", "hinsdale", "villa park", "addison", "bensenville",
+                  "bloomingdale", "carol stream", "glendale heights", "itasca", "roselle",
+                  "warrenville", "west chicago", "willowbrook", "winfield", "burr ridge",
+                  "bolingbrook", "aurora", "hanover park", "lemont", "wayne"}
+COUNTY_GIS = [
+    {"county": "DuPage County, IL",
+     "match": lambda p: (p["state"] or "") == "IL" and (p["city"] or "").strip().lower() in _DUPAGE_CITIES,
+     "url": "https://gis.dupageco.org/arcgis/rest/services/ParcelSearch/DuPageAssessmentParcelSearch/MapServer/3/query",
+     "addr_field": "PROPSTNAME", "pin_field": "PIN", "value_field": "FCVTOTAL",
+     "sale_date_field": None, "sale_price_field": None},
+    {"county": "Hillsborough County, FL",
+     "match": lambda p: (p["state"] or "") == "FL" and (p["city"] or "").strip().lower() == "tampa",
+     "url": "https://gis.hcpafl.org/arcgis/rest/services/Webmaps/HillsboroughFL_WebParcels/MapServer/0/query",
+     "addr_field": "FullAddress", "pin_field": "folio", "value_field": None,
+     "sale_date_field": "TopSaleDate", "sale_price_field": "TopSalePrice"},
+]
+
+def county_parcel_fill(d, prop):
+    """Blank-fill subject facts from the county parcel record (APN, assessor
+    value, last-sale note). Returns a provenance string, or None when no
+    registry entry covers the county / no parcel matches / the service is
+    unreachable — the honest Not found. Never overwrites a non-blank field."""
+    entry = next((e for e in COUNTY_GIS if e["match"](prop)), None)
+    if entry is None or prop["lat"] is None or prop["lon"] is None: return None
+    try:
+        env = (f"{prop['lon'] - 0.0025},{prop['lat'] - 0.0025},"
+               f"{prop['lon'] + 0.0025},{prop['lat'] + 0.0025}")
+        r = requests.get(entry["url"], params={
+            "geometry": env, "geometryType": "esriGeometryEnvelope", "inSR": 4326,
+            "spatialRel": "esriSpatialRelIntersects", "outFields": "*",
+            "f": "json", "returnGeometry": "false", "resultRecordCount": 1000}, timeout=30)
+        feats = r.json().get("features", [])
+    except Exception:
+        return None
+    pnum, pcore = _street_key(prop["street"] or prop["address"])
+    hit = None
+    for f in feats:
+        a = f.get("attributes", {})
+        raw = _s(a.get(entry["addr_field"])).split(",")[0]
+        rnum, rcore = _street_key(raw)
+        if pnum and rnum == pnum and rcore and rcore == pcore: hit = a; break
+    if hit is None: return None
+    fills = {}
+    pin = _s(hit.get(entry["pin_field"])).strip()
+    if pin and not prop["apn"]: fills["apn"] = pin
+    val = _nn(hit.get(entry["value_field"])) if entry["value_field"] else None
+    if val:
+        if not prop["est_county"]: fills["est_county"] = val; fills["est_date"] = datetime.date.today().isoformat()
+        if not prop["tax_assessed"]: fills["tax_assessed"] = val
+    if entry["sale_date_field"]:
+        sd = _s(hit.get(entry["sale_date_field"]))[:10]; sp = _nn(hit.get(entry["sale_price_field"]))
+        if sd and sp and not prop["sales_history"]:
+            fills["sales_history"] = (f"Sold {sd} — ${sp:,.0f} "
+                                      f"({entry['county']} parcel record)")
+    if fills:
+        d.execute(f"UPDATE properties SET {','.join(k+'=?' for k in fills)} WHERE id=?",
+                  (*fills.values(), prop["id"]))
+    parts = []
+    if pin: parts.append(f"PIN {pin}")
+    if val: parts.append(f"assessor value ${val:,.0f}")
+    if entry["sale_date_field"] and _s(hit.get(entry["sale_date_field"])):
+        parts.append(f"last sale {_s(hit.get(entry['sale_date_field']))[:10]}")
+    return f"county parcel confirmed via {entry['county']} GIS" + (f" ({'; '.join(parts)})" if parts else "")
+
 def pull_comps(prop, radius_mi=1.0, past_days=365):
-    """ZIP-mode query + post-filter on ZIP and coordinates. NEVER raw full-address mode (mis-resolves).
-    Pulls sold comps + rental comps, the subject's own listing photos, fills blank subject
-    facts from its listing row, and auto-pins the top 3 sold comps (ReiSearch default) when
-    the user has not pinned any yet. Returns counts per kind. Raises on total failure so the
-    job layer can surface the reason — partial failures are reported in 'warnings'."""
+    """Multi-frame union pull (v3.4). Frames: a SUBJECT-CENTERED radius frame
+    (the scraper's comps mode — address + radius) at a 3-year horizon, unioned
+    with the ZIP-area frame at the requested window; distance from the
+    subject's own geocode governs inclusion (no ZIP-equality gate). The
+    centered frame is what finds same-street sales a capped whole-ZIP frame
+    crowds out — probed 2026-11-04: 4248 Lindley St's street has 5 sales in
+    3 years (incl. all 3 of Sherif's fixture sales); the old 365-day ZIP pull
+    surfaced 1. The distance gate is also the mis-resolution safety net: the
+    old raw-address lookup mode mis-resolved cities, but any wrong-area row
+    lands miles away and is discarded here.
+    Also pulls rental comps, the subject's own listing photos, fills blank
+    subject facts from its EXACT listing row only, blank-fills county parcel
+    facts (APN / assessor value / last sale) where a probed GIS endpoint
+    covers the county, and auto-pins the top 3 sold comps (ReiSearch
+    default) when the user has not pinned any yet. Returns counts per kind.
+    Raises on total sold-frame failure so the job layer can surface the
+    reason — partial failures are reported in 'warnings'."""
     from homeharvest import scrape_property
     d = db(); today = datetime.date.today().isoformat()
     warnings = []
-    sold = scrape_property(location=prop["zip"], listing_type="sold", past_days=past_days)
+    addr_line = prop["address"]
+    def _scrape(**kw):
+        try: return scrape_property(**kw), None
+        except Exception as e: return None, e
     subj = {"sqft": prop["sqft"], "beds": prop["beds"], "baths": prop["baths"], "year_built": prop["year_built"], "lot_sqft": prop["lot_sqft"]}
-    added, updated, n_sold = _merge_sold_frame(d, prop, sold, radius_mi, subj)
-    # rentals (LTR / Co-Living / Affordable views all read this set)
-    n_rent = 0; rent_df = None
-    try:
-        rent_df = scrape_property(location=prop["zip"], listing_type="for_rent", past_days=90)
-        a2, n_rent = _merge_rent_frame(d, prop, rent_df, radius_mi, subj)
-        added += a2
-    except Exception as e:
-        warnings.append(f"rental comps failed ({e})")
-        app.logger.warning(f"rent pull failed: {e}")
+    # --- sold frames: centered (3-yr horizon) UNION ZIP area (requested window) ---
+    sold_frames = []
+    centered, err_c = _scrape(location=addr_line, listing_type="sold",
+                              past_days=max(past_days, 1095), radius=radius_mi)
+    if centered is not None: sold_frames.append(centered)
+    area, err_a = _scrape(location=prop["zip"], listing_type="sold", past_days=past_days)
+    if area is not None: sold_frames.append(area)
+    if not sold_frames: raise (err_c or err_a)
+    if err_c is not None: warnings.append(f"centered sold frame failed ({err_c})")
+    if err_a is not None: warnings.append(f"ZIP sold frame failed ({err_a})")
+    added = updated = n_sold = 0
+    for fr in sold_frames:
+        a1, u1, n1 = _merge_sold_frame(d, prop, fr, radius_mi, subj)
+        added += a1; updated += u1; n_sold += n1
+    # --- rentals: centered UNION ZIP (LTR / Co-Living / Affordable views read this set) ---
+    n_rent = 0; rent_frames = []
+    rc, _ = _scrape(location=addr_line, listing_type="for_rent", past_days=90, radius=radius_mi)
+    if rc is not None: rent_frames.append(rc)
+    ra, err_r = _scrape(location=prop["zip"], listing_type="for_rent", past_days=90)
+    if ra is not None: rent_frames.append(ra)
+    if not rent_frames:
+        warnings.append(f"rental comps failed ({err_r})")
+        app.logger.warning(f"rent pull failed: {err_r}")
+    for fr in rent_frames:
+        a2, n2 = _merge_rent_frame(d, prop, fr, radius_mi, subj)
+        added += a2; n_rent += n2
     d.commit()
     # --- subject's own listing: photos + blank-fact fill (never overwrite user data) ---
+    # v3.4: EXACT row only. The old nearest-within-0.05mi fallback could fill a
+    # subject with a NEIGHBOR's specs and photos (the live-record mutation
+    # class); a missing row now honestly leaves the fields blank.
     photos_found = 0
-    try:
-        fs = scrape_property(location=prop["zip"], listing_type="for_sale", past_days=365)
-    except Exception as e:
-        fs = None; warnings.append(f"for-sale lookup for subject photos failed ({e})")
-    srow = find_subject_row(fs, prop)
-    if srow is None:
-        srow = find_subject_row(sold, prop)
-    if srow is None:
-        srow = find_subject_row(rent_df, prop)
+    fs_frames = []
+    fc, _ = _scrape(location=addr_line, listing_type="for_sale", past_days=365, radius=radius_mi)
+    if fc is not None: fs_frames.append(fc)
+    fz, err_f = _scrape(location=prop["zip"], listing_type="for_sale", past_days=365)
+    if fz is not None: fs_frames.append(fz)
+    if not fs_frames: warnings.append(f"for-sale lookup for subject photos failed ({err_f})")
+    srow = None
+    for fr in fs_frames + sold_frames + rent_frames:
+        srow = find_subject_row(fr, prop, exact_only=True)
+        if srow is not None: break
     if srow is None:
         # v1.6 (item N): DEEP subject lookup — the subject's own last sale is often
         # older than the comp window, so the frames above miss it and photos/specs
-        # never populate. One wider sold scrape (10 years, ZIP mode) finds the
-        # subject's own listing row: photos + blank specs come from it.
-        try:
-            deep = scrape_property(location=prop["zip"], listing_type="sold", past_days=3650)
-            srow = find_subject_row(deep, prop)
-        except Exception as e:
-            warnings.append(f"deep subject lookup failed ({e})")
+        # never populate. One wider sold scrape (10 years) finds the subject's own
+        # listing row: photos + blank specs come from it. v3.4: centered first.
+        deep, err_d = _scrape(location=addr_line, listing_type="sold", past_days=3650,
+                              radius=max(radius_mi, 1.0))
+        if deep is not None:
+            srow = find_subject_row(deep, prop, exact_only=True)
+        if srow is None:
+            deep2, err_d2 = _scrape(location=prop["zip"], listing_type="sold", past_days=3650)
+            if deep2 is not None:
+                srow = find_subject_row(deep2, prop, exact_only=True)
+            elif err_d is not None and err_d2 is not None:
+                warnings.append(f"deep subject lookup failed ({err_d2})")
     if srow is None:
         # v2.0 honest state: no listing row for this address in ANY free frame
         # (including the 10-year deep sold scrape) — specs/photos stay blank
@@ -1631,6 +1785,14 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         if fills:
             d.execute(f"UPDATE properties SET {','.join(k+'=?' for k in fills)} WHERE id=?",
                       (*fills.values(), prop["id"])); d.commit()
+    # --- county parcel record (v3.4): blank-fill APN / assessor value / last
+    # sale from the county GIS where a probed endpoint covers the county ---
+    try:
+        _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
+        _note = county_parcel_fill(d, _prop_now)
+        if _note: warnings.append(_note); d.commit()
+    except Exception as e:
+        warnings.append(f"county parcel lookup failed ({e})")
     # --- P0-1/P0-2 widening (Sherif 2026-11-02): the match-first views need a
     # real matched set. If the stored sold set holds <10 Tier-1 matches, run ONE
     # widened sold scrape (2x radius, min 2 mi; 730 days) and merge it; if the
@@ -1640,20 +1802,34 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     prop2 = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
     subj2 = {"sqft": prop2["sqft"], "beds": prop2["beds"], "baths": prop2["baths"],
              "year_built": prop2["year_built"], "lot_sqft": prop2["lot_sqft"]}
-    def _tier1_count():
-        rows = d.execute("SELECT beds,baths,sqft FROM comps WHERE property_id=? AND kind='sold' AND excluded=0",
+    def _tier1_count(win_days=None):
+        rows = d.execute("SELECT beds,baths,sqft,event_date FROM comps WHERE property_id=? AND kind='sold' AND excluded=0",
                          (prop["id"],)).fetchall()
+        if win_days:
+            cutoff = (datetime.date.today() - datetime.timedelta(days=win_days)).isoformat()
+            rows = [r for r in rows if not r["event_date"] or r["event_date"] >= cutoff]
         return sum(1 for r in rows if comp_tier(subj2, dict(r)) == 1)
     t1 = _tier1_count()
-    if t1 < 10:
-        try:
-            wide = scrape_property(location=prop["zip"], listing_type="sold", past_days=730)
-            a3, u3, _ = _merge_sold_frame(d, prop2, wide, max(radius_mi * 2, 2.0), subj2)
-            added += a3; updated += u3; d.commit()
-            t1b = _tier1_count()
-            warnings.append(f"sold set widened to {max(radius_mi * 2, 2.0):g} mi / 730 days to find Tier-1 matches ({t1} -> {t1b} found)")
-        except Exception as e:
-            warnings.append(f"sold widening scrape failed ({e})")
+    # v3.4: the widening must also serve the VIEW — the sold view shows a
+    # date window, so Tier-1 depth is measured inside the requested window
+    # too (a 3-year stored set can hold 31 Tier-1 all-time yet only 8 inside
+    # the 365-day view, and the top cards are what Sherif judges).
+    t1w = _tier1_count(past_days)
+    if t1 < 10 or t1w < 10:
+        wide_r = max(radius_mi * 2, 2.0)
+        got = False
+        for kw in (dict(location=prop2["address"], listing_type="sold", past_days=730, radius=wide_r),
+                   dict(location=prop["zip"], listing_type="sold", past_days=730)):
+            wide, _e = _scrape(**kw)
+            if wide is None: continue
+            a3, u3, _ = _merge_sold_frame(d, prop2, wide, wide_r, subj2)
+            added += a3; updated += u3; got = True
+        if got:
+            d.commit()
+            t1b = _tier1_count(); t1wb = _tier1_count(past_days)
+            warnings.append(f"sold set widened to {wide_r:g} mi / 730 days to find Tier-1 matches ({t1} -> {t1b} found; {t1w} -> {t1wb} within {past_days} days)")
+        else:
+            warnings.append("sold widening scrape failed")
     def _rent_match_counts():
         rows = d.execute("SELECT beds,baths FROM comps WHERE property_id=? AND kind='rent'",
                          (prop["id"],)).fetchall()
@@ -1662,14 +1838,20 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         return len(rows), ex_, near
     rn, rex, rnear = _rent_match_counts()
     if rn < 11 or (rex + rnear) < 5:
-        try:
-            wide_r = scrape_property(location=prop["zip"], listing_type="for_rent", past_days=365)
-            a4, _ = _merge_rent_frame(d, prop2, wide_r, max(radius_mi * 2, 2.0), subj2)
-            added += a4; d.commit()
+        wide_r = max(radius_mi * 2, 2.0)
+        got = False
+        for kw in (dict(location=prop2["address"], listing_type="for_rent", past_days=365, radius=wide_r),
+                   dict(location=prop["zip"], listing_type="for_rent", past_days=365)):
+            wide_rf, _e = _scrape(**kw)
+            if wide_rf is None: continue
+            a4, _ = _merge_rent_frame(d, prop2, wide_rf, wide_r, subj2)
+            added += a4; got = True
+        if got:
+            d.commit()
             rn2, rex2, rnear2 = _rent_match_counts()
-            warnings.append(f"rental set widened to {max(radius_mi * 2, 2.0):g} mi / 365 days for matched rentals ({rn} -> {rn2} listings; {rex2} exact + {rnear2} near beds/baths matches)")
-        except Exception as e:
-            warnings.append(f"rental widening scrape failed ({e})")
+            warnings.append(f"rental set widened to {wide_r:g} mi / 365 days for matched rentals ({rn} -> {rn2} listings; {rex2} exact + {rnear2} near beds/baths matches)")
+        else:
+            warnings.append("rental widening scrape failed")
     # --- Auto-pin (only if user pinned none): top 3 by TIER first (P0-1: Tier 1
     # only when >=3 exist), then match score, then distance. ---
     pinned_now = d.execute("SELECT COUNT(*) c FROM comps WHERE property_id=? AND kind='sold' AND pinned=1",

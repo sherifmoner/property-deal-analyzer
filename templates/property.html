@@ -4,8 +4,16 @@
    Built from the row's own stored address fields; only links the data supports. #}
 {% set street = (street or '')|trim %}{% set city = (city or '')|trim %}{% set state = (state or '')|trim %}{% set zip = (zip or '')|string|trim %}
 {% if street or source_url %}<div class="sitelinks">
-{% if source_url %}<a class="sl-chip src" target="_blank" rel="noopener" href="{{ source_url }}" title="The actual listing this row came from">🏠 Listing · {{ source_name or 'source' }} ↗</a>{% endif %}
-{% if street %}{% set zslug = (street ~ ' ' ~ city ~ ' ' ~ state ~ ' ' ~ zip)|replace(',', '')|replace(' ', '-') %}
+{% if source_url %}<a class="sl-chip src" target="_blank" rel="noopener" href="{{ source_url }}" title="The actual listing this row came from">🏠 Listing · {{ source_name or 'source' }} ↗</a>
+{# v3.4 (Sherif 2026-11-04): the site chip for the site this listing actually
+   came from links the STORED listing URL. Hand-built search URLs are dead
+   ends (the Redfin /search?query= form redirects to Redfin's homepage —
+   live-verified) and a working page on another site needs that site's own
+   property ID, which only the stored URL carries. No fabricated chips. #}
+{% set su = source_url|lower %}{% set host_site = 'Zillow' if 'zillow.' in su else ('Redfin' if 'redfin.' in su else ('Realtor' if 'realtor.' in su else '')) %}
+{% if host_site %}<a class="sl-chip" target="_blank" rel="noopener" href="{{ source_url }}" title="This property's page on {{ host_site }} (the stored listing URL)">{{ host_site }} ↗</a>{% endif %}
+{% elif street %}{% set zslug = (street ~ ' ' ~ city ~ ' ' ~ state ~ ' ' ~ zip)|replace(',', '')|replace(' ', '-') %}
+{# last-resort fallback ONLY when the row carries no stored listing URL #}
 <a class="sl-chip" target="_blank" rel="noopener" href="https://www.zillow.com/homes/{{ zslug }}_rb/">Zillow ↗</a>
 <a class="sl-chip" target="_blank" rel="noopener" href="https://www.redfin.com/search?query={{ (street ~ ', ' ~ city ~ ', ' ~ state ~ ' ' ~ zip)|urlencode }}">Redfin ↗</a>
 <a class="sl-chip" target="_blank" rel="noopener" href="https://www.realtor.com/realestateandhomes-search/{{ street|replace(' ', '-') }}_{{ city|replace(' ', '-') }}_{{ state }}_{{ zip }}">Realtor ↗</a>{% endif %}
