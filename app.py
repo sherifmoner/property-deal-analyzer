@@ -1676,6 +1676,34 @@ def county_parcel_fill(d, prop):
         parts.append(f"last sale {_s(hit.get(entry['sale_date_field']))[:10]}")
     return f"county parcel confirmed via {entry['county']} GIS" + (f" ({'; '.join(parts)})" if parts else "")
 
+class SourceUnreachableError(Exception):
+    """The listing source cannot be reached from this host at all — e.g. an
+    egress-whitelisted host (PythonAnywhere free tier), where realtor.com
+    is not on the allowlist and every HomeHarvest frame fails at the
+    connection. The message IS the user-facing text: complete and human,
+    no exception internals, no URLs. The job layer surfaces it verbatim."""
+
+SOURCE_UNREACHABLE_MSG = (
+    "Comp pull stopped — the listing data source (Realtor.com via HomeHarvest) "
+    "can't be reached from this server, because this host's internet access "
+    "doesn't include the listing sites. Nothing was added or changed.")
+
+_CONN_ERR_MARKERS = ("connection", "timed out", "timeout", "unreachable",
+                     "name resolution", "max retries", "proxy", "tunnel",
+                     "whitelist", "forbidden", "403", "blocked", "reset",
+                     "refused", "eof occurred", "ssl")
+
+def _is_unreachable_err(e):
+    """True when a frame failure is a connectivity failure (the source
+    cannot be reached from this host), as opposed to the source answering
+    with bad/empty data. Type first, message markers as fallback —
+    HomeHarvest wraps requests errors in its own exception classes."""
+    if e is None: return False
+    if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    low = str(e).lower()
+    return any(k in low for k in _CONN_ERR_MARKERS)
+
 def pull_comps(prop, radius_mi=1.0, past_days=365):
     """Multi-frame union pull (v3.4). Frames: a SUBJECT-CENTERED radius frame
     (the scraper's comps mode — address + radius) at a 3-year horizon, unioned
@@ -1709,9 +1737,23 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     if centered is not None: sold_frames.append(centered)
     area, err_a = _scrape(location=prop["zip"], listing_type="sold", past_days=past_days)
     if area is not None: sold_frames.append(area)
-    if not sold_frames: raise (err_c or err_a)
-    if err_c is not None: warnings.append(f"centered sold frame failed ({err_c})")
-    if err_a is not None: warnings.append(f"ZIP sold frame failed ({err_a})")
+    if not sold_frames:
+        # v3.6: total sold-frame failure fails HUMAN. Raw exception text
+        # (URLs, proxy internals) goes to the server log only — never the
+        # UI. Nothing has been merged yet at this point, so a failed pull
+        # stores zero rows.
+        app.logger.warning(f"comp pull: all sold frames failed for {addr_line}: "
+                           f"centered={err_c!r} area={err_a!r}")
+        if _is_unreachable_err(err_c) or _is_unreachable_err(err_a):
+            raise SourceUnreachableError(SOURCE_UNREACHABLE_MSG)
+        raise RuntimeError("the listing source returned an error before any comps "
+                           "came back — nothing was added or changed; please try again")
+    if err_c is not None:
+        app.logger.warning(f"comp pull: centered sold frame failed for {addr_line}: {err_c!r}")
+        warnings.append("centered sold frame failed — results came from the ZIP-area frame")
+    if err_a is not None:
+        app.logger.warning(f"comp pull: ZIP sold frame failed for {addr_line}: {err_a!r}")
+        warnings.append("ZIP-area sold frame failed — results came from the address-centered frame")
     added = updated = n_sold = 0
     for fr in sold_frames:
         a1, u1, n1 = _merge_sold_frame(d, prop, fr, radius_mi, subj)
@@ -1723,7 +1765,7 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     ra, err_r = _scrape(location=prop["zip"], listing_type="for_rent", past_days=90)
     if ra is not None: rent_frames.append(ra)
     if not rent_frames:
-        warnings.append(f"rental comps failed ({err_r})")
+        warnings.append("rental comps couldn't be pulled this time")
         app.logger.warning(f"rent pull failed: {err_r}")
     for fr in rent_frames:
         a2, n2 = _merge_rent_frame(d, prop, fr, radius_mi, subj)
@@ -1739,7 +1781,9 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     if fc is not None: fs_frames.append(fc)
     fz, err_f = _scrape(location=prop["zip"], listing_type="for_sale", past_days=365)
     if fz is not None: fs_frames.append(fz)
-    if not fs_frames: warnings.append(f"for-sale lookup for subject photos failed ({err_f})")
+    if not fs_frames:
+        app.logger.warning(f"comp pull: for-sale lookup failed for {addr_line}: {err_f!r}")
+        warnings.append("for-sale lookup for subject photos failed")
     srow = None
     for fr in fs_frames + sold_frames + rent_frames:
         srow = find_subject_row(fr, prop, exact_only=True)
@@ -1758,7 +1802,8 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             if deep2 is not None:
                 srow = find_subject_row(deep2, prop, exact_only=True)
             elif err_d is not None and err_d2 is not None:
-                warnings.append(f"deep subject lookup failed ({err_d2})")
+                app.logger.warning(f"comp pull: deep subject lookup failed for {addr_line}: {err_d2!r}")
+                warnings.append("deep subject lookup failed")
     if srow is None:
         # v2.0 honest state: no listing row for this address in ANY free frame
         # (including the 10-year deep sold scrape) — specs/photos stay blank
@@ -1792,7 +1837,8 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         _note = county_parcel_fill(d, _prop_now)
         if _note: warnings.append(_note); d.commit()
     except Exception as e:
-        warnings.append(f"county parcel lookup failed ({e})")
+        app.logger.warning(f"comp pull: county parcel fill failed for {addr_line}: {e!r}")
+        warnings.append("county parcel lookup failed")
     # --- P0-1/P0-2 widening (Sherif 2026-11-02): the match-first views need a
     # real matched set. If the stored sold set holds <10 Tier-1 matches, run ONE
     # widened sold scrape (2x radius, min 2 mi; 730 days) and merge it; if the
@@ -1887,7 +1933,11 @@ def _census_key():
 
 def _acs_fetch(year, varlist, geo_params):
     """One ACS 5-year query -> {var: value} dict, or None on any failure.
-    The Census *geocoder* is keyless; the *data* API needs the key when configured."""
+    Keyless-first (v3.6): the key is added only when one is configured
+    (CENSUS_API_KEY env or the census_key setting). Where the network
+    demands a key, api.census.gov answers with an HTML 'Missing Key' page
+    instead of JSON — that fails parsing here and returns None, which
+    callers treat as 'source unavailable', never as data."""
     key = _census_key()
     for path in (f"https://api.census.gov/data/{year}/acs/acs5", f"https://api.census.gov/data/{year}/acs5"):
         try:
@@ -1972,8 +2022,16 @@ def _block_from_vals(v, name=None):
     blk["pyramid"] = _age_pyramid(v)
     return blk
 
-def _geo_block(geo_params, year=ACS_YEAR):
-    """Direct api.census.gov path (OPTIONAL ALTERNATE — needs CENSUS_API_KEY)."""
+# v3.6: the direct api.census.gov fallback serves the SAME vintage Census
+# Reporter is pinned to (CR_RELEASE = acs2024_5yr), so a block built from
+# either source is like-for-like under the "ACS 2024 5-year" label. (The
+# ACS_YEAR constant still governs the _pop_trend year range and the
+# _resolve_place place-list query — separate surfaces, unchanged.)
+DIRECT_ACS_YEAR = 2024
+
+def _geo_block(geo_params, year=DIRECT_ACS_YEAR):
+    """Direct api.census.gov path — the fallback when Census Reporter is
+    unreachable (v3.6). Keyless-first; uses CENSUS_API_KEY when configured."""
     core = _acs_fetch(year, "NAME,B01003_001E,B25077_001E,B25064_001E,B19013_001E,"
                             "B25003_002E,B25003_003E,B23025_003E,B23025_005E", geo_params)
     if not core: return None
@@ -2036,7 +2094,11 @@ def _cr_fetch(geo_id, release=CR_RELEASE, tables=CR_TABLES, timeout=20):
 
 def _geo_block_any(geo_id, name, direct_params):
     """Dashboard block for one geography: Census Reporter first (keyless);
-    the keyed direct Census API only as an optional alternate. Returns (block, source)."""
+    direct api.census.gov whenever Reporter does not answer (v3.6 — on
+    egress-restricted hosts like PythonAnywhere free, censusreporter.org
+    is blocked but api.census.gov is reachable, so this fallback is what
+    serves demographics there; keyless-first, key used when configured).
+    Returns (block, source)."""
     try:
         vals, rel = _cr_fetch(geo_id)
     except Exception:
@@ -2044,9 +2106,9 @@ def _geo_block_any(geo_id, name, direct_params):
     if vals:
         blk = _block_from_vals(vals, name)
         if blk: return blk, f"US Census {rel} via Census Reporter"
-    if direct_params and _census_key():
+    if direct_params:
         blk = _geo_block(direct_params)
-        if blk: return blk, "US Census ACS 5-year (api.census.gov, keyed alternate)"
+        if blk: return blk, "US Census ACS 5-year (api.census.gov)"
     return None, None
 
 def _growth_series(pts):
@@ -3114,7 +3176,10 @@ def census_demographics(zip_code, city=None, state=None, address=None):
     distribution (B19001), race (B02001+B03003), age pyramid (B01001), population
     trend, and prior-release change for home value / rent.
     PRIMARY source: Census Reporter API (keyless, api.censusreporter.org).
-    The direct api.census.gov path remains only as an optional keyed alternate."""
+    FALLBACK (v3.6): direct api.census.gov (same ACS 2024 5-year vintage)
+    whenever Reporter does not answer — the only demographics route on
+    egress-restricted hosts where censusreporter.org is blocked but
+    api.census.gov is reachable. Keyless-first; CENSUS_API_KEY when set."""
     out = {"zip": None, "city": None, "source": None,
            "date": datetime.date.today().isoformat()}
     zip_geo = f"86000US{zip_code}"
@@ -3124,11 +3189,18 @@ def census_demographics(zip_code, city=None, state=None, address=None):
     if src: out["source"] = src
     if blk:
         blk["pop_trend"] = _pop_trend_cr(zip_geo)
-        if len(blk["pop_trend"]) < 2 and _census_key():
+        if len(blk["pop_trend"]) < 2:
             # Census Reporter's public API serves named 5-year releases
             # (acs2014_5yr / acs2019_5yr / acs2024_5yr verified) but NOT
-            # acs2023_5yr — vintage trend falls back to the keyed direct API.
-            blk["pop_trend"] = _pop_trend(zip_code)
+            # acs2023_5yr — a thin/absent Reporter trend falls back to the
+            # direct API (v3.6: no longer key-gated; keyless-first). The
+            # fallback only REPLACES the Reporter trend when it returns
+            # more points: on a keyless network where Census refuses the
+            # direct calls, Reporter's single current-release point must
+            # survive rather than be emptied by a zero-point fallback.
+            direct_trend = _pop_trend(zip_code)
+            if len(direct_trend) > len(blk["pop_trend"]):
+                blk["pop_trend"] = direct_trend
         prev_vals = {}
         try:
             # v3.3: same archive-timeout rationale as _pop_trend_cr — the
@@ -3137,8 +3209,12 @@ def census_demographics(zip_code, city=None, state=None, address=None):
             prev_vals, _r = _cr_fetch(zip_geo, release="acs2019_5yr", tables="B25077,B25064", timeout=12)
         except Exception:
             prev_vals = {}
-        if not prev_vals and _census_key():
-            prev_vals = _acs_fetch(ACS_YEAR - 5, "B25077_001E,B25064_001E",
+        if not prev_vals:
+            # v3.6: direct-API prior-release comparison, keyless-first.
+            # Year is DIRECT_ACS_YEAR - 5 = 2019 — the same vintage as the
+            # acs2019_5yr Reporter archive it stands in for (the old keyed
+            # path used ACS_YEAR - 5 = 2018, a different comparison basis).
+            prev_vals = _acs_fetch(DIRECT_ACS_YEAR - 5, "B25077_001E,B25064_001E",
                                    f"zip code tabulation area:{zip_code}") or {}
         chg = {}
         for var, key, field in (("B25077_001E", "home_value_pct", "median_home_value"),
@@ -3153,7 +3229,11 @@ def census_demographics(zip_code, city=None, state=None, address=None):
         out["city"] = cblk
         if not out["source"] and csrc: out["source"] = csrc
     if not out["source"]:
-        out["source"] = "US Census ACS 5-year via Census Reporter (api.censusreporter.org)"
+        # v3.6: never credit a source that did not serve. When neither
+        # block loaded, say so plainly (the job layer fails the pull
+        # honestly in that case and keeps any cached data untouched).
+        out["source"] = ("US Census ACS 5-year — unavailable (neither Census Reporter "
+                         "nor api.census.gov answered from this server)")
     return out
 
 # ---------------------------------------------------------------- OSM amenities (v1.1)
@@ -3351,6 +3431,8 @@ def start_job(pid, kind, fn):
     return jid
 
 def _plain_error(kind, e):
+    if isinstance(e, SourceUnreachableError):
+        return str(e)  # v3.6: the message is already complete human text
     s = str(e) or e.__class__.__name__
     low = s.lower()
     if any(k in low for k in ("403", "forbidden", "blocked", "captcha")):
@@ -3442,8 +3524,9 @@ def job_demographics(pid):
             # v2.0: the ZIP block is the property's OWN geography and is required
             # for success — a city-only result (bad ZIP, resolvable city) must not
             # pose as a successful pull or overwrite the cache.
-            msg = ("Census data didn't come back — Census Reporter (and the Census Geocoder for the "
-                   "city scope) may be unreachable right now. Cached data, if any, is unchanged.")
+            msg = ("Census data didn't come back — Census Reporter and api.census.gov (and the "
+                   "Census Geocoder for the city scope) may be unreachable right now. "
+                   "Cached data, if any, is unchanged.")
             db().execute("UPDATE properties SET demo_error=? WHERE id=?", (msg, pid)); db().commit()
             raise RuntimeError("Census demographics failed (key/network) — see the notice on the Demographics tab")
         db().execute("UPDATE properties SET demo_json=?, demo_date=?, demo_error=NULL WHERE id=?",
