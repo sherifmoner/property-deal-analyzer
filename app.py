@@ -1638,18 +1638,29 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
             if touched is not None: touched.append((_cur.lastrowid, vals["source"]))
     return added, updated, n
 
-def _merge_rent_frame(d, prop, df, radius_mi, subj, source_override=None):
-    """Merge one HomeHarvest for_rent frame. Returns (added, usable).
-    v3.4: same distance-governs rule as the sold merge (no ZIP gate).
-    source_override: see _merge_sold_frame."""
-    added = n = 0
-    if df is None: return added, n
+def _merge_rent_frame(d, prop, df, radius_mi, subj, source_override=None, drops=None):
+    """Merge one HomeHarvest for_rent frame. Returns (added, updated,
+    usable). v3.4: same distance-governs rule as the sold merge (no
+    ZIP gate). source_override: see _merge_sold_frame.
+    drops (v45, optional): the same drop collector the sold merge
+    takes (see _drop_note / _merge_sold_frame) — pull_comps passes one
+    for RapidAPI frames and logs the per-reason counts, so a
+    served-but-not-stored rent pull names the exact filter that ate
+    the rows (the v43/v44 live pulls logged "served 13 rows, 0
+    in-gate" with no reason anywhere). Default None = no accounting,
+    behavior unchanged. The return gained `updated` (v45) for that
+    line's duplicate count; it was bookkeeping the merge did silently
+    before."""
+    added = updated = n = 0
+    if df is None: return added, updated, n
     for _, r in df.iterrows():
         # v43: the store decision is the SHARED rent acceptance test
         # (_rent_row_gate) — the same test the pool's rent in-gate
         # counter uses, so the two cannot diverge (see _sold_row_gate).
-        ok, _reason, dist = _rent_row_gate(r, prop, radius_mi)
-        if not ok: continue
+        ok, reason, dist = _rent_row_gate(r, prop, radius_mi)
+        if not ok:
+            if drops is not None: _drop_note(drops, reason, r)
+            continue
         lat, lon = float(r.get("latitude")), float(r.get("longitude"))
         addr = _s(r.get("street")).strip(); price = _nn(r.get("list_price"))
         sqft = _nn(r.get("sqft"))
@@ -1670,11 +1681,12 @@ def _merge_rent_frame(d, prop, df, radius_mi, subj, source_override=None):
         ex = _find_existing_comp(d, prop["id"], "rent", addr, price)
         cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
         if ex:
-            d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex))
+            d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex)); updated += 1
+            if drops is not None: _drop_note(drops, "duplicate", r)
         else:
             d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
         n += 1
-    return added, n
+    return added, updated, n
 
 def comp_tier(subj, c):
     """Sherif's match-first tiers for SOLD comps (2026-11-02, P0-1).
@@ -2242,9 +2254,23 @@ def _src_reefapi_sold(prop, past_days, radius_mi=1.0):
     return rows, None, RAPIDAPI_SRC_REEF
 
 def _src_redfin_sold(prop, past_days, radius_mi=1.0):
+    # v45: WHICH empty this was is part of the outcome. "No results"
+    # used to cover the region never resolving (the two live pulls —
+    # the auto-complete path is a defensive constant whose response
+    # shape was never captured, so an unresolvable region is a live
+    # possibility), the search answering empty, and the search
+    # failing. Each non-serving path now leaves a distinct side-note
+    # (the _rapi_note channel, taken into the outcome's LOG text by
+    # _rapidapi_sold_frame; the banner keeps its clean reason).
+    _rapi_take_note("redfin_sold")  # discard any stale note from a direct call
     rid, err = _redfin_region_id(prop)
-    if err is not None: return [], err, RAPIDAPI_SRC_REDFIN
-    if not rid: return [], None, RAPIDAPI_SRC_REDFIN
+    if err is not None:
+        _rapi_note("redfin_sold", "region lookup failed")
+        return [], err, RAPIDAPI_SRC_REDFIN
+    if not rid:
+        _rapi_note("redfin_sold",
+                   "region unresolved — auto-complete returned no region id")
+        return [], None, RAPIDAPI_SRC_REDFIN
     # soldWithin follows the pull window (v44): floored at 365 — the
     # value every pre-v44 window used, so existing windows behave
     # exactly as before — and capped at 1095, the deepest the client
@@ -2253,9 +2279,14 @@ def _src_redfin_sold(prop, past_days, radius_mi=1.0):
     data, err = _rapidapi_get(RAPIDAPI_REDFIN_HOST, "/properties/search-sold",
                               {"regionId": rid, "limit": 100,
                                "soldWithin": min(max(past_days, 365), 1095)})
-    if err is not None: return [], err, RAPIDAPI_SRC_REDFIN
+    if err is not None:
+        _rapi_note("redfin_sold", f"region {rid} resolved; search failed")
+        return [], err, RAPIDAPI_SRC_REDFIN
     items = data.get("data") if isinstance(data, dict) else None
-    rows = _rapi_rows(items if isinstance(items, list) else [], _redfin_item_to_row)
+    items = items if isinstance(items, list) else []
+    if not items:
+        _rapi_note("redfin_sold", f"region {rid} resolved; search returned no rows")
+    rows = _rapi_rows(items, _redfin_item_to_row)
     return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_REDFIN
 
 def _src_sabri_forsold(prop, past_days, radius_mi=1.0):
@@ -2593,10 +2624,36 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     if not rent_frames:
         warnings.append("rental comps couldn't be pulled this time")
         app.logger.warning(f"rent pull failed: {err_r}")
+    # v45: drop accounting for the RapidAPI rent frame, mirroring the
+    # sold side (v43) — one collector across its merge, logged below,
+    # so a served-but-not-stored rent frame names the exact filter.
+    rent_rapi_drops = {}
+    rent_rapi_served = rent_rapi_added = rent_rapi_updated = 0
+    rent_rapi_merged = False
     for fr in rent_frames:
-        a2, n2 = _merge_rent_frame(d, prop, fr, radius_mi, subj,
-                                   source_override=rent_sources.get(id(fr)))
+        _is_rapi_r = id(fr) in rent_sources
+        a2, u2, n2 = _merge_rent_frame(d, prop, fr, radius_mi, subj,
+                                       source_override=rent_sources.get(id(fr)),
+                                       drops=rent_rapi_drops if _is_rapi_r else None)
         added += a2; n_rent += n2
+        if _is_rapi_r:
+            rent_rapi_merged = True
+            rent_rapi_served += len(fr); rent_rapi_added += a2; rent_rapi_updated += u2
+    if rent_rapi_merged:
+        _rparts = []
+        for _rsn in ("no_coords", "no_street", "no_price", "outside_radius",
+                     "outside_window", "other"):
+            _slot = rent_rapi_drops.get(_rsn)
+            if _slot and _slot[0]:
+                _ex = "; ".join(_slot[1])
+                _rparts.append(f"{_rsn}={_slot[0]}" + (f" ({_ex})" if _ex else ""))
+        _rdup = rent_rapi_drops.get("duplicate")
+        app.logger.warning(
+            f"rent pull: RapidAPI rent merge detail for {addr_line}: "
+            f"served {rent_rapi_served} rows -> {rent_rapi_added} stored new"
+            + (f" + {rent_rapi_updated} duplicate updates" if rent_rapi_updated else "")
+            + (f" ({'; '.join(_rdup[1])})" if _rdup and _rdup[1] else "")
+            + f"; drops: {', '.join(_rparts) if _rparts else 'none'}")
     d.commit()
     # --- subject's own listing: photos + blank-fact fill (never overwrite user data) ---
     # v3.4: EXACT row only. The old nearest-within-0.05mi fallback could fill a
@@ -2717,7 +2774,7 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                    dict(location=prop["zip"], listing_type="for_rent", past_days=365)):
             wide_rf, _e = _scrape(**kw)
             if wide_rf is None: continue
-            a4, _ = _merge_rent_frame(d, prop2, wide_rf, wide_r, subj2)
+            a4, _, _ = _merge_rent_frame(d, prop2, wide_rf, wide_r, subj2)
             added += a4; got = True
         if got:
             d.commit()
@@ -4319,7 +4376,20 @@ def job_comps(pid, radius, past_days):
         res = pull_comps(p, radius_mi=radius, past_days=past_days)
         msg = f"✓ {res['sold']} sold comps + {res['rentals']} rental comps found (radius {radius:g} mi)"
         if res["photos"]: msg += f" · {res['photos']} listing photos found for this property"
-        if res["warnings"]: msg += " · ⚠ " + "; ".join(res["warnings"])
+        if res["warnings"]:
+            # v45: the "; " separator is STRUCTURAL, not per-segment
+            # luck — each segment is stripped of surrounding space and
+            # any trailing ';' it arrived with, and empties are
+            # dropped, before the join. The v43 live banner showed the
+            # include-results segment and the for-sale note run
+            # together ("...(Realtor16) for-sale lookup..."): with the
+            # raw join, a segment boundary is only as clean as the
+            # segment text itself. Normalized here — the ONE place the
+            # banner is assembled — every boundary is "; " by
+            # construction.
+            _segs = [str(w).strip().rstrip(";").strip() for w in res["warnings"]]
+            _segs = [s for s in _segs if s]
+            if _segs: msg += " · ⚠ " + "; ".join(_segs)
         return msg
     return start_job(pid, "comps", fn)
 
