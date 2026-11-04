@@ -1832,8 +1832,9 @@ def _is_unreachable_err(e):
 #     POST /realtor/v1/sold   {location, sort, limit, offset} -> data.results
 #                             (FLAT items, coordinates on every row)
 #   "Redfin.Com Data" by Nathan (Basic free 100 req/mo):
-#     GET  <auto-complete>    city/state -> regionId ("6_20109" verified)
-#     GET  /properties/search-sold?regionId&limit&soldWithin=365 -> data[]
+#     GET  /properties/auto-complete?query="City, ST" -> regionId
+#          ("6_20109" for West Chicago, "6_18142" for Tampa — captured)
+#     GET  /properties/search-sold?regionId&limit&soldWithin -> data[]
 #   "Realtor" by Sabri (Basic free 30 req/mo — LAST, the quota is precious):
 #     GET  /search/forsold/coordinates?lat&lon&radius&page -> properties[]
 #     GET  /search/forrent/coordinates?lat&lon&radius&page -> properties[]
@@ -1859,6 +1860,26 @@ def _is_unreachable_err(e):
 # the comps table, so the pool is only walked on a fresh pull. With NO
 # key configured, nothing in this section ever runs and the pull is
 # the pre-RapidAPI one.
+# v46 — rent price-path rebuild + Redfin auto-complete fix, both on
+# LIVE-CAPTURED structures (playground, Sherif's account, 2026-11-04
+# ~23:17 EET — the capture round the v45 log prescribed). The Sabri
+# forrent capture proved the rent read was a dead path: a forrent
+# item's description has NO list_price key (beds/baths/sqft arrive as
+# scalars, [] — the API's empty-array null — or min/max ranges); the
+# rent is the item's TOP-LEVEL list_price (a number on single-family
+# items, [] on community items), a list_price_min/max range, or
+# units[] (one priced entry per floor plan). _sabri_rent_rows
+# resolves, in order: numeric top-level list_price -> one row; else
+# one row PER priced unit; else a priceless row the merge drops as
+# no_price (a range endpoint is never stored as a point rent). [] is
+# missing in every Sabri spec read (min == max is the only range
+# fallback). Sabri forrent pages 1..3 like forsold, and the radius is
+# confirmed KILOMETRES (the playground's own description). The Redfin
+# capture proved the other live failure was the REQUEST: the
+# auto-complete endpoint takes query="City, ST" (the app sent a
+# "location" parameter it does not take, so every live call resolved
+# no region) and answers grouped rows — _redfin_region_id parses the
+# Places group for the row named for the property's city.
 # v44 — wider pull windows + deeper nets (the fixture-street hunt):
 # the pull form offers Last 2 years / Last 3 years / All time beside
 # Last year (the v35 view filter's exact list), and past_days plumbs
@@ -1877,12 +1898,12 @@ RAPIDAPI_SABRI_HOST = "realtor16.p.rapidapi.com"
 RAPIDAPI_SRC_REEF = "RapidAPI (ReefAPI)"
 RAPIDAPI_SRC_REDFIN = "RapidAPI (Redfin)"
 RAPIDAPI_SRC_SABRI = "RapidAPI (Realtor16)"
-# The Redfin auto-complete endpoint path was NOT captured in the
-# playground test (only its result — a regionId of the form
-# <digits>_<digits>). The path lives in this one constant so a live 404
-# is a one-line fix; the response parse is a defensive deep-search
-# (_redfin_region_id) and a wrong or missing path can only classify the
-# source "didn't serve" — it can never produce data.
+# The Redfin auto-complete endpoint is LIVE-CAPTURED (playground,
+# 2026-11-04): GET /properties/auto-complete with query="City, ST",
+# answering grouped rows ({data: [{name: "Places", rows: [...]},
+# {name: "Schools", ...}, {name: "Agents", ...}]}). _redfin_region_id
+# parses that shape; an unusable answer can only classify the source
+# "didn't serve" — it can never produce data.
 RAPIDAPI_REDFIN_AC_PATH = "/properties/auto-complete"
 # v42 union thresholds. RAPIDAPI_PAGE_STOP: the ReefAPI page walk stops
 # early once this many accumulated rows pass BOTH gates (distance +
@@ -2004,40 +2025,52 @@ def _rapi_in_horizon(rows, past_days):
 
 def _redfin_region_id(prop):
     """Resolve the property's city to a Redfin regionId via Nathan's
-    auto-complete. Returns (region_id, err). The auto-complete RESPONSE
-    SHAPE was not captured in the playground test (only its result — a
-    regionId of the form <digits>_<digits>, e.g. "6_20109" for West
-    Chicago, IL), so the parse is a defensive deep-search: walk the
-    whole document for strings of that form, scoring entries whose key
-    mentions "region" and whose sibling text names the property's city
-    above bare matches (Redfin property ids share the same form and
-    must not win). Nothing found -> (None, None): the source simply
-    didn't serve. An id is NEVER guessed or constructed, and any wrong
-    hit is backstopped by the merge's distance gate (a wrong region's
-    rows land miles from the subject and are discarded there)."""
+    auto-complete. Returns (region_id, err). LIVE-CAPTURED request and
+    response (playground, Sherif's account, 2026-11-04): the endpoint
+    takes query="City, ST" — pre-v46 the app sent a "location"
+    parameter the endpoint does not take, so every live call resolved
+    nothing (the v43–v45 pulls' "region unresolved"). The response
+    groups its rows: {data: [{name: "Places", rows: [{id: "6_18142",
+    name: "Tampa", subName: "Tampa, FL, USA", ...}]}, {name:
+    "Schools", ...}, {name: "Agents", ...}]}. The region id is a
+    Places row's id ("6_<digits>"): prefer the row whose name IS the
+    property's city (case-insensitive) — the groups also carry
+    schools, agents, and near-name places whose ids share the form
+    and must not win — else the first Places row with a well-formed
+    id. No Places group: scan every group's rows by the same
+    preference. Nothing usable -> (None, None): the source simply
+    didn't serve. An id is NEVER guessed or constructed, and any
+    wrong hit is backstopped by the merge's distance gate (a wrong
+    region's rows land miles from the subject and are discarded
+    there)."""
     data, err = _rapidapi_get(RAPIDAPI_REDFIN_HOST, RAPIDAPI_REDFIN_AC_PATH,
-                              {"location": f"{prop['city']}, {prop['state']}"})
+                              {"query": f"{prop['city']}, {prop['state']}"})
     if err is not None or data is None: return None, err
     import re as _re
     pat = _re.compile(r"^\d+_\d+$")
-    city = (prop["city"] or "").lower()
-    hits = []
-    def walk(node):
-        if isinstance(node, dict):
-            text = " ".join(v for v in node.values() if isinstance(v, str)).lower()
-            for k, v in node.items():
-                if isinstance(v, str) and pat.match(v.strip()):
-                    score = (2 if "region" in k.lower() else 0) \
-                          + (1 if city and city in text else 0)
-                    hits.append((score, v.strip()))
-                else:
-                    walk(v)
-        elif isinstance(node, list):
-            for v in node: walk(v)
-    walk(data)
-    if not hits: return None, None
-    hits.sort(key=lambda t: -t[0])
-    return hits[0][1], None
+    city = (prop["city"] or "").strip().lower()
+    groups = data.get("data") if isinstance(data, dict) else None
+    places, all_rows = None, []
+    if isinstance(groups, list):
+        for g in groups:
+            if not isinstance(g, dict): continue
+            grows = g.get("rows")
+            if not isinstance(grows, list): continue
+            all_rows.extend(grows)
+            if (g.get("name") or "") == "Places": places = grows
+    pool = places if places is not None else all_rows
+    def _rid(row):
+        v = row.get("id") if isinstance(row, dict) else None
+        return v.strip() if isinstance(v, str) and pat.match(v.strip()) else None
+    for row in pool:
+        if isinstance(row, dict) and city \
+                and (row.get("name") or "").strip().lower() == city:
+            rid = _rid(row)
+            if rid: return rid, None
+    for row in pool:
+        rid = _rid(row)
+        if rid: return rid, None
+    return None, None
 
 def _redfin_item_to_row(item):
     """One Redfin.Com Data search-sold item -> the standard HomeHarvest
@@ -2075,18 +2108,52 @@ def _redfin_item_to_row(item):
                 primary_photo=(alts[0] if alts else None), alt_photos=alts,
                 estimated_value=None, price_per_sqft=None)
 
-def _sabri_item_to_row(item, rent=False):
+def _sabri_num(v):
+    """A Sabri scalar as a number, or None. The API's null convention
+    is the EMPTY ARRAY [] (beds [], sqft [], list_price [] all mean
+    "no value" — live-captured 2026-11-04), so anything that is not a
+    finite number or a numeric string is missing: [], {}, None, junk.
+    (fnum alone would stringify a list; the isinstance screen keeps
+    containers out before it ever sees them.)"""
+    if isinstance(v, bool) or isinstance(v, (list, dict)): return None
+    if isinstance(v, (int, float)):
+        return v if math.isfinite(v) else None
+    return fnum(v)
+
+def _sabri_spec(desc, keys, min_key=None, max_key=None):
+    """One Sabri spec value (beds / baths / sqft) from a description
+    dict (an item's, or a rental unit's): the first numeric scalar
+    among keys; when every scalar is [] / missing, the min when
+    min == max (both numeric) — a range that is really a point —
+    else None. A genuine range (min != max) is NOT a point and is
+    never read as one (no guessed endpoint)."""
+    for k in keys:
+        v = _sabri_num(desc.get(k))
+        if v is not None: return v
+    if min_key and max_key:
+        lo, hi = _sabri_num(desc.get(min_key)), _sabri_num(desc.get(max_key))
+        if lo is not None and lo == hi: return lo
+    return None
+
+def _sabri_item_to_row(item, rent=False, unit=None):
     """One Sabri realtor16 item -> the standard HomeHarvest columns.
     The item is the Realtor data model (playground-verified for
     /search/forsold/coordinates 2026-11-04; year_built is read when
     present — it was not observed in the captured first item — else
     None). Sold price comes ONLY from description.sold_price, never
-    the list price. rent=True reads the /search/forrent sibling, whose
-    item shape was NOT separately captured: the rent is
-    description.list_price, normalized defensively — a row without a
-    usable list price reaches the merge with list_price=None and is
-    stored as nothing."""
+    the list price. Spec scalars pass through _sabri_spec: the API's
+    empty-array null [] is missing everywhere, with min == max as
+    the only range fallback (v46).
+    rent=True reads the /search/forrent sibling in its LIVE-CAPTURED
+    shape (2026-11-04): the description carries NO list_price — the
+    rent is the item's TOP-LEVEL list_price. With unit=<a units[]
+    entry>, the row is that unit's: rent and beds/baths/sqft from the
+    unit, address/coords/photo/permalink from the parent item (see
+    _sabri_rent_rows for the resolution order). A row without a
+    usable rent reaches the merge with list_price=None and is stored
+    as nothing."""
     desc = item.get("description") or {}
+    if not isinstance(desc, dict): desc = {}
     addr = _rapi_dig(item, "location", "address") or {}
     coord = addr.get("coordinate") or {}
     perma = _s(item.get("permalink"))
@@ -2094,20 +2161,71 @@ def _sabri_item_to_row(item, rent=False):
     elif perma: url = "https://www.realtor.com/realestateandhomes-detail/" + perma.lstrip("/")
     else: url = ""
     photo, alts = _rapi_photos(item)
+    ptype = _s(desc.get("type")) if isinstance(desc.get("type"), str) else ""
+    if rent:
+        specs = desc
+        if unit is not None:
+            specs = unit.get("description") or {}
+            if not isinstance(specs, dict): specs = {}
+            price = _sabri_num(unit.get("list_price"))
+        else:
+            price = _sabri_num(item.get("list_price"))
+        return dict(street=_s(addr.get("line")), city=_s(addr.get("city")),
+                    zip_code=_s(addr.get("postal_code")),
+                    sold_price=None, list_price=price,
+                    sqft=_sabri_spec(specs, ("sqft",), "sqft_min", "sqft_max"),
+                    beds=_sabri_spec(specs, ("beds",), "beds_min", "beds_max"),
+                    full_baths=_sabri_spec(specs, ("baths_consolidated", "baths_full", "baths"),
+                                           "baths_min", "baths_max"),
+                    year_built=_sabri_num(desc.get("year_built")),
+                    lot_sqft=_sabri_num(desc.get("lot_sqft")),
+                    last_sold_date=None,
+                    days_on_mls=_sabri_num(desc.get("days_on_market")),
+                    latitude=coord.get("lat"), longitude=coord.get("lon"),
+                    style=ptype, property_type=ptype,
+                    property_url=url, primary_photo=photo, alt_photos=alts,
+                    estimated_value=None, price_per_sqft=None)
     return dict(street=_s(addr.get("line")), city=_s(addr.get("city")),
                 zip_code=_s(addr.get("postal_code")),
-                sold_price=None if rent else desc.get("sold_price"),
-                list_price=desc.get("list_price"),
-                sqft=desc.get("sqft"), beds=desc.get("beds"),
-                full_baths=desc.get("baths_consolidated",
-                                     desc.get("baths_full", desc.get("baths"))),
-                year_built=desc.get("year_built"), lot_sqft=desc.get("lot_sqft"),
-                last_sold_date=None if rent else (_s(desc.get("sold_date"))[:10] or None),
-                days_on_mls=desc.get("days_on_market"),
+                sold_price=_sabri_num(desc.get("sold_price")),
+                list_price=_sabri_num(desc.get("list_price")),
+                sqft=_sabri_spec(desc, ("sqft",), "sqft_min", "sqft_max"),
+                beds=_sabri_spec(desc, ("beds",), "beds_min", "beds_max"),
+                full_baths=_sabri_spec(desc, ("baths_consolidated", "baths_full", "baths"),
+                                       "baths_min", "baths_max"),
+                year_built=_sabri_num(desc.get("year_built")),
+                lot_sqft=_sabri_num(desc.get("lot_sqft")),
+                last_sold_date=_s(desc.get("sold_date"))[:10] or None,
+                days_on_mls=_sabri_num(desc.get("days_on_market")),
                 latitude=coord.get("lat"), longitude=coord.get("lon"),
-                style=_s(desc.get("type")), property_type=_s(desc.get("type")),
+                style=ptype, property_type=ptype,
                 property_url=url, primary_photo=photo, alt_photos=alts,
                 estimated_value=None, price_per_sqft=None)
+
+def _sabri_rent_rows(item):
+    """One forrent item -> the normalized rent rows it yields (v46),
+    in the LIVE-CAPTURED structure's resolution order:
+      (a) a numeric top-level list_price > 0 -> the single item row
+          (specs from the item description);
+      (b) else a non-empty units[] -> ONE ROW PER UNIT carrying a
+          numeric list_price > 0 (community listings price per floor
+          plan; the parent item itself has no point rent);
+      (c) else the single item row with list_price=None — a
+          range-only item (list_price_min/max, no units, no numeric
+          list_price) reaches the merge priceless and is dropped
+          there as no_price: a range endpoint is never stored as a
+          point rent."""
+    top = _sabri_num(item.get("list_price"))
+    units = item.get("units")
+    if (top is None or top <= 0) and isinstance(units, list) and units:
+        rows = []
+        for u in units:
+            if not isinstance(u, dict): continue
+            rent = _sabri_num(u.get("list_price"))
+            if rent is None or rent <= 0: continue
+            rows.append(_sabri_item_to_row(item, rent=True, unit=u))
+        if rows: return rows
+    return [_sabri_item_to_row(item, rent=True)]
 
 def _rapi_fail_reason(err):
     """Short human reason class for one source's failure, used in the
@@ -2183,11 +2301,13 @@ def _sabri_radius(radius_mi):
     """The radius sent to Sabri's coordinate endpoints (v42). forrent
     REQUIRES radius (latitude/longitude/radius all required — the
     radius-less call was the live HTTP 400; the API's validation body
-    names the field). The parameter's UNITS are unverified (miles vs
-    km), so the value hedges both: ceil(radius_mi * 1.61) + 1 covers
-    the pull radius read as kilometers AND as miles. The merge remains
-    the real gate — an over-wide Sabri net costs rows, never accuracy."""
-    return int(math.ceil((radius_mi or 1.0) * 1.61)) + 1
+    names the field). The parameter's units are KILOMETRES — the
+    playground's own parameter description, confirmed in the
+    2026-11-04 capture round (v46 retires the v42 miles-vs-km hedge):
+    the value is the pull radius converted to km, plus 1 km of slack.
+    The merge remains the real gate — an over-wide Sabri net costs
+    rows, never accuracy."""
+    return int(math.ceil((radius_mi or 1.0) * 1.60934)) + 1
 
 def _rapi_rows(items, fn):
     """Normalize a result list item by item (v40). One malformed item —
@@ -2200,6 +2320,18 @@ def _rapi_rows(items, fn):
     for it in items or []:
         if not isinstance(it, dict): continue
         try: rows.append(fn(it))
+        except Exception: continue
+    return rows
+
+def _rapi_rows_multi(items, fn):
+    """_rapi_rows for a normalizer that returns a LIST of rows per
+    item (v46: Sabri rent — one community item expands to one row per
+    priced unit, see _sabri_rent_rows). Same per-item containment: a
+    malformed item is skipped, never fatal."""
+    rows = []
+    for it in items or []:
+        if not isinstance(it, dict): continue
+        try: rows.extend(fn(it))
         except Exception: continue
     return rows
 
@@ -2256,10 +2388,10 @@ def _src_reefapi_sold(prop, past_days, radius_mi=1.0):
 def _src_redfin_sold(prop, past_days, radius_mi=1.0):
     # v45: WHICH empty this was is part of the outcome. "No results"
     # used to cover the region never resolving (the two live pulls —
-    # the auto-complete path is a defensive constant whose response
-    # shape was never captured, so an unresolvable region is a live
-    # possibility), the search answering empty, and the search
-    # failing. Each non-serving path now leaves a distinct side-note
+    # pre-v46 the auto-complete request itself was malformed, see
+    # _redfin_region_id; an unresolvable region remains possible for
+    # places Redfin doesn't know), the search answering empty, and
+    # the search failing. Each non-serving path now leaves a distinct side-note
     # (the _rapi_note channel, taken into the outcome's LOG text by
     # _rapidapi_sold_frame; the banner keeps its clean reason).
     _rapi_take_note("redfin_sold")  # discard any stale note from a direct call
@@ -2339,13 +2471,33 @@ def _src_sabri_forsold(prop, past_days, radius_mi=1.0):
     return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_SABRI
 
 def _src_sabri_forrent(prop, past_days, radius_mi=1.0):
-    data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forrent/coordinates",
-                              {"latitude": prop["lat"], "longitude": prop["lon"],
-                               "radius": _sabri_radius(radius_mi), "page": 1})
-    if err is not None: return [], err, RAPIDAPI_SRC_SABRI
-    items = data.get("properties") if isinstance(data, dict) else None
-    rows = _rapi_rows(items if isinstance(items, list) else [],
-                      lambda it: _sabri_item_to_row(it, rent=True))
+    # v46: PAGES like forsold (1..RAPIDAPI_SABRI_PAGES of ~50): the
+    # pre-v46 single page of area rentals held nothing storable on
+    # either live pull (13 rows, 0 in-gate at West Chicago) — rentals
+    # are sparse and the page is not distance-ordered. The walk stops
+    # on a short page, on the API's reported total (counted in ITEMS:
+    # one community item expands to several rows), or once the
+    # accumulated rows reach RAPIDAPI_UNION_RICH in-gate. A page-1
+    # failure is the source's failure; a later page's failure keeps
+    # the accumulated rows. Items normalize through _sabri_rent_rows
+    # (the captured price resolution: top-level list_price, else one
+    # row per priced unit, else priceless).
+    rows, items_seen = [], 0
+    for page in range(1, RAPIDAPI_SABRI_PAGES + 1):
+        data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forrent/coordinates",
+                                  {"latitude": prop["lat"], "longitude": prop["lon"],
+                                   "radius": _sabri_radius(radius_mi), "page": page})
+        if err is not None:
+            if page == 1: return [], err, RAPIDAPI_SRC_SABRI
+            break
+        items = data.get("properties") if isinstance(data, dict) else None
+        items = items if isinstance(items, list) else []
+        items_seen += len(items)
+        rows.extend(_rapi_rows_multi(items, _sabri_rent_rows))
+        total = data.get("total") if isinstance(data, dict) else None
+        if len(items) < RAPIDAPI_SABRI_PAGE_SIZE: break
+        if isinstance(total, (int, float)) and items_seen >= total: break
+        if _rapi_count_in_gate_rent(rows, prop, radius_mi) >= RAPIDAPI_UNION_RICH: break
     return rows, None, RAPIDAPI_SRC_SABRI
 
 _RAPIDAPI_ADAPTERS = {"reefapi_sold": _src_reefapi_sold,
