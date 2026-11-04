@@ -1841,9 +1841,12 @@ def _realty_item_to_row(item):
 
 def _zillow_item_to_row(item, rent=False):
     """One Zillow propertyExtendedSearch 'props' item -> the standard
-    HomeHarvest columns. dateSold arrives as an epoch (ms) timestamp in
-    Zillow's data model; a string date is taken as-is. rent=True: the
-    price is a monthly rent (list_price only, never a sold price)."""
+    HomeHarvest columns. dateSold is datetime-typed in the API's own
+    spec (research/rapidapi-live-shapes-2026-11-04.md): an ISO string
+    is taken as-is, an epoch (ms) timestamp is converted. The spec's
+    type key is propertyType (homeType is read first for back-compat
+    with pre-spec captures). rent=True: the price is a monthly rent
+    (list_price only, never a sold price)."""
     full = _s(item.get("address"))
     parts = [p.strip() for p in full.split(",")]
     street = parts[0] if parts else full
@@ -1870,7 +1873,8 @@ def _zillow_item_to_row(item, rent=False):
                 lot_sqft=lot, last_sold_date=None if rent else sold_date,
                 days_on_mls=item.get("daysOnZillow"),
                 latitude=item.get("latitude"), longitude=item.get("longitude"),
-                style=_s(item.get("homeType")), property_type=_s(item.get("homeType")),
+                style=_s(item.get("homeType") or item.get("propertyType")),
+                property_type=_s(item.get("homeType") or item.get("propertyType")),
                 property_url=_s(item.get("detailUrl")),
                 primary_photo=_s(item.get("imgSrc")), alt_photos=[],
                 estimated_value=None, price_per_sqft=None)
@@ -1879,11 +1883,18 @@ def _realty_results(data):
     """Result items from a Realty v3 envelope: data.results (with a bare
     results / home_search.results tolerated — the provider generates its
     payload from the source and the wrapper has shifted across versions;
-    unconfirmed shapes normalize to an empty list, never a guess)."""
+    unconfirmed shapes normalize to an empty list, never a guess). v40:
+    the top-level home_search variant and a bare-list data are read too
+    (the Realtor-family wrappers seen in the wild — a candidate only
+    matches where a list actually sits, so this can never invent rows;
+    research/rapidapi-live-shapes-2026-11-04.md)."""
     if not isinstance(data, dict): return []
     for cand in (_rapi_dig(data, "data", "results"), data.get("results"),
-                 _rapi_dig(data, "data", "home_search", "results")):
+                 _rapi_dig(data, "data", "home_search", "results"),
+                 _rapi_dig(data, "home_search", "results")):
         if isinstance(cand, list): return cand
+    inner = data.get("data")
+    if isinstance(inner, list): return inner
     return []
 
 def _rapidapi_subject_pid(prop):
@@ -1893,7 +1904,10 @@ def _rapidapi_subject_pid(prop):
     data, err = _rapidapi_get(RAPIDAPI_REALTY_HOST, "/locations/v2/auto-complete",
                                {"input": prop["address"]})
     if not isinstance(data, dict): return None, err
-    for ent in data.get("autocomplete") or []:
+    ents = data.get("autocomplete")
+    if not isinstance(ents, list):
+        ents = _rapi_dig(data, "data", "autocomplete")  # v40: data-wrapped variant
+    for ent in ents or []:
         if not isinstance(ent, dict): continue
         pid = ent.get("property_id") or ent.get("mpr_id") or ent.get("_id")
         if pid: return pid, None
@@ -1911,6 +1925,20 @@ def _rapi_fail_reason(err):
     if _is_unreachable_err(err): return "unreachable"
     return "error"
 
+def _rapi_rows(items, fn):
+    """Normalize a result list item by item (v40). One malformed item —
+    a non-dict entry, a description of the wrong type, any shape the
+    normalizer chokes on — is SKIPPED, never fatal: per the pool
+    contract a broken shape degrades a source, it does not zero a
+    frame that also carries good rows, and it never raises into the
+    rotation (research/rapidapi-live-shapes-2026-11-04.md §6)."""
+    rows = []
+    for it in items or []:
+        if not isinstance(it, dict): continue
+        try: rows.append(fn(it))
+        except Exception: continue
+    return rows
+
 # --- the failover pool (Sherif 2026-11-04: subscribe to all the useful
 # free APIs and SWITCH automatically when one hits its quota or fails).
 # RapidAPI quotas are PER-API, so moving down the list moves to a fresh
@@ -1925,7 +1953,7 @@ def _src_realty_similar(prop, past_days):
     data, err = _rapidapi_get(RAPIDAPI_REALTY_HOST, "/properties/v3/list-similar-homes",
                               {"property_id": pid, "status": "sold", "limit": 200})
     if err is not None: return [], err, RAPIDAPI_SRC_REALTY
-    return [_realty_item_to_row(it) for it in _realty_results(data)], None, RAPIDAPI_SRC_REALTY
+    return _rapi_rows(_realty_results(data), _realty_item_to_row), None, RAPIDAPI_SRC_REALTY
 
 def _src_realty_list_sold(prop, past_days):
     since = (datetime.date.today() - datetime.timedelta(days=max(past_days, 1095))).isoformat()
@@ -1935,26 +1963,27 @@ def _src_realty_list_sold(prop, past_days):
             "sort": {"direction": "desc", "field": "sold_date"}}
     data, err = _rapidapi_post(RAPIDAPI_REALTY_HOST, "/properties/v3/list", body)
     if err is not None: return [], err, RAPIDAPI_SRC_REALTY
-    return [_realty_item_to_row(it) for it in _realty_results(data)], None, RAPIDAPI_SRC_REALTY
+    return _rapi_rows(_realty_results(data), _realty_item_to_row), None, RAPIDAPI_SRC_REALTY
 
 def _src_zillow_sold(prop, past_days):
     data, err = _rapidapi_get(RAPIDAPI_ZILLOW_HOST, "/propertyExtendedSearch",
                               {"location": prop["zip"], "status_type": "RecentlySold"})
     if err is not None: return [], err, RAPIDAPI_SRC_ZILLOW
-    return [_zillow_item_to_row(it) for it in ((data or {}).get("props") or [])], None, RAPIDAPI_SRC_ZILLOW
+    return _rapi_rows((data or {}).get("props"), _zillow_item_to_row), None, RAPIDAPI_SRC_ZILLOW
 
 def _src_realty_list_rent(prop, past_days):
     body = {"limit": 200, "offset": 0, "status": ["for_rent"],
             "search_location": {"location": f"{prop['zip']}, {prop['city']}, {prop['state']}"}}
     data, err = _rapidapi_post(RAPIDAPI_REALTY_HOST, "/properties/v3/list", body)
     if err is not None: return [], err, RAPIDAPI_SRC_REALTY
-    return [_realty_item_to_row(it) for it in _realty_results(data)], None, RAPIDAPI_SRC_REALTY
+    return _rapi_rows(_realty_results(data), _realty_item_to_row), None, RAPIDAPI_SRC_REALTY
 
 def _src_zillow_rent(prop, past_days):
     data, err = _rapidapi_get(RAPIDAPI_ZILLOW_HOST, "/propertyExtendedSearch",
                               {"location": prop["zip"], "status_type": "ForRent"})
     if err is not None: return [], err, RAPIDAPI_SRC_ZILLOW
-    return [_zillow_item_to_row(it, rent=True) for it in ((data or {}).get("props") or [])], None, RAPIDAPI_SRC_ZILLOW
+    return _rapi_rows((data or {}).get("props"),
+                      lambda it: _zillow_item_to_row(it, rent=True)), None, RAPIDAPI_SRC_ZILLOW
 
 _RAPIDAPI_ADAPTERS = {"realty_similar": _src_realty_similar,
                       "realty_list_sold": _src_realty_list_sold,
@@ -1976,7 +2005,17 @@ def _rapidapi_rotate(order, prop, past_days):
     can surface the switch: a failover is never hidden."""
     tried, last_err = [], None
     for key in order:
-        rows, err, label = _RAPIDAPI_ADAPTERS[key](prop, past_days)
+        try:
+            rows, err, label = _RAPIDAPI_ADAPTERS[key](prop, past_days)
+        except Exception as e:
+            # Adapter contract (prep section 5): ANY failure — including
+            # an exception raised while normalizing an unexpected
+            # response shape — is just "didn't serve" with a reason. It
+            # must never escape the rotation and mask the sources behind
+            # it (v40; pre-fix, a normalizer AttributeError aborted the
+            # whole pull before HomeHarvest even ran — rapidapi-live-
+            # shapes-2026-11-04.md section 6).
+            rows, err, label = [], e, None
         if rows: return rows, None, label, tried
         if err is not None: last_err = err
         tried.append((_RAPIDAPI_SOURCE_NAMES[key], _rapi_fail_reason(err)))
@@ -2037,9 +2076,21 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     # byte-identical to the pre-RapidAPI behavior. ---
     rapi_sold_df, rapi_sold_src, rapi_tried = None, None, []
     if _rapidapi_key():
-        rapi_sold_df, _rapi_err, rapi_sold_src, rapi_tried = _rapidapi_sold_frame(prop, past_days)
+        try:
+            rapi_sold_df, _rapi_err, rapi_sold_src, rapi_tried = _rapidapi_sold_frame(prop, past_days)
+        except Exception as _rapi_boom:
+            # Last-resort guard (v40): the RapidAPI layer must never
+            # abort a pull the HomeHarvest frames could still serve.
+            rapi_sold_df, _rapi_err, rapi_sold_src, rapi_tried = None, _rapi_boom, None, []
+            app.logger.warning(f"comp pull: RapidAPI sold frame raised for {addr_line}: {_rapi_boom!r}")
         if rapi_sold_df is None and _rapi_err is not None:
             app.logger.warning(f"comp pull: RapidAPI sold frame failed for {addr_line}: {_rapi_err!r}")
+        if rapi_sold_df is None and rapi_tried:
+            # v40: name EVERY source's classified reason server-side.
+            # The PA incident logged only the pool's last error (a
+            # Zillow 404), which hid what the Realty sources did.
+            app.logger.warning(f"comp pull: RapidAPI sold pool detail for {addr_line}: "
+                               + "; ".join(f"{n} — {r}" for n, r in rapi_tried))
     # --- sold frames: centered (3-yr horizon) UNION ZIP area (requested window) ---
     sold_frames = []
     frame_sources = {}
@@ -2081,13 +2132,21 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     # --- rentals: centered UNION ZIP (LTR / Co-Living / Affordable views read this set) ---
     n_rent = 0; rent_frames = []; rent_sources = {}
     if _rapidapi_key():
-        _rdf, _rerr, _rsrc, _rtried = _rapidapi_rent_frame(prop)
+        try:
+            _rdf, _rerr, _rsrc, _rtried = _rapidapi_rent_frame(prop)
+        except Exception as _rboom:
+            # Same v40 last-resort guard as the sold frame.
+            _rdf, _rerr, _rsrc, _rtried = None, _rboom, None, []
+            app.logger.warning(f"rent pull: RapidAPI rent frame raised for {addr_line}: {_rboom!r}")
         if _rdf is not None:
             rent_frames.append(_rdf); rent_sources[id(_rdf)] = _rsrc
             _rnote = _rapi_switch_note("rental", _rtried, _rsrc)
             if _rnote: warnings.append(_rnote)
         elif _rerr is not None:
             app.logger.warning(f"rent pull: RapidAPI rent frame failed for {addr_line}: {_rerr!r}")
+        if _rdf is None and _rtried:
+            app.logger.warning(f"rent pull: RapidAPI rent pool detail for {addr_line}: "
+                               + "; ".join(f"{n} — {r}" for n, r in _rtried))
     rc, _ = _scrape(location=addr_line, listing_type="for_rent", past_days=90, radius=radius_mi)
     if rc is not None: rent_frames.append(rc)
     ra, err_r = _scrape(location=prop["zip"], listing_type="for_rent", past_days=90)
