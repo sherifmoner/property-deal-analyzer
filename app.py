@@ -1507,7 +1507,83 @@ def _find_existing_comp(d, pid, kind, addr, price):
         if _norm_addr(r["address"]) == want: return r["id"]
     return None
 
-def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touched=None):
+def _row_gate(row, prop, radius_mi, price_key, horizon_cutoff=None):
+    """The shared row-acceptance core (v43): coordinates present and
+    numeric, distance from the subject within the radius, a street
+    address, and a usable price read from price_key ("sold_price" for
+    sold rows, "list_price" for rents). _sold_row_gate /
+    _rent_row_gate are the two specializations; each is called by
+    BOTH its merge (the store decision) and the pool's in-gate
+    counter for that kind, so counter and merge can never diverge
+    again within a kind."""
+    lat, lon = row.get("latitude"), row.get("longitude")
+    if lat is None or lon is None: return False, "no_coords", None
+    try: flat, flon = float(lat), float(lon)
+    except (TypeError, ValueError): return False, "no_coords", None
+    if math.isnan(flat) or math.isnan(flon): return False, "no_coords", None
+    dist = haversine_mi(prop["lat"], prop["lon"], flat, flon)
+    if dist is None: return False, "no_coords", None
+    if dist > radius_mi: return False, "outside_radius", dist
+    if not _s(row.get("street")).strip(): return False, "no_street", dist
+    if not _nn(row.get(price_key)): return False, "no_price", dist
+    if horizon_cutoff:
+        _dt = _s(row.get("last_sold_date"))[:10]
+        if _dt and _dt < horizon_cutoff: return False, "outside_window", dist
+    return True, None, dist
+
+def _sold_row_gate(row, prop, radius_mi, horizon_cutoff=None):
+    """THE sold-row acceptance test (v43) — ONE implementation, called
+    by BOTH the sold merge (its store decision) and the RapidAPI pool's
+    in-gate counter (pagination early-stop + union top-up sequencing),
+    so the two can never diverge again. The v42 live failure: the
+    counter tested coordinates + distance only, while the merge ALSO
+    required a street address and a usable sold price. On the live
+    West Chicago payload all 45 rows the counter called in-gate failed
+    the merge's price test — ReefAPI's sold search returns records
+    with no last_sold_price (not-recently-sold / listing-type records;
+    the normalizer rightly never substitutes the list price) — so the
+    pull stored 0, and the inflated count (45 >= the "rich"
+    threshold) suppressed the Redfin/Sabri top-up whose rows do carry
+    sold prices. Returns (ok, reason, dist); reason is one of
+    no_coords / outside_radius / no_street / no_price /
+    outside_window when not ok, else None.
+    horizon_cutoff (ISO date) is OPTIONAL and neither caller passes
+    one today: the merge stores a set deliberately deeper than any
+    single view window (the views window it), and the pool adapters
+    pre-filter by their own horizon before counting. The rule lives
+    here so any future caller applies the SAME test instead of
+    growing a third variant. Dedupe is NOT part of this test: it is
+    merge-side bookkeeping — a duplicate updates the stored row in
+    place and counts as accepted (the merge's usable count has always
+    included duplicates). One deliberate tightening vs the pre-v43
+    merge: a NaN longitude used to slip past its distance check and
+    store a NaN distance; unplottable coordinates are no_coords here,
+    like a NaN latitude always was."""
+    return _row_gate(row, prop, radius_mi, "sold_price", horizon_cutoff)
+
+def _rent_row_gate(row, prop, radius_mi):
+    """THE rent-row acceptance test (v43): the _row_gate specialization
+    for rental rows (price read from list_price), called by BOTH the
+    rent merge (its store decision) and the pool's rent in-gate
+    counter — the rent outcome previously borrowed the SOLD counter,
+    which reads sold_price and so counted every (priceless-in-sold-
+    terms) rent row 0 in-gate once the sold gate became strict."""
+    return _row_gate(row, prop, radius_mi, "list_price")
+
+def _drop_note(drops, reason, row):
+    """Record one non-stored row in a merge drop collector (v43):
+    drops[reason] = [count, [up to 2 example addresses]]. The example
+    is the row's street when it has one, else its city/ZIP in
+    parentheses (a no-street row has no address to show)."""
+    slot = drops.setdefault(reason, [0, []])
+    slot[0] += 1
+    if len(slot[1]) < 2:
+        ex = _s(row.get("street")).strip()
+        if not ex:
+            ex = f"({_s(row.get('city'))} {_s(row.get('zip_code'))})".strip() or "(no address)"
+        slot[1].append(ex)
+
+def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touched=None, drops=None):
     """Merge one HomeHarvest sold frame into the comps table. Returns
     (added, updated, usable). v3.4: DISTANCE from the subject governs
     inclusion — the ZIP-equality post-filter is gone (a capped whole-ZIP
@@ -1519,18 +1595,23 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
     touched (v42, optional): a list the merge appends (comp_id,
     stored_label) to for every row it stores, in merge order — the
     caller (pull_comps) uses it to attribute stored rows to sources for
-    the truthful banner. Default None = no tracking, behavior unchanged."""
+    the truthful banner. Default None = no tracking, behavior unchanged.
+    drops (v43, optional): a drop collector dict (see _drop_note) the
+    merge fills with the reason every non-stored row was rejected, as
+    decided by the SHARED acceptance test _sold_row_gate — pull_comps
+    passes one for RapidAPI frames and logs the per-reason counts, so
+    a served-but-not-stored pull names the exact filter that ate the
+    rows. Default None = no accounting, behavior unchanged."""
     added = updated = n = 0
     if df is None: return added, updated, n
     for _, r in df.iterrows():
-        lat, lon = r.get("latitude"), r.get("longitude")
-        if lat is None or lon is None or (isinstance(lat, float) and math.isnan(lat)): continue
-        dist = haversine_mi(prop["lat"], prop["lon"], float(lat), float(lon))
-        if dist is None or dist > radius_mi: continue
+        ok, reason, dist = _sold_row_gate(r, prop, radius_mi)
+        if not ok:
+            if drops is not None: _drop_note(drops, reason, r)
+            continue
+        lat, lon = float(r.get("latitude")), float(r.get("longitude"))
         addr = _s(r.get("street")).strip()
-        if not addr: continue
         price = _nn(r.get("sold_price")); sqft = _nn(r.get("sqft"))
-        if not price: continue  # a "sold" row with no price is not a usable comp
         n += 1
         vals = dict(kind="sold", address=addr, city=_s(r.get("city")) or prop["city"],
                     zip=_s(r.get("zip_code")), price=price,
@@ -1551,6 +1632,7 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
         if ex:
             d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex)); updated += 1
             if touched is not None: touched.append((ex, vals["source"]))
+            if drops is not None: _drop_note(drops, "duplicate", r)
         else:
             _cur = d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
             if touched is not None: touched.append((_cur.lastrowid, vals["source"]))
@@ -1563,12 +1645,13 @@ def _merge_rent_frame(d, prop, df, radius_mi, subj, source_override=None):
     added = n = 0
     if df is None: return added, n
     for _, r in df.iterrows():
-        lat, lon = r.get("latitude"), r.get("longitude")
-        if lat is None or lon is None or (isinstance(lat, float) and math.isnan(lat)): continue
-        dist = haversine_mi(prop["lat"], prop["lon"], float(lat), float(lon))
-        if dist is None or dist > radius_mi: continue
+        # v43: the store decision is the SHARED rent acceptance test
+        # (_rent_row_gate) — the same test the pool's rent in-gate
+        # counter uses, so the two cannot diverge (see _sold_row_gate).
+        ok, _reason, dist = _rent_row_gate(r, prop, radius_mi)
+        if not ok: continue
+        lat, lon = float(r.get("latitude")), float(r.get("longitude"))
         addr = _s(r.get("street")).strip(); price = _nn(r.get("list_price"))
-        if not addr or not price: continue
         sqft = _nn(r.get("sqft"))
         vals = dict(kind="rent", address=addr, city=_s(r.get("city")) or prop["city"],
                     zip=_s(r.get("zip_code")), price=price,
@@ -2036,20 +2119,16 @@ def _rapi_fail_detail(err):
     return f"{reason}: {snip}" if snip else reason
 
 def _rapi_count_in_gate(rows, prop, radius_mi):
-    """How many normalized rows pass the DISTANCE gate (haversine vs
-    the property's coordinates <= radius_mi). Rows reach this helper
-    already date-horizon-filtered by their adapter (_rapi_in_horizon),
-    so distance + horizon — the merge's own two gates minus price —
-    is the full test the union sequencing paginates/tops up on. Rows
-    without usable coordinates never count."""
-    n = 0
-    for r in rows or []:
-        lat, lon = r.get("latitude"), r.get("longitude")
-        if lat is None or lon is None: continue
-        try: dist = haversine_mi(prop["lat"], prop["lon"], float(lat), float(lon))
-        except Exception: continue
-        if dist is not None and dist <= radius_mi: n += 1
-    return n
+    """How many normalized rows the sold MERGE would accept (store
+    new, or update in place as a duplicate) — the SHARED acceptance
+    test _sold_row_gate over the adapter's horizon-filtered rows
+    (v43). The union sequencing paginates and tops up on this count,
+    so it must mean "storable", not merely "nearby": pre-v43 it
+    tested coordinates + distance only, counted rows the merge then
+    dropped for having no sold price or no street, and a rich-looking
+    count suppressed the top-up sources (the live 45-in-gate /
+    0-stored pull — see _sold_row_gate)."""
+    return sum(1 for r in rows or [] if _sold_row_gate(r, prop, radius_mi)[0])
 
 def _sabri_radius(radius_mi):
     """The radius sent to Sabri's coordinate endpoints (v42). forrent
@@ -2134,8 +2213,12 @@ def _src_redfin_sold(prop, past_days, radius_mi=1.0):
     return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_REDFIN
 
 def _src_sabri_forsold(prop, past_days, radius_mi=1.0):
+    # Parameter names are the API's OWN (v43): its field list spells
+    # latitude/longitude in full, and its live 400 validation body
+    # keys the complaint "latitude" — the app sent lat/lon, which the
+    # validator does not recognize as the required field.
     data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forsold/coordinates",
-                              {"lat": prop["lat"], "lon": prop["lon"],
+                              {"latitude": prop["lat"], "longitude": prop["lon"],
                                "radius": _sabri_radius(radius_mi), "page": 1})
     if err is not None: return [], err, RAPIDAPI_SRC_SABRI
     items = data.get("properties") if isinstance(data, dict) else None
@@ -2144,7 +2227,7 @@ def _src_sabri_forsold(prop, past_days, radius_mi=1.0):
 
 def _src_sabri_forrent(prop, past_days, radius_mi=1.0):
     data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forrent/coordinates",
-                              {"lat": prop["lat"], "lon": prop["lon"],
+                              {"latitude": prop["lat"], "longitude": prop["lon"],
                                "radius": _sabri_radius(radius_mi), "page": 1})
     if err is not None: return [], err, RAPIDAPI_SRC_SABRI
     items = data.get("properties") if isinstance(data, dict) else None
@@ -2175,15 +2258,25 @@ def _rapi_call_source(key, prop, past_days, radius_mi):
     except Exception as e:
         return [], e, None
 
-def _rapi_outcome(key, rows, err, label, prop, radius_mi):
+def _rapi_count_in_gate_rent(rows, prop, radius_mi):
+    """The rent twin of _rapi_count_in_gate (v43): rows the RENT merge
+    would accept, per the shared _rent_row_gate (price = list_price).
+    Rent outcomes counted with the sold test read sold_price and so
+    reported every rent row as 0 in-gate once that gate became the
+    full acceptance test."""
+    return sum(1 for r in rows or [] if _rent_row_gate(r, prop, radius_mi)[0])
+
+def _rapi_outcome(key, rows, err, label, prop, radius_mi, rent=False):
     """The outcome record for one CALLED source (v42): what it did,
     in numbers. 'log' is the pool-detail text (classified reason + the
     sanitized error-body snippet on failure); 'reason' is the clean
-    banner form. In-gate counts use the same distance test the union
-    sequencing runs on, over the adapter's horizon-filtered rows."""
+    banner form. In-gate counts use the shared acceptance test for
+    the frame's kind (sold: _rapi_count_in_gate; rent:
+    _rapi_count_in_gate_rent — v43) over the adapter's served rows."""
     name = _RAPIDAPI_SOURCE_NAMES[key]
     if rows:
-        in_gate = _rapi_count_in_gate(rows, prop, radius_mi)
+        in_gate = (_rapi_count_in_gate_rent(rows, prop, radius_mi) if rent
+                   else _rapi_count_in_gate(rows, prop, radius_mi))
         return {"name": name, "label": label, "served": True,
                 "rows": len(rows), "in_gate": in_gate, "reason": None,
                 "log": f"{name} — served {len(rows)} rows, {in_gate} in-gate"}
@@ -2224,7 +2317,7 @@ def _rapidapi_rent_frame(prop, radius_mi=1.0):
     outcomes, last_err = [], None
     for key in RAPIDAPI_RENT_SOURCES:
         rows, err, label = _rapi_call_source(key, prop, 365, radius_mi)
-        outcomes.append(_rapi_outcome(key, rows, err, label, prop, radius_mi))
+        outcomes.append(_rapi_outcome(key, rows, err, label, prop, radius_mi, rent=True))
         if rows: return _hh_frame(rows), None, label, outcomes
         if err is not None: last_err = err
     return None, last_err, None, outcomes
@@ -2314,11 +2407,39 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             warnings.append("ZIP-area sold frame failed — results came from the address-centered frame")
     added = updated = n_sold = 0
     sold_touched = []
+    # v43: drop accounting for the RapidAPI frames ONLY — one collector
+    # across all their merges, logged below next to the pool detail,
+    # so a served-but-not-stored pull names the exact filter (with
+    # counts and example addresses) instead of a bare zero.
+    rapi_drops = {}
+    rapi_served = rapi_added = rapi_updated = 0
     for fr in sold_frames:
+        _is_rapi = id(fr) in frame_sources
         a1, u1, n1 = _merge_sold_frame(d, prop, fr, radius_mi, subj,
                                        source_override=frame_sources.get(id(fr)),
-                                       touched=sold_touched)
+                                       touched=sold_touched,
+                                       drops=rapi_drops if _is_rapi else None)
         added += a1; updated += u1; n_sold += n1
+        if _is_rapi:
+            rapi_served += len(fr); rapi_added += a1; rapi_updated += u1
+    if rapi_frames:
+        # outside_window cannot appear here: the horizon lives in the
+        # adapters (their served counts are already post-horizon) and
+        # the merge deliberately stores deeper than the view window.
+        _parts = []
+        for _rsn in ("no_coords", "no_street", "no_price", "outside_radius",
+                     "outside_window", "other"):
+            _slot = rapi_drops.get(_rsn)
+            if _slot and _slot[0]:
+                _ex = "; ".join(_slot[1])
+                _parts.append(f"{_rsn}={_slot[0]}" + (f" ({_ex})" if _ex else ""))
+        _dup = rapi_drops.get("duplicate")
+        app.logger.warning(
+            f"comp pull: RapidAPI sold merge detail for {addr_line}: "
+            f"served {rapi_served} rows -> {rapi_added} stored new"
+            + (f" + {rapi_updated} duplicate updates" if rapi_updated else "")
+            + (f" ({'; '.join(_dup[1])})" if _dup and _dup[1] else "")
+            + f"; drops: {', '.join(_parts) if _parts else 'none'}")
     if rapi_outcomes:
         # v42 TRUTHFUL BANNER. The v41 line named the serving source
         # even when the merge stored ZERO of its rows (the live pull's
@@ -2345,8 +2466,22 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         if _stored_labels:
             warnings.append("sold comps include results from " + ", ".join(_stored_labels))
         elif _served_labels:
-            warnings.append(f"RapidAPI answered but no results within {radius_mi:g} mi / "
-                            "the date window could be stored")
+            _msg = (f"RapidAPI answered but no results within {radius_mi:g} mi / "
+                    "the date window could be stored")
+            # v43: when one merge filter ate most of the served rows,
+            # the banner says which — in plain words, from the drop
+            # accounting above (the v42 live pull's zero carried no
+            # hint that every in-range row lacked a sold price).
+            _drop_counts = {k: v[0] for k, v in rapi_drops.items() if k != "duplicate"}
+            _drop_total = sum(_drop_counts.values())
+            if _drop_total:
+                _dom_rsn, _dom_n = max(_drop_counts.items(), key=lambda t: t[1])
+                if _dom_n * 2 >= _drop_total:
+                    _phrase = {"no_price": "most of the rows it returned had no sold price recorded",
+                               "no_street": "most of the rows it returned had no street address",
+                               "no_coords": "most of the rows it returned had no coordinates"}.get(_dom_rsn)
+                    if _phrase: _msg += " — " + _phrase
+            warnings.append(_msg)
     # --- rentals: centered UNION ZIP (LTR / Co-Living / Affordable views read this set) ---
     n_rent = 0; rent_frames = []; rent_sources = {}
     if _rapidapi_key():
