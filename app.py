@@ -1507,7 +1507,7 @@ def _find_existing_comp(d, pid, kind, addr, price):
         if _norm_addr(r["address"]) == want: return r["id"]
     return None
 
-def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None):
+def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touched=None):
     """Merge one HomeHarvest sold frame into the comps table. Returns
     (added, updated, usable). v3.4: DISTANCE from the subject governs
     inclusion — the ZIP-equality post-filter is gone (a capped whole-ZIP
@@ -1515,7 +1515,11 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None):
     across ZIP lines, Sherif 2026-11-04). Insert-only: an existing
     (normalized address, price) row updates in place, never duplicates.
     source_override (RapidAPI frames): the honest transport label for the
-    whole frame; default None keeps the per-row URL-derived label."""
+    whole frame; default None keeps the per-row URL-derived label.
+    touched (v42, optional): a list the merge appends (comp_id,
+    stored_label) to for every row it stores, in merge order — the
+    caller (pull_comps) uses it to attribute stored rows to sources for
+    the truthful banner. Default None = no tracking, behavior unchanged."""
     added = updated = n = 0
     if df is None: return added, updated, n
     for _, r in df.iterrows():
@@ -1546,8 +1550,10 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None):
         cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
         if ex:
             d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex)); updated += 1
+            if touched is not None: touched.append((ex, vals["source"]))
         else:
-            d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
+            _cur = d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
+            if touched is not None: touched.append((_cur.lastrowid, vals["source"]))
     return added, updated, n
 
 def _merge_rent_frame(d, prop, df, radius_mi, subj, source_override=None):
@@ -1719,7 +1725,7 @@ def _is_unreachable_err(e):
     low = str(e).lower()
     return any(k in low for k in _CONN_ERR_MARKERS)
 
-# ---------------------------------------------------------------- RapidAPI frames (v3.8; pool rebuilt v41)
+# ---------------------------------------------------------------- RapidAPI frames (v3.8; pool v41, union v42)
 # A second frame source for hosts whose egress cannot reach the listing
 # sites directly (PythonAnywhere free tier blocks realtor.com, but
 # p.rapidapi.com IS whitelisted — hosting-options-2026-11-04).
@@ -1734,18 +1740,29 @@ def _is_unreachable_err(e):
 #     GET  <auto-complete>    city/state -> regionId ("6_20109" verified)
 #     GET  /properties/search-sold?regionId&limit&soldWithin=365 -> data[]
 #   "Realtor" by Sabri (Basic free 30 req/mo — LAST, the quota is precious):
-#     GET  /search/forsold/coordinates?lat&lon   -> properties[]
-#     GET  /search/forrent/coordinates?lat&lon   -> properties[] (rent pool)
+#     GET  /search/forsold/coordinates?lat&lon&radius&page -> properties[]
+#     GET  /search/forrent/coordinates?lat&lon&radius&page -> properties[]
 # Responses are normalized into the standard HomeHarvest columns and fed
 # through the SAME merge (distance gate, dedupe, match tiers) — no merge,
-# tiering, or UI changes. The sources form an ordered FAILOVER POOL (see
-# _rapidapi_rotate below): the first source that returns rows serves,
-# and a switch is always surfaced in the pull's warnings. Call budget: a
-# healthy pull costs ONE sold call (ReefAPI); a full failover walk costs
-# at most 4 (ReefAPI + auto-complete + search-sold + Sabri). Results
-# persist in the comps table, so the pool is only walked on a fresh
-# pull. With NO key configured, nothing in this section ever runs and
-# the pull is the pre-RapidAPI one.
+# tiering, or UI changes.
+# v42 — the pool is a sequential UNION WITH TOP-UP, not first-serve-wins.
+# The v41 PA pull stored 0 comps while ReefAPI "served": its single
+# city-wide page (100 newest of 3,535) held nothing inside the pull's
+# 1-mile gate, and rotation never asked anyone else. Probes after that
+# pull (playground, 2026-11-04) proved ReefAPI takes a ZIP location and
+# paginates, and that Sabri's forrent REQUIRES a radius (its absence was
+# the live HTTP 400). So now: ReefAPI is queried by ZIP and PAGINATES
+# (pages of 100, early stop at RAPIDAPI_PAGE_STOP in-gate rows); if the
+# accumulated in-gate count is still under RAPIDAPI_UNION_RICH, Redfin
+# unions in, and if it is STILL under, Sabri tops up. Every called
+# source leaves an outcome record (served N rows / M in-gate, or the
+# classified failure + a sanitized error-body snippet) that is ALWAYS
+# written to the server log as the pool detail, and the pull's banner
+# names only sources whose rows the merge actually STORED. Call budget
+# per pull: ReefAPI <= 5 pages + Redfin 2 + Sabri 1 sold, Sabri 1 rent.
+# Results persist in the comps table, so the pool is only walked on a
+# fresh pull. With NO key configured, nothing in this section ever runs
+# and the pull is the pre-RapidAPI one.
 RAPIDAPI_REEF_HOST = "realtor-com-property-data-api.p.rapidapi.com"
 RAPIDAPI_REDFIN_HOST = "redfin-com-data.p.rapidapi.com"
 RAPIDAPI_SABRI_HOST = "realtor16.p.rapidapi.com"
@@ -1759,6 +1776,13 @@ RAPIDAPI_SRC_SABRI = "RapidAPI (Realtor16)"
 # (_redfin_region_id) and a wrong or missing path can only classify the
 # source "didn't serve" — it can never produce data.
 RAPIDAPI_REDFIN_AC_PATH = "/properties/auto-complete"
+# v42 union thresholds. RAPIDAPI_PAGE_STOP: the ReefAPI page walk stops
+# early once this many accumulated rows pass BOTH gates (distance +
+# date horizon). RAPIDAPI_UNION_RICH: once the union's in-gate count
+# reaches this, no further source is called (top-up stops).
+RAPIDAPI_PAGE_STOP = 30
+RAPIDAPI_UNION_RICH = 25
+RAPIDAPI_REEF_PAGES = 5
 
 def _rapidapi_key():
     """RapidAPI key: env RAPIDAPI_API_KEY first, then the rapidapi_key
@@ -1982,6 +2006,61 @@ def _rapi_fail_reason(err):
     if _is_unreachable_err(err): return "unreachable"
     return "error"
 
+def _rapi_err_snippet(err):
+    """A sanitized snippet of an HTTP error's RESPONSE BODY (v42): the
+    first 200 chars, whitespace-collapsed. The v41 live pull's Sabri
+    rent 400 was mute — the API's own body said exactly what was wrong
+    ({"error": "Invalid query parameters", "fields": {"radius": ...}})
+    and only the status reached the log. This reads the body off the
+    error's response object ONLY: never request headers, never the key,
+    never a URL. '' when the error carries no readable body."""
+    resp = getattr(err, "response", None)
+    if resp is None: return ""
+    text = getattr(resp, "text", None)
+    if not text:
+        try:
+            payload = resp.json()
+            text = json.dumps(payload) if payload is not None else ""
+        except Exception:
+            text = ""
+    if not text: return ""
+    return " ".join(str(text).split())[:200]
+
+def _rapi_fail_detail(err):
+    """The LOG form of a failure: the classified reason plus the error
+    body snippet when one exists (e.g. 'HTTP 400: {"error": ...}').
+    The banner keeps the clean reason (_rapi_fail_reason); bodies are
+    diagnostics and belong server-side."""
+    reason = _rapi_fail_reason(err)
+    snip = _rapi_err_snippet(err)
+    return f"{reason}: {snip}" if snip else reason
+
+def _rapi_count_in_gate(rows, prop, radius_mi):
+    """How many normalized rows pass the DISTANCE gate (haversine vs
+    the property's coordinates <= radius_mi). Rows reach this helper
+    already date-horizon-filtered by their adapter (_rapi_in_horizon),
+    so distance + horizon — the merge's own two gates minus price —
+    is the full test the union sequencing paginates/tops up on. Rows
+    without usable coordinates never count."""
+    n = 0
+    for r in rows or []:
+        lat, lon = r.get("latitude"), r.get("longitude")
+        if lat is None or lon is None: continue
+        try: dist = haversine_mi(prop["lat"], prop["lon"], float(lat), float(lon))
+        except Exception: continue
+        if dist is not None and dist <= radius_mi: n += 1
+    return n
+
+def _sabri_radius(radius_mi):
+    """The radius sent to Sabri's coordinate endpoints (v42). forrent
+    REQUIRES radius (latitude/longitude/radius all required — the
+    radius-less call was the live HTTP 400; the API's validation body
+    names the field). The parameter's UNITS are unverified (miles vs
+    km), so the value hedges both: ceil(radius_mi * 1.61) + 1 covers
+    the pull radius read as kilometers AND as miles. The merge remains
+    the real gate — an over-wide Sabri net costs rows, never accuracy."""
+    return int(math.ceil((radius_mi or 1.0) * 1.61)) + 1
+
 def _rapi_rows(items, fn):
     """Normalize a result list item by item (v40). One malformed item —
     a non-dict entry, a description of the wrong type, any shape the
@@ -1996,26 +2075,54 @@ def _rapi_rows(items, fn):
         except Exception: continue
     return rows
 
-# --- the failover pool (Sherif 2026-11-04: subscribe to all the useful
-# free APIs and SWITCH automatically when one hits its quota or fails).
+# --- the pool (Sherif 2026-11-04: subscribe to all the useful free
+# APIs and SWITCH automatically when one hits its quota or fails).
 # RapidAPI quotas are PER-API, so moving down the list moves to a fresh
 # monthly quota behind the SAME account key. Adapter contract:
-# fn(prop, past_days) -> (rows, err, source_label); rows empty means
-# "this source didn't serve" (quota / unreachable / empty / broken
-# response are all just reasons to move on). v41 pool — every member
-# playground-verified from Sherif's account 2026-11-04, in quota order:
-# ReefAPI first (100/mo, ONE call, coordinates on every row), Redfin
+# fn(prop, past_days, radius_mi) -> (rows, err, source_label); rows
+# empty means "this source didn't serve" (quota / unreachable / empty /
+# broken response are all just reasons to move on). v41 pool — every
+# member playground-verified from Sherif's account 2026-11-04, in quota
+# order: ReefAPI first (100/mo, coordinates on every row), Redfin
 # second (100/mo, two calls), Sabri LAST (30/mo — precious; one call).
-def _src_reefapi_sold(prop, past_days):
-    body = {"location": f"{prop['city']}, {prop['state']}", "sort": "newest",
-            "limit": 100, "offset": 0}
-    data, err = _rapidapi_post(RAPIDAPI_REEF_HOST, "/realtor/v1/sold", body)
-    if err is not None: return [], err, RAPIDAPI_SRC_REEF
-    items = _rapi_dig(data, "data", "results")
-    rows = _rapi_rows(items if isinstance(items, list) else [], _reef_item_to_row)
-    return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_REEF
+# v42: the sold side is a sequential UNION WITH TOP-UP over this order
+# (see _rapidapi_sold_frame) — a source is only skipped when the union
+# is already rich, and a failure never blocks the sources behind it.
+def _src_reefapi_sold(prop, past_days, radius_mi=1.0):
+    """ReefAPI sold, queried by ZIP and PAGINATED (v42). The v41 form —
+    one page of the 100 newest sales in the whole CITY — held nothing
+    inside a 1-mile gate on the live pull: ZIP narrows the net
+    (playground: meta.total 3,484 for the ZIP vs 3,535 city-wide) and
+    the page walk (offsets 0..400, limit 100) digs past the newest
+    cluster. After each page the accumulated rows are counted against
+    BOTH gates (distance via _rapi_count_in_gate on horizon-filtered
+    rows); the walk stops at RAPIDAPI_PAGE_STOP in-gate rows, a short
+    page, meta.total exhaustion, or RAPIDAPI_REEF_PAGES pages. A page
+    error after page 1 keeps the accumulated rows; on page 1 it is the
+    source's failure. A full street address as location does NOT
+    narrow (playground-verified — it returns generic city results), so
+    it is never sent; no ZIP falls back to "City, ST"."""
+    zipc = (prop.get("zip") if hasattr(prop, "get") else prop["zip"]) or ""
+    loc = str(zipc).strip() or f"{prop['city']}, {prop['state']}"
+    rows = []
+    for page in range(RAPIDAPI_REEF_PAGES):
+        body = {"location": loc, "sort": "newest", "limit": 100,
+                "offset": page * 100}
+        data, err = _rapidapi_post(RAPIDAPI_REEF_HOST, "/realtor/v1/sold", body)
+        if err is not None:
+            if page == 0: return [], err, RAPIDAPI_SRC_REEF
+            break
+        items = _rapi_dig(data, "data", "results")
+        items = items if isinstance(items, list) else []
+        rows.extend(_rapi_in_horizon(
+            _rapi_rows(items, _reef_item_to_row), past_days))
+        total = _rapi_dig(data, "meta", "total")
+        if len(items) < 100: break
+        if isinstance(total, (int, float)) and (page + 1) * 100 >= total: break
+        if _rapi_count_in_gate(rows, prop, radius_mi) >= RAPIDAPI_PAGE_STOP: break
+    return rows, None, RAPIDAPI_SRC_REEF
 
-def _src_redfin_sold(prop, past_days):
+def _src_redfin_sold(prop, past_days, radius_mi=1.0):
     rid, err = _redfin_region_id(prop)
     if err is not None: return [], err, RAPIDAPI_SRC_REDFIN
     if not rid: return [], None, RAPIDAPI_SRC_REDFIN
@@ -2026,17 +2133,19 @@ def _src_redfin_sold(prop, past_days):
     rows = _rapi_rows(items if isinstance(items, list) else [], _redfin_item_to_row)
     return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_REDFIN
 
-def _src_sabri_forsold(prop, past_days):
+def _src_sabri_forsold(prop, past_days, radius_mi=1.0):
     data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forsold/coordinates",
-                              {"lat": prop["lat"], "lon": prop["lon"]})
+                              {"lat": prop["lat"], "lon": prop["lon"],
+                               "radius": _sabri_radius(radius_mi), "page": 1})
     if err is not None: return [], err, RAPIDAPI_SRC_SABRI
     items = data.get("properties") if isinstance(data, dict) else None
     rows = _rapi_rows(items if isinstance(items, list) else [], _sabri_item_to_row)
     return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_SABRI
 
-def _src_sabri_forrent(prop, past_days):
+def _src_sabri_forrent(prop, past_days, radius_mi=1.0):
     data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forrent/coordinates",
-                              {"lat": prop["lat"], "lon": prop["lon"]})
+                              {"lat": prop["lat"], "lon": prop["lon"],
+                               "radius": _sabri_radius(radius_mi), "page": 1})
     if err is not None: return [], err, RAPIDAPI_SRC_SABRI
     items = data.get("properties") if isinstance(data, dict) else None
     rows = _rapi_rows(items if isinstance(items, list) else [],
@@ -2054,50 +2163,71 @@ _RAPIDAPI_SOURCE_NAMES = {"reefapi_sold": "ReefAPI Realtor sold",
 RAPIDAPI_SOLD_SOURCES = ("reefapi_sold", "redfin_sold", "sabri_forsold")
 RAPIDAPI_RENT_SOURCES = ("sabri_forrent",)
 
-def _rapidapi_rotate(order, prop, past_days):
-    """Walk the ordered source list; the first source returning rows
-    serves. Returns (rows, last_err, label, tried) — tried holds
-    (source name, reason) for every source passed over, so the caller
-    can surface the switch: a failover is never hidden."""
-    tried, last_err = [], None
-    for key in order:
-        try:
-            rows, err, label = _RAPIDAPI_ADAPTERS[key](prop, past_days)
-        except Exception as e:
-            # Adapter contract (prep section 5): ANY failure — including
-            # an exception raised while normalizing an unexpected
-            # response shape — is just "didn't serve" with a reason. It
-            # must never escape the rotation and mask the sources behind
-            # it (v40; pre-fix, a normalizer AttributeError aborted the
-            # whole pull before HomeHarvest even ran — rapidapi-live-
-            # shapes-2026-11-04.md section 6).
-            rows, err, label = [], e, None
-        if rows: return rows, None, label, tried
+def _rapi_call_source(key, prop, past_days, radius_mi):
+    """One pool source, fully contained (the v40 rule): ANY failure —
+    including an exception raised while normalizing an unexpected
+    response shape — is just "didn't serve" with the error attached.
+    It must never escape and mask the sources behind it (pre-fix, a
+    normalizer AttributeError aborted the whole pull before
+    HomeHarvest even ran — rapidapi-live-shapes-2026-11-04.md §6)."""
+    try:
+        return _RAPIDAPI_ADAPTERS[key](prop, past_days, radius_mi)
+    except Exception as e:
+        return [], e, None
+
+def _rapi_outcome(key, rows, err, label, prop, radius_mi):
+    """The outcome record for one CALLED source (v42): what it did,
+    in numbers. 'log' is the pool-detail text (classified reason + the
+    sanitized error-body snippet on failure); 'reason' is the clean
+    banner form. In-gate counts use the same distance test the union
+    sequencing runs on, over the adapter's horizon-filtered rows."""
+    name = _RAPIDAPI_SOURCE_NAMES[key]
+    if rows:
+        in_gate = _rapi_count_in_gate(rows, prop, radius_mi)
+        return {"name": name, "label": label, "served": True,
+                "rows": len(rows), "in_gate": in_gate, "reason": None,
+                "log": f"{name} — served {len(rows)} rows, {in_gate} in-gate"}
+    reason = _rapi_fail_reason(err)
+    return {"name": name, "label": None, "served": False, "rows": 0,
+            "in_gate": 0, "reason": reason,
+            "log": f"{name} — {_rapi_fail_detail(err)}"}
+
+def _rapidapi_sold_frame(prop, past_days=365, radius_mi=1.0):
+    """The RapidAPI sold side for one pull (v42): a sequential UNION
+    with top-up. Returns (frames, err, outcomes): frames is a list of
+    (DataFrame, source label) — one per source that served rows;
+    outcomes records EVERY source actually called; err is the last
+    error when NO source served (the pull then relies on HomeHarvest),
+    else None. Sequencing: ReefAPI (paginated) first; if its in-gate
+    count reaches RAPIDAPI_UNION_RICH the frame is ReefAPI's alone;
+    else Redfin unions in; if the union is STILL under the threshold,
+    Sabri tops up. A source that errors never blocks the others."""
+    if not _rapidapi_key(): return [], None, []
+    frames, outcomes, in_gate_total, last_err = [], [], 0, None
+    for key in RAPIDAPI_SOLD_SOURCES:
+        if frames and in_gate_total >= RAPIDAPI_UNION_RICH: break
+        rows, err, label = _rapi_call_source(key, prop, past_days, radius_mi)
+        oc = _rapi_outcome(key, rows, err, label, prop, radius_mi)
+        outcomes.append(oc)
         if err is not None: last_err = err
-        tried.append((_RAPIDAPI_SOURCE_NAMES[key], _rapi_fail_reason(err)))
-    return [], last_err, None, tried
+        if rows:
+            frames.append((_hh_frame(rows), label))
+            in_gate_total += oc["in_gate"]
+    if not frames: return [], last_err, outcomes
+    return frames, None, outcomes
 
-def _rapi_switch_note(kind, tried, label):
-    """The user-visible failover note, or None when the first source
-    served and there is nothing to disclose."""
-    if not tried: return None
-    parts = "; ".join(f"{name} — {reason}" for name, reason in tried)
-    return f"RapidAPI failover: {parts}; {kind} comps served by {label}"
-
-def _rapidapi_sold_frame(prop, past_days=365):
-    """The RapidAPI sold frame for one pull: (df, err, source, tried).
-    df is None when the whole pool produced nothing."""
+def _rapidapi_rent_frame(prop, radius_mi=1.0):
+    """The RapidAPI rental frame: (df, err, source, outcomes) — the
+    v41 contract plus the v42 outcome records. df is None when the
+    rent pool produced nothing."""
     if not _rapidapi_key(): return None, None, None, []
-    rows, err, label, tried = _rapidapi_rotate(RAPIDAPI_SOLD_SOURCES, prop, past_days)
-    if not rows: return None, err, None, tried
-    return _hh_frame(rows), None, label, tried
-
-def _rapidapi_rent_frame(prop):
-    """The RapidAPI rental frame. Same contract as _rapidapi_sold_frame."""
-    if not _rapidapi_key(): return None, None, None, []
-    rows, err, label, tried = _rapidapi_rotate(RAPIDAPI_RENT_SOURCES, prop, 365)
-    if not rows: return None, err, None, tried
-    return _hh_frame(rows), None, label, tried
+    outcomes, last_err = [], None
+    for key in RAPIDAPI_RENT_SOURCES:
+        rows, err, label = _rapi_call_source(key, prop, 365, radius_mi)
+        outcomes.append(_rapi_outcome(key, rows, err, label, prop, radius_mi))
+        if rows: return _hh_frame(rows), None, label, outcomes
+        if err is not None: last_err = err
+    return None, last_err, None, outcomes
 
 def pull_comps(prop, radius_mi=1.0, past_days=365):
     """Multi-frame union pull (v3.4). Frames: a SUBJECT-CENTERED radius frame
@@ -2125,33 +2255,39 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         try: return scrape_property(**kw), None
         except Exception as e: return None, e
     subj = {"sqft": prop["sqft"], "beds": prop["beds"], "baths": prop["baths"], "year_built": prop["year_built"], "lot_sqft": prop["lot_sqft"]}
-    # --- RapidAPI sold frame (v3.8): when a key is configured it is tried
-    # FIRST — on egress-whitelisted hosts it is the only frame source that
-    # can answer — and the HomeHarvest frames below still union in (dedupe
-    # is address+price). No key: this block never runs and the pull is
-    # byte-identical to the pre-RapidAPI behavior. ---
-    rapi_sold_df, rapi_sold_src, rapi_tried = None, None, []
+    # --- RapidAPI sold frames (v3.8; union v42): when a key is
+    # configured the pool runs FIRST — on egress-whitelisted hosts it
+    # is the only frame source that can answer — and the HomeHarvest
+    # frames below still union in (dedupe is address+price). The pool
+    # itself is a sequential union with top-up (see
+    # _rapidapi_sold_frame): one frame per source that served. No key:
+    # this block never runs and the pull is byte-identical to the
+    # pre-RapidAPI behavior. ---
+    rapi_frames, rapi_outcomes = [], []
     if _rapidapi_key():
         try:
-            rapi_sold_df, _rapi_err, rapi_sold_src, rapi_tried = _rapidapi_sold_frame(prop, past_days)
+            rapi_frames, _rapi_err, rapi_outcomes = _rapidapi_sold_frame(prop, past_days, radius_mi)
         except Exception as _rapi_boom:
             # Last-resort guard (v40): the RapidAPI layer must never
             # abort a pull the HomeHarvest frames could still serve.
-            rapi_sold_df, _rapi_err, rapi_sold_src, rapi_tried = None, _rapi_boom, None, []
+            rapi_frames, _rapi_err, rapi_outcomes = [], _rapi_boom, []
             app.logger.warning(f"comp pull: RapidAPI sold frame raised for {addr_line}: {_rapi_boom!r}")
-        if rapi_sold_df is None and _rapi_err is not None:
+        if not rapi_frames and _rapi_err is not None:
             app.logger.warning(f"comp pull: RapidAPI sold frame failed for {addr_line}: {_rapi_err!r}")
-        if rapi_sold_df is None and rapi_tried:
-            # v40: name EVERY source's classified reason server-side.
-            # The v39 PA incident logged only the pool's last error,
-            # which hid what the earlier sources in the walk did.
+        if rapi_outcomes:
+            # v42: the pool detail is logged on EVERY pull that used
+            # the layer — each CALLED source's outcome (served counts
+            # or failure + body snippet). v40/v41 logged it only on
+            # total exhaustion, so a serving pull left no trace of
+            # what the sources did (and a failing one hid the earlier
+            # sources behind the last error — the v39 PA incident).
             app.logger.warning(f"comp pull: RapidAPI sold pool detail for {addr_line}: "
-                               + "; ".join(f"{n} — {r}" for n, r in rapi_tried))
+                               + "; ".join(o["log"] for o in rapi_outcomes))
     # --- sold frames: centered (3-yr horizon) UNION ZIP area (requested window) ---
     sold_frames = []
     frame_sources = {}
-    if rapi_sold_df is not None:
-        sold_frames.append(rapi_sold_df); frame_sources[id(rapi_sold_df)] = rapi_sold_src
+    for _rapi_df, _rapi_lbl in rapi_frames:
+        sold_frames.append(_rapi_df); frame_sources[id(_rapi_df)] = _rapi_lbl
     centered, err_c = _scrape(location=addr_line, listing_type="sold",
                               past_days=max(past_days, 1095), radius=radius_mi)
     if centered is not None: sold_frames.append(centered)
@@ -2170,39 +2306,64 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                            "came back — nothing was added or changed; please try again")
     if err_c is not None:
         app.logger.warning(f"comp pull: centered sold frame failed for {addr_line}: {err_c!r}")
-        if rapi_sold_df is None:
+        if not rapi_frames:
             warnings.append("centered sold frame failed — results came from the ZIP-area frame")
     if err_a is not None:
         app.logger.warning(f"comp pull: ZIP sold frame failed for {addr_line}: {err_a!r}")
-        if rapi_sold_df is None:
+        if not rapi_frames:
             warnings.append("ZIP-area sold frame failed — results came from the address-centered frame")
-    if rapi_sold_df is not None:
-        _note = _rapi_switch_note("sold", rapi_tried, rapi_sold_src)
-        if _note: warnings.append(_note)
-        warnings.append(f"sold comps include results from {rapi_sold_src}")
     added = updated = n_sold = 0
+    sold_touched = []
     for fr in sold_frames:
         a1, u1, n1 = _merge_sold_frame(d, prop, fr, radius_mi, subj,
-                                       source_override=frame_sources.get(id(fr)))
+                                       source_override=frame_sources.get(id(fr)),
+                                       touched=sold_touched)
         added += a1; updated += u1; n_sold += n1
+    if rapi_outcomes:
+        # v42 TRUTHFUL BANNER. The v41 line named the serving source
+        # even when the merge stored ZERO of its rows (the live pull's
+        # banner claimed ReefAPI results next to a 0-comp count).
+        # Attribution is exact: sold_touched records (comp_id, label)
+        # for every row this pull's merges stored, in order; a row's
+        # final touch is the label it is stored under. The include-line
+        # names ONLY pool sources with >= 1 stored row; when the pool
+        # answered but stored nothing, the banner says so plainly. The
+        # failover note keeps the established wording for sources that
+        # were passed over / failed while others served.
+        _last_label = {}
+        for _cid, _clbl in sold_touched: _last_label[_cid] = _clbl
+        _stored_by = {}
+        for _clbl in _last_label.values():
+            _stored_by[_clbl] = _stored_by.get(_clbl, 0) + 1
+        _stored_labels = [lbl for _f, lbl in rapi_frames if _stored_by.get(lbl)]
+        _served_labels = [o["label"] for o in rapi_outcomes if o["served"]]
+        _failed = [o for o in rapi_outcomes if not o["served"]]
+        if _failed and _served_labels:
+            warnings.append("RapidAPI failover: "
+                            + "; ".join(f"{o['name']} — {o['reason']}" for o in _failed)
+                            + "; sold comps served by " + ", ".join(_served_labels))
+        if _stored_labels:
+            warnings.append("sold comps include results from " + ", ".join(_stored_labels))
+        elif _served_labels:
+            warnings.append(f"RapidAPI answered but no results within {radius_mi:g} mi / "
+                            "the date window could be stored")
     # --- rentals: centered UNION ZIP (LTR / Co-Living / Affordable views read this set) ---
     n_rent = 0; rent_frames = []; rent_sources = {}
     if _rapidapi_key():
         try:
-            _rdf, _rerr, _rsrc, _rtried = _rapidapi_rent_frame(prop)
+            _rdf, _rerr, _rsrc, _rout = _rapidapi_rent_frame(prop, radius_mi)
         except Exception as _rboom:
             # Same v40 last-resort guard as the sold frame.
-            _rdf, _rerr, _rsrc, _rtried = None, _rboom, None, []
+            _rdf, _rerr, _rsrc, _rout = None, _rboom, None, []
             app.logger.warning(f"rent pull: RapidAPI rent frame raised for {addr_line}: {_rboom!r}")
         if _rdf is not None:
             rent_frames.append(_rdf); rent_sources[id(_rdf)] = _rsrc
-            _rnote = _rapi_switch_note("rental", _rtried, _rsrc)
-            if _rnote: warnings.append(_rnote)
         elif _rerr is not None:
             app.logger.warning(f"rent pull: RapidAPI rent frame failed for {addr_line}: {_rerr!r}")
-        if _rdf is None and _rtried:
+        if _rout:
+            # v42: rent pool detail on EVERY pull (see the sold side).
             app.logger.warning(f"rent pull: RapidAPI rent pool detail for {addr_line}: "
-                               + "; ".join(f"{n} — {r}" for n, r in _rtried))
+                               + "; ".join(o["log"] for o in _rout))
     rc, _ = _scrape(location=addr_line, listing_type="for_rent", past_days=90, radius=radius_mi)
     if rc is not None: rent_frames.append(rc)
     ra, err_r = _scrape(location=prop["zip"], listing_type="for_rent", past_days=90)
