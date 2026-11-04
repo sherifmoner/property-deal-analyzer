@@ -891,7 +891,13 @@ def compute_underwriting(strategy, raw_inp, prop):
                     and not (fnum(s.get("amort_value"), 0) or 0) and not (fnum(s.get("term_value"), 0) or 0)):
                 # v3.1: priced interest-only for lack of ANY term — ReiSearch's verbatim label.
                 lab = f"{lab} — Interest only (no term set)"
-            debt_lines.append({"label": lab, "payment": round(pay + esc)})
+            # v3.3: the Underwriting Summary's MONEY OUT block lists each loan
+            # by its funding name with a payment-kind sublabel (pictured:
+            # "Subject-To" / "P&I"). Additive fields — label/payment unchanged.
+            _sub = {"fixed": "P&I", "amortized": "P&I", "interest_only": "Interest only",
+                    "principal_only": "Principal only"}.get(s.get("payment_type") or "amortized", "P&I")
+            debt_lines.append({"label": lab, "payment": round(pay + esc),
+                               "name": s.get("preset") or s.get("type") or lab, "sub": _sub})
     # existing mortgage data (all strategies except Fix & Flip)
     # v1.8a PITI wiring: the breakdown fields are LIVE components of the payment,
     # not decoration. Base = the typed Monthly Payment, or the Principal+Interest
@@ -1141,6 +1147,18 @@ def compute_underwriting(strategy, raw_inp, prop):
     opex_cats = {"Booking & Service Fees": round(fees_cat), "Utilities": round(util),
                  "Cleaning Service": round(cleaning), "Maintenance": round(maint),
                  "Management": round(mgmt_lines), "Taxes, Insurance & HOA": round(taxes_mo + ins_mo + hoa)}
+    opex_cats_computed = dict(opex_cats)
+    # v3.3: category-total overrides (ReiSearch behavior — the category total
+    # is editable independently of its sub-items and carries the money when
+    # the user has taken manual control of it; the Senisa pictured state runs
+    # 600/600/0/300/300 over $0 sub-items). The cat_manual list distinguishes
+    # a typed total from the synced computed display value.
+    _manual = set(x for x in str(inp.get("cat_manual") or "").split(",") if x)
+    for _ck, _cat in (("fees", "Booking & Service Fees"), ("utilities", "Utilities"),
+                      ("cleaning", "Cleaning Service"), ("maintenance", "Maintenance"),
+                      ("management", "Management"), ("taxes", "Taxes, Insurance & HOA")):
+        _ov = fnum(inp.get("cat_override_" + _ck), None)
+        if _ov is not None and _ck in _manual: opex_cats[_cat] = round(_ov)
     opex = sum(opex_cats.values())
     # v2.3: the old -10 "no utilities/maintenance" score penalty is REMOVED.
     # It was an app-side invention: every ReiSearch state measured in the
@@ -1213,6 +1231,7 @@ def compute_underwriting(strategy, raw_inp, prop):
                 "platform_fee_mo": round(platform_fee),
                 "service_fee_mo": round(service_fee), "mgmt_fee_mo": round(mgmt_fee),
                 "egi_mo": round(egi), "opex_mo": round(opex), "opex_cats": opex_cats,
+                "opex_cats_computed": opex_cats_computed,
                 "taxes_mo": taxes_mo, "insurance_mo": ins_mo,
                 "taxes_est": taxes_est, "insurance_est": ins_est, "noi_mo": round(noi),
                 "cashflow_mo": round(cf), "cf_per_room": round(metrics["cf_per_room"]),
@@ -1363,9 +1382,15 @@ def uw_state(strategy, prop, saved_inp, ctx):
     if strategy == "Co-Living":
         rows = inp.get("rooms_rows") if saved_inp else None
         if not rows:
-            wk = (ctx.get("coli") or {}).get("weekly_per_room") or 189
+            # v3.3 (Phase 3, methodology doc 2026-11-04): the fresh rent is the
+            # area benchmark ONLY — the old hardcoded `or 189` fallback (ReiSearch's
+            # ZIP-33613 Tier-A figure) fired on ANY property whose comp stats came
+            # back empty, i.e. an invented rent. Below the data minimum the rooms
+            # now prefill BLANK ("Not found — enter per-room rent" note on the page).
+            wk = (ctx.get("coli") or {}).get("weekly_per_room")
             rows = [{"bath": "Shared", "bath_group": "A" if (i // 2) % 2 == 0 else "B",
-                     "rent_wk": wk, "rent_mo": round(wk * 52 / 12, 2), "vacancy": 15, "amenity_mo": 0}
+                     "rent_wk": wk if wk else "", "rent_mo": round(wk * 52 / 12, 2) if wk else "",
+                     "vacancy": 15, "amenity_mo": 0}
                     for i in range(beds)]
         st["rooms_rows"] = rows
         st["amenities_mo"] = g("amenities_mo", 0); st["late_fees_mo"] = g("late_fees_mo", 0)
@@ -1390,6 +1415,12 @@ def uw_state(strategy, prop, saved_inp, ctx):
         st["booking_days"] = g("booking_days", 10 if strategy == "Co-Living" else 0)
         st["service_fee_pct"] = g("service_fee_pct", 8 if strategy == "Co-Living" else 0)
         st["mgmt_fee_pct"] = g("mgmt_fee_pct", 0); st["mgmt_fee_basis"] = g("mgmt_fee_basis", "gross")
+        # v3.3: ReiSearch category totals are editable independently of their
+        # sub-items (Senisa pictures: totals 600/600/0/300/300 with every
+        # sub-item $0). Blank = computed from sub-items; a value overrides.
+        for _ck in ("fees", "utilities", "cleaning", "maintenance", "management", "taxes"):
+            st["cat_override_" + _ck] = g("cat_override_" + _ck, "")
+        st["cat_manual"] = g("cat_manual", "")
         # v1.5: a FRESH panel opens with ReiSearch's PadSplit expense template prefilled
         # (screenshot spec). Saved scenarios/drafts keep exactly what they stored.
         # v2.1: only Co-Living / Short Term get the cleaning + property-manager lines; a Long Term tenant
@@ -1785,7 +1816,13 @@ CR_TABLES = "B01003,B01001,B19001,B19013,B02001,B03003,B25003,B25064,B25077,B230
 # Census Reporter: it 404s "isn't supported".)
 CR_RELEASE = "acs2024_5yr"
 
-def _cr_fetch(geo_id, release=CR_RELEASE, tables=CR_TABLES):
+def _cr_fetch(geo_id, release=CR_RELEASE, tables=CR_TABLES, timeout=20):
+    # v3.3: default timeout 60 -> 20. Census Reporter's healthy latency is
+    # 0.5-2s, but a degraded Reporter (incl. slow negative answers for
+    # geographies it doesn't have) could hold a demographics pull for the
+    # full 60s per call, stacking past every consumer's wait window.
+    # 20s is ~10x healthy latency; callers may pass a shorter one for
+    # non-essential archive-release enrichment (see _pop_trend_cr).
     """Census Reporter API (NO key): one call -> flat {B01003_001E: value} dict in
     api.census.gov naming + the release label. Pinned-release responses are cached
     server-side per geography in settings (30 days) so repeat opens are instant."""
@@ -1799,7 +1836,7 @@ def _cr_fetch(geo_id, release=CR_RELEASE, tables=CR_TABLES):
         except Exception:
             pass
     r = requests.get(f"https://api.censusreporter.org/1.0/data/show/{release}",
-                     params={"table_ids": tables, "geo_ids": geo_id}, timeout=60,
+                     params={"table_ids": tables, "geo_ids": geo_id}, timeout=timeout,
                      headers={"User-Agent": "PropertyDealAnalyzer/1.6 (Census Reporter client)"})
     r.raise_for_status()
     j = r.json()
@@ -1854,7 +1891,12 @@ def _pop_trend_cr(geo_id):
     pts = []
     for release, yr in (("acs2014_5yr", 2014), ("acs2019_5yr", 2019)):
         try:
-            vals, _r = _cr_fetch(geo_id, release=release, tables="B01003")
+            # v3.3: archive releases are non-essential enrichment and Census
+            # Reporter's archive endpoints can take ~60s each when degraded;
+            # a short timeout keeps one slow archive from holding the whole
+            # demographics pull hostage (a miss just drops that trend point,
+            # which this loop already tolerates). Healthy path unchanged.
+            vals, _r = _cr_fetch(geo_id, release=release, tables="B01003", timeout=12)
             pop = _acs_num(vals, "B01003_001E")
             if pop: pts.append({"year": yr, "pop": int(pop)})
         except Exception:
@@ -2907,7 +2949,10 @@ def census_demographics(zip_code, city=None, state=None, address=None):
             blk["pop_trend"] = _pop_trend(zip_code)
         prev_vals = {}
         try:
-            prev_vals, _r = _cr_fetch(zip_geo, release="acs2019_5yr", tables="B25077,B25064")
+            # v3.3: same archive-timeout rationale as _pop_trend_cr — the
+            # prior-release comparison is enrichment; the ZIP block (current
+            # release) is the required data and keeps the full timeout.
+            prev_vals, _r = _cr_fetch(zip_geo, release="acs2019_5yr", tables="B25077,B25064", timeout=12)
         except Exception:
             prev_vals = {}
         if not prev_vals and _census_key():

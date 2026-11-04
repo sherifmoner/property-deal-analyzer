@@ -86,10 +86,14 @@
 <details class="acc" open data-sec="revenue"><summary><span class="acc-t">Operating Revenue</span><span class="acc-mode">CALCULATED TOTAL</span><span class="acc-total" data-out="egi_mo">$0</span></summary><div class="acc-b">
 {% if strat=='Co-Living' %}
 <div class="secgrid"><div class="secmain">
-<div class="rhead r15"><span>Bed</span><span>Bath Type</span><span>Bath Group</span><span>Gross Rent $/Wk</span><span>Gross Rent $/Mo</span><span>Vacancy %</span><span>Weekly</span><span>Monthly</span><span>Amenities</span><span></span></div>
+{# v3.3: ReiSearch's revenue header line — "Rental Revenue" + the net-of-vacancy
+   Gross Income per Week / Month / Year (was a paragraph under the table). #}
+<div class="revhead"><span class="revlab">Rental Revenue</span><span class="revgi">Gross Income ⓘ <b data-out="egi_wk">$0</b> <span class="muted">Week</span> · <b data-out="egi_mo">$0</b> <span class="muted">Month</span> · <b data-out="rev_egi_yr">$0</b> <span class="muted">Year</span></span></div>
+<div class="rhead r15"><span>Beds</span><span>Baths ⓘ</span><span><a href="#" class="autoassign" onclick="return uwAutoAssign(this)">Auto assign</a></span><span>Gross Rent ⓘ</span><span></span><span>− Vacancy (%) +</span><span>ⓘ Weekly</span><span>Monthly</span><span>Amenities</span><span></span></div>
 <div data-rows="rooms_rows"></div>
 <button type="button" class="btn sm sec" data-add="rooms_rows" onclick="return uwAddRow(this,'rooms_rows')">+ Add Room</button>
 <div class="srow tot"><span>Amenities Total</span><span><b data-out="amenity_wk">$0</b> <span class="muted">/wk</span> · <b data-out="amenity_total">$0</b> <span class="muted">/mo</span></span></div>
+<p class="small muted" data-coli-note></p>
 <div class="rowflex">
 <div><label>Rental Late Fees $/wk</label><input type="number" step="any" name="late_fees_wk" value=""></div>
 <div><label>Rental Late Fees $/mo</label><input type="number" step="any" name="late_fees_mo" value="{{ st.late_fees_mo }}"></div>
@@ -99,7 +103,6 @@
 <div><label>Misc. Income $/mo</label><input type="number" step="any" name="misc_income_mo" value="{{ st.misc_income_mo }}"></div>
 <div><label>Moving Fee $ (one time)</label><input type="number" step="any" name="moving_fee" value="{{ st.moving_fee }}"></div>
 </div>
-<p class="small muted">Gross Income: <b data-out="egi_wk">$0</b> /wk · <b data-out="egi_mo">$0</b> /mo · <b data-out="rev_egi_yr">$0</b> /yr</p>
 </div>
 <aside class="sumpanel"><div class="sump-head"><h4>Operating Revenue</h4><span class="ptoggle"><button type="button" data-ptog="mo" onclick="return uwPanelPeriod(this,'mo')">Month</button><button type="button" class="on" data-ptog="yr" onclick="return uwPanelPeriod(this,'yr')">Year</button></span></div>
 <div class="srow"><span>Bedroom Rental Revenue</span><b data-out="rev_rent_yr" data-pv="gross_mo">$0</b></div>
@@ -156,38 +159,50 @@
 
 <details class="acc" open data-sec="expenses"><summary><span class="acc-t">Operating Expenses</span><span class="acc-mode">CALCULATED TOTAL</span><span class="acc-total" data-out="opex_mo">$0</span></summary><div class="acc-b">
 <div class="secgrid"><div class="secmain">
-<h4>Booking &amp; Service Fee <span class="gtot"><b data-out="cat_fees">$0</b> <span class="muted">Month</span> · <b data-outyr="cat_fees">$0</b> <span class="muted">Year</span></span></h4>
-<div class="rowflex">
-<div><label>Booking Fee — First Days to PadSplit (days)</label><input type="number" step="any" name="booking_days" value="{{ st.booking_days }}"></div>
-<div><label>First-days fee</label><div class="disp"><b data-out="booking_fee_mo">$0</b> <span class="muted">/mo · <span data-outyr="booking_fee_mo">$0</span>/yr</span></div></div>
-<div><label>Ongoing Service Fee %</label><input type="number" step="any" name="service_fee_pct" value="{{ st.service_fee_pct }}"></div>
-<div><label>Ongoing fee</label><div class="disp"><b data-out="service_fee_mo">$0</b> <span class="muted">/mo</span></div></div>
-<div><label>Blended rate</label><div class="disp"><b data-out="blended_rate">—</b></div></div>
+{# v3.3: category totals are INPUTS (ReiSearch anatomy) — see the cat_manual
+   flag in uw.js/app.py. The hidden cat_manual field lists the categories the
+   user has taken manual control of. #}
+<input type="hidden" name="cat_manual" data-stateval="1" value="{{ st.cat_manual }}">
+<h4>Booking &amp; Service Fee <span class="gtot">Total <b data-out="cat_fees">$0</b> <span class="muted">Month</span> · <b data-catyr="Booking &amp; Service Fees">$0</b> <span class="muted">Year</span> · <input type="number" step="any" class="catover" name="cat_override_fees" data-catkey="fees" data-catname="Booking &amp; Service Fees" value="{{ st.cat_override_fees }}" placeholder="override" title="Category total override — type a total to carry this category independently of its sub-items; clear it to go back to the sub-item sum"></span></h4>
+<div class="feerow">
+<div class="feemain"><label>Booking Fee — First Days to PadSplit</label>
+<p class="small muted feehelp">PadSplit keeps this many days of a room's rent from each new booking (typically 10), modeled once per room per year.</p></div>
+<div class="feeval"><input type="number" step="any" name="booking_days" value="{{ st.booking_days }}"> <span class="muted">Days</span></div>
+<div class="feeamt"><b data-out="booking_fee_mo">$0</b> <span class="muted">Month</span> · <b data-outyr="booking_fee_mo">$0</b> <span class="muted">Year</span></div>
 </div>
-<div class="rowflex">
-<div><label>Property Management Fee %</label><input type="number" step="any" name="mgmt_fee_pct" value="{{ st.mgmt_fee_pct }}"></div>
-<div><label>Fee basis</label><select name="mgmt_fee_basis"><option value="gross" {% if st.mgmt_fee_basis=='gross' %}selected{% endif %}>Gross</option><option value="net" {% if st.mgmt_fee_basis=='net' %}selected{% endif %}>Net</option></select></div>
-<div><label>Management fee</label><div class="disp"><b data-out="mgmt_fee_mo">$0</b> <span class="muted">/mo</span></div></div>
+<div class="feerow">
+<div class="feemain"><label>Ongoing Service Fee (%)</label>
+<p class="small muted feehelp">PadSplit's ongoing percentage of collected income (effective gross income).</p></div>
+<div class="feeval"><input type="number" step="any" name="service_fee_pct" value="{{ st.service_fee_pct }}"> <span class="muted">%</span></div>
+<div class="feeamt"><b data-out="service_fee_mo">$0</b> <span class="muted">Month</span> · <b data-outyr="service_fee_mo">$0</b> <span class="muted">Year</span></div>
 </div>
-<h4>Utilities <span class="gtot"><b data-out="cat_utilities">$0</b> <span class="muted">Month</span> · <b data-outyr="cat_utilities">$0</b> <span class="muted">Year</span></span></h4>
+<p class="small muted blendedline" data-out="blended_line"></p>
+<div class="feerow">
+<div class="feemain"><label>Property Management Fee (%)</label>
+<p class="small muted feehelp">Charged on gross income — effective gross income, before the PadSplit fees.</p></div>
+<div class="feeval"><span class="segbtns"><button type="button" class="segbtn {{ 'on' if st.mgmt_fee_basis!='net' }}" data-basisval="gross" onclick="return uwBasis(this,'gross')">Gross</button><button type="button" class="segbtn {{ 'on' if st.mgmt_fee_basis=='net' }}" data-basisval="net" onclick="return uwBasis(this,'net')">Net</button></span><input type="hidden" name="mgmt_fee_basis" data-stateval="1" value="{{ st.mgmt_fee_basis }}"> <input type="number" step="any" name="mgmt_fee_pct" value="{{ st.mgmt_fee_pct }}"> <span class="muted">%</span></div>
+<div class="feeamt"><b data-out="mgmt_fee_mo">$0</b> <span class="muted">Month</span> · <b data-outyr="mgmt_fee_mo">$0</b> <span class="muted">Year</span></div>
+</div>
+<h4>Utilities <span class="gtot">Total <b data-out="cat_utilities">$0</b> <span class="muted">Month</span> · <b data-catyr="Utilities">$0</b> <span class="muted">Year</span> · <input type="number" step="any" class="catover" name="cat_override_utilities" data-catkey="utilities" data-catname="Utilities" value="{{ st.cat_override_utilities }}" placeholder="override" title="Category total override — type a total to carry this category independently of its sub-items; clear it to go back to the sub-item sum"></span></h4>
 {% for k, lab in [('electric_mo','Electric'),('water_mo','Water'),('gas_mo','Gas'),('internet_mo','Internet')] %}
 <div class="xrow"><span>{{ lab }}</span><input type="number" step="any" name="{{ k }}" value="{{ st[k] }}"><span class="yr" data-yr="{{ k }}"></span></div>{% endfor %}
-<h4>Cleaning Service <span class="gtot"><b data-out="cat_cleaning">$0</b> <span class="muted">Month</span> · <b data-outyr="cat_cleaning">$0</b> <span class="muted">Year</span></span></h4>
+<h4>Cleaning Service <span class="gtot">Total <b data-out="cat_cleaning">$0</b> <span class="muted">Month</span> · <b data-catyr="Cleaning Service">$0</b> <span class="muted">Year</span> · <input type="number" step="any" class="catover" name="cat_override_cleaning" data-catkey="cleaning" data-catname="Cleaning Service" value="{{ st.cat_override_cleaning }}" placeholder="override" title="Category total override — type a total to carry this category independently of its sub-items; clear it to go back to the sub-item sum"></span></h4>
 <div class="xrow"><span>Cleaning Service</span><input type="number" step="any" name="cleaning_mo" value="{{ st.cleaning_mo }}"><span class="yr" data-yr="cleaning_mo"></span></div>
-<h4>Maintenance <span class="gtot"><b data-out="cat_maintenance">$0</b> <span class="muted">Month</span> · <b data-outyr="cat_maintenance">$0</b> <span class="muted">Year</span></span></h4>
+<h4>Maintenance <span class="gtot">Total <b data-out="cat_maintenance">$0</b> <span class="muted">Month</span> · <b data-catyr="Maintenance">$0</b> <span class="muted">Year</span> · <input type="number" step="any" class="catover" name="cat_override_maintenance" data-catkey="maintenance" data-catname="Maintenance" value="{{ st.cat_override_maintenance }}" placeholder="override" title="Category total override — type a total to carry this category independently of its sub-items; clear it to go back to the sub-item sum"></span></h4>
 {% for k, lab in [('landscaping_mo','Landscaping'),('pest_mo','Pest Control'),('handyman_mo','Handy Man')] %}
 <div class="xrow"><span>{{ lab }}</span><input type="number" step="any" name="{{ k }}" value="{{ st[k] }}"><span class="yr" data-yr="{{ k }}"></span></div>{% endfor %}
-<h4>Management <span class="gtot"><b data-out="cat_management">$0</b> <span class="muted">Month</span> · <b data-outyr="cat_management">$0</b> <span class="muted">Year</span></span></h4>
+<h4>Management <span class="gtot">Total <b data-out="cat_management">$0</b> <span class="muted">Month</span> · <b data-catyr="Management">$0</b> <span class="muted">Year</span> · <input type="number" step="any" class="catover" name="cat_override_management" data-catkey="management" data-catname="Management" value="{{ st.cat_override_management }}" placeholder="override" title="Category total override — type a total to carry this category independently of its sub-items; clear it to go back to the sub-item sum"></span></h4>
 {% for k, lab in [('property_manager_mo','Property Manager'),('turnover_reserve_mo','Turnover Reserve'),('additional_insurance_mo','Additional Insurance')] %}
 <div class="xrow"><span>{{ lab }}</span><input type="number" step="any" name="{{ k }}" value="{{ st[k] }}"><span class="yr" data-yr="{{ k }}"></span></div>{% endfor %}
-<h4>Taxes, Insurance &amp; HOA <span class="small muted">(auto-filled with an editable estimate — real county tax ÷ 12 where known, else 1.1% of price/yr; insurance $180/mo. Skipped when a loan payment exists: they live inside PITI then)</span> <span class="gtot"><b data-out="cat_taxes">$0</b> <span class="muted">Month</span> · <b data-outyr="cat_taxes">$0</b> <span class="muted">Year</span></span></h4>
+<h4>Taxes, Insurance &amp; HOA <span class="small muted">(auto-filled with an editable estimate — real county tax ÷ 12 where known, else 1.1% of price/yr; insurance $180/mo. Skipped when a loan payment exists: they live inside PITI then)</span> <span class="gtot">Total <b data-out="cat_taxes">$0</b> <span class="muted">Month</span> · <b data-catyr="Taxes, Insurance &amp; HOA">$0</b> <span class="muted">Year</span> · <input type="number" step="any" class="catover" name="cat_override_taxes" data-catkey="taxes" data-catname="Taxes, Insurance &amp; HOA" value="{{ st.cat_override_taxes }}" placeholder="override" title="Category total override — type a total to carry this category independently of its sub-items; clear it to go back to the sub-item sum"></span></h4>
 {% for k, lab in [('taxes_mo','Taxes'),('insurance_mo','Insurance'),('hoa_mo','HOA dues')] %}
 <div class="xrow"><span>{{ lab }}</span><input type="number" step="any" name="{{ k }}" value="{{ st[k] }}"><span class="yr" data-yr="{{ k }}"></span></div>{% endfor %}
 <input type="hidden" name="taxes_est" data-estflag value="{{ st.taxes_est }}">
 <input type="hidden" name="insurance_est" data-estflag value="{{ st.insurance_est }}">
 <p class="small muted">Fields shaded amber are auto-estimates — type over them to replace with the real number.</p>
+<div class="srow tot expfoot"><span>Total Operating Expenses</span><span><b data-out="opex_mo">$0</b> <span class="muted">Month</span> · <b data-outyr="opex_mo">$0</b> <span class="muted">Year</span></span></div>
 </div>
-<aside class="sumpanel"><div class="sump-head"><h4>Operating Expenses</h4><span class="ptoggle"><button type="button" class="on" data-ptog="mo" onclick="return uwPanelPeriod(this,'mo')">Month</button><button type="button" data-ptog="yr" onclick="return uwPanelPeriod(this,'yr')">Year</button></span></div>
+<aside class="sumpanel"><div class="sump-head"><h4>Operating Expenses</h4><span class="ptoggle"><button type="button" data-ptog="mo" onclick="return uwPanelPeriod(this,'mo')">Month</button><button type="button" class="on" data-ptog="yr" onclick="return uwPanelPeriod(this,'yr')">Year</button></span></div>
 <div class="srow"><span>Booking &amp; Service Fees</span><b data-pv="cat_fees">$0</b></div>
 <div class="srow"><span>Utilities Costs</span><b data-pv="cat_utilities">$0</b></div>
 <div class="srow"><span>Cleaning Service Costs</span><b data-pv="cat_cleaning">$0</b></div>
@@ -324,40 +339,56 @@
 {% endif %}
 
 {% if strat=='Co-Living' %}
+{# v3.3: ReiSearch's pictured Underwriting Summary anatomy (Senisa screenshots,
+   digest research/senisa-subjectto-layout-2026-11-04.md). Values render through
+   the data-outsum pass in uw.js (Month|Year scaling lives there). #}
 <div class="card uwbottom">
-<h3>Underwriting Summary</h3>
+<div class="sumhead"><h3>Underwriting Summary</h3><span class="ptoggle"><button type="button" class="on" data-summode="mo" onclick="return uwSumMode(this,'mo')">Month</button><button type="button" data-summode="yr" onclick="return uwSumMode(this,'yr')">Year</button></span></div>
 <div class="hcards">
-<div class="hcard"><span>Cash Needed</span><b data-out="cash_needed">$0</b><small data-out="cash_per_room"></small></div>
-<div class="hcard"><span>Net Cash Flow / Mo</span><b data-out="cashflow_mo">$0</b><small data-out="cf_per_room"></small></div>
-<div class="hcard"><span>Cash-on-Cash</span><b data-out="coc_pct">—</b><small data-out="payback"></small></div>
-<div class="hcard"><span>DSCR</span><b data-out="dscr">—</b><small>&nbsp;</small></div>
+<div class="hcard"><span class="hlab">Cash Needed</span><b class="hval" data-out="cash_needed" data-outsum="sum_cash_needed">$0</b><small data-out="cash_per_room" data-outsum="sum_cash_per_room"></small></div>
+<div class="hcard"><span class="hlab">Net Cash Flow / Mo</span><b class="hval pos" data-out="cashflow_mo" data-outsum="sum_cf">$0</b><small data-out="cf_per_room" data-outsum="sum_cf_per_room"></small></div>
+{# CoC keeps the exact v29-gated data-out rendering ("—" no-data glyph — the
+   "--" in ReiSearch's picture is a parked Sherif's-call item, not this lap). #}
+<div class="hcard"><span class="hlab">Cash-on-Cash</span><b class="hval" data-out="coc_pct">—</b><small data-out="payback"></small></div>
+<div class="hcard"><span class="hlab">DSCR</span><b class="hval pos" data-out="dscr">—</b><small data-outsum="sum_dscr_note"></small></div>
 </div>
-<div class="grid2">
+<div class="sumcols">
 <div class="moneyblock">
 <h4>Cash Flow (Monthly)</h4>
-<div class="srow"><span><b>MONEY IN</b></span><b></b></div>
-<div class="srow"><span>Revenue (effective gross income)</span><b data-out="egi_mo">$0</b></div>
-<div class="srow"><span>Scheduled Rent (gross)</span><b data-out="gross_mo">$0</b></div>
-<div class="srow"><span>Vacancy Loss</span><b data-out="vacancy_loss_mo">$0</b></div>
-<div class="srow"><span><b>MONEY OUT</b></span><b></b></div>
-<div class="srow"><span>Operating Expenses</span><b data-out="opex_mo">$0</b></div>
-<div class="srow"><span>Loan Payments</span><b data-out="debt_service_mo">$0</b></div>
-<div class="srow tot"><span>Net Cash Flow</span><b data-out="cashflow_mo">$0</b></div>
-<p class="small muted" data-out="breakeven_line"></p>
+<div class="cfbar sumbar"><div class="cfseg exp" data-cfseg="exp"></div><div class="cfseg debt" data-cfseg="debt"></div><div class="cfseg cf" data-cfseg="cf"></div></div>
+<p class="small muted cflegend" data-out="cf_bar_legend"></p>
+<div class="mblock in">
+<div class="srow mb-head"><span class="mb-t in">MONEY IN</span><span class="mb-r">Revenue <b data-outsum="sum_rev_head">$0</b></span></div>
+<div class="srow"><span>Scheduled Rent</span><span class="pencil" data-goto="revenue" onclick="return uwGoto(this,'revenue')">✎</span><b data-out="gross_mo" data-outsum="sum_gross">$0</b></div>
+<div class="srow"><span>Vacancy Loss</span><span class="pencil" data-goto="revenue" onclick="return uwGoto(this,'revenue')">✎</span><b data-out="vacancy_loss_mo" data-outsum="sum_vac">$0</b></div>
+<div class="srow" data-hz="other_income_mo"><span>Other Income</span><span></span><b data-outsum="sum_other">$0</b></div>
 </div>
-<div>
+<div class="mblock out">
+<div class="srow mb-head"><span class="mb-t out">MONEY OUT</span><span class="mb-r">Expenses + Loans <b data-outsum="sum_out_head">$0</b></span></div>
+<div class="srow"><span>Operating Expenses</span><span class="pencil" data-goto="expenses" onclick="return uwGoto(this,'expenses')">✎</span><b data-outsum="sum_opex">$0</b></div>
+<div class="srow grouplab"><span>Loan Payments</span><span></span><b></b></div>
+<div data-loanlines></div>
+</div>
+<div class="ncfbox"><div><span class="ncf-lab">Net Cash Flow</span><small data-outsum="sum_ncf_sub"></small></div><b class="ncf-val" data-outsum="sum_ncf">$0</b></div>
+<p class="small breakevenline" data-out="breakeven_line"></p>
+</div>
+<div class="sumside">
+<div class="cashgoes">
+<h4>Where the Cash Goes</h4>
+<div data-outlay></div>
+<div class="srow tot"><span>Total Cash Outlay</span><b data-outsum="sum_outlay_total">$0</b></div>
+</div>
+<div class="y1block">
 <h4>Year 1 Returns</h4>
-<div class="srow"><span>Cash Flow (Year 1)</span><b data-out="cashflow_y1">$0</b></div>
-<div class="srow"><span>Loan Paydown (Year 1)</span><b data-out="paydown_y1">$0</b></div>
-<div class="srow"><span>Total Return</span><b data-out="total_return_y1">$0</b></div>
-<div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
-<div class="srow"><span>Total ROI</span><b data-out="total_roi_y1">—</b></div>
-<h4>Per-Room Economics</h4>
-<div class="srow"><span>Net Cash Flow / room</span><b data-out="cf_per_room">$0</b></div>
-<div class="srow"><span>Cash Needed / room</span><b data-out="cash_per_room">$0</b></div>
-<div class="srow"><span>Rooms</span><b data-out="rooms">—</b></div>
+<div class="srow"><span>Cash Flow</span><b class="pos" data-out="cashflow_y1" data-outsum="sum_y1_cf">$0</b></div>
+<div class="srow"><span>Loan Paydown</span><b data-out="paydown_y1" data-outsum="sum_y1_paydown">$0</b></div>
+<div class="srow tot"><span>Total Return</span><b class="pos" data-out="total_return_y1" data-outsum="sum_y1_total">$0</b></div>
+<div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct" data-outsum="sum_cap">—</b></div>
+<div class="srow"><span>Total ROI (CF + Paydown)</span><b data-out="total_roi_y1">—</b></div>
 </div>
 </div>
+</div>
+<div class="perroom"><span class="pr-lab">Per-Room Economics</span><span><b data-outsum="sum_strip_rooms">—</b> rooms</span><span><b data-outsum="sum_strip_avg">—</b> avg rent/room</span><span><b class="pos" data-outsum="sum_strip_cf">—</b> cash flow/room/mo</span><span><b data-outsum="sum_strip_inv">—</b> invested/room</span></div>
 </div>
 {% endif %}
 
@@ -381,27 +412,32 @@
 </div>
 <div class="sidepane on" data-spane="overview">
 {% if strat=='Co-Living' %}
-<div class="scorebox"><span>Deal Score</span><b data-out="score">—</b><small data-out="score_label"></small></div>
+{# v3.3: ReiSearch's pictured sidebar — score RING, then the Net Cash Flow card
+   (big value + annually subline + Revenue|Expenses|Loan Payments columns). #}
+<div class="scorebox"><div class="scorering"><b data-out="score">—</b></div><div class="scoremeta"><span>Deal Score</span><small data-out="score_label"></small></div></div>
 <p class="small insight" data-out="score_insight"></p>
 <p class="small"><a href="#" onclick="return uwGoDetails(this)">View Details</a></p>
 <div class="chips"><button type="button" data-scenchip="Downside (-10%)" onclick="return uwScenChip(this)">Downside −10%</button><button type="button" class="on" data-scenchip="Base Case (0%)" onclick="return uwScenChip(this)">Base Case</button><button type="button" data-scenchip="Upside (+10%)" onclick="return uwScenChip(this)">Upside +10%</button><button type="button" data-scenchip="Fully Booked (0% vacancy)" onclick="return uwScenChip(this)">Fully Booked</button></div>
+<div class="cfbox"><div class="ncfhead"><h4>Net Cash Flow</h4><span class="moyrtoggle"><button type="button" class="on" onclick="return uwNcfMode(this,'mo')">Mo</button><button type="button" onclick="return uwNcfMode(this,'yr')">Yr</button></span></div>
+<div class="ncfbig"><b><span data-ncfdisp>$0</span><span data-ncfunit>/mo</span></b></div>
+<p class="small muted ncfannual" data-ncfannual></p>
+<div class="cfcols">
+<div><span>Revenue</span><b data-scen="rev">$0</b></div>
+<div><span>Expenses</span><b data-scen="exp">$0</b></div>
+<div><span>Loan Payments</span><b data-scen="debt">$0</b></div>
+</div>
+<div class="cfbar"><div class="cfseg exp" data-cfseg="exp"></div><div class="cfseg debt" data-cfseg="debt"></div><div class="cfseg cf" data-cfseg="cf"></div></div>
+<p class="small muted" data-out="cf_bar_legend"></p></div>
 <div class="srow big"><span>Cash Needed</span><b data-out="cash_needed">$0</b></div>
 <div data-breakdown="cashside"></div>
 <p class="small muted">One-time cash beyond the funding stack (loan points/fees + sub-to entry fee — cash contributions, closing costs and a loan-only funding gap don't count).</p>
-<div class="cfbox"><h4>Monthly Cash Flow</h4>
-<div class="srow"><span>+ Revenue</span><b data-scen="rev">$0</b></div>
-<div class="srow"><span>− Expenses</span><b data-scen="exp">$0</b></div>
-<div class="srow"><span>− Loan Payments</span><b data-scen="debt">$0</b></div>
-<div class="srow tot"><span>Net Cash Flow</span><span class="ncfcell"><b><span data-ncfdisp>$0</span><span data-ncfunit>/mo</span></b><span class="moyrtoggle"><button type="button" class="on" onclick="return uwNcfMode(this,'mo')">Mo</button><button type="button" onclick="return uwNcfMode(this,'yr')">Yr</button></span></span></div>
-<div class="cfbar"><div class="cfseg exp" data-cfseg="exp"></div><div class="cfseg debt" data-cfseg="debt"></div><div class="cfseg cf" data-cfseg="cf"></div></div>
-<p class="small muted" data-out="cf_bar_legend"></p></div>
 <h4>ROI Metrics</h4>
 <div class="srow"><span>Cash-on-Cash Return</span><b data-out="coc_pct">—</b></div>
 <div class="srow"><span>Cap Rate</span><b data-out="cap_rate_pct">—</b></div>
 <div class="srow"><span>DSCR</span><b data-out="dscr">—</b></div>
 <div class="srow"><span>Annual Cash Flow</span><b data-out="cashflow_y1">$0</b></div>
 <div class="srow"><span>Return of Capital</span><b data-out="payback_full">—</b></div>
-<p class="small"><a href="#" onclick="return uwGoDetails(this)">View Full Analysis →</a></p>
+<p><a class="btn sec vfabtn" href="#" onclick="return uwGoDetails(this)">View Full Analysis →</a></p>
 {% else %}
 <div class="scorebox"><span>Deal Score</span><b data-out="score">—</b><small data-out="score_label"></small></div>
 <p class="small insight" data-out="score_insight"></p>
@@ -510,6 +546,7 @@
 
 <script>
 window.UW = {"sqft": {{ p.sqft or 0 }}, "pid": {{ p.id }}, "drafts": {{ uw_draft_meta|tojson }},
+  "coli": {{ coli|tojson }},
   "propTaxMo": {{ ((p.tax_amount or 0) / 12)|round(0)|int }},
   "propLoan": {"balance": {{ p.loan_balance or 0 }}, "type": {{ (p.loan_type or '')|tojson }}, "rate": {{ p.loan_rate or 0 }}, "piti": {{ p.loan_piti or 0 }}},
   "fresh": {{ uw_fresh|tojson }}, "current": {{ uw_current|tojson }}, "saved": {{ uw_saved|tojson }},

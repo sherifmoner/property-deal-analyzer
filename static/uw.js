@@ -290,7 +290,12 @@
         if (f.preset && f.preset !== lab) lab += " · " + f.preset;
         if ((f.payment_type === "amortized" || f.payment_type === "principal_only") && amt > 0 && !N(rr.amort_value) && !N(rr.term_value))
           lab += " — Interest only (no term set)"; /* v3.1: priced IO for lack of ANY term — ReiSearch's verbatim label */
-        debtLines.push({ label: lab, payment: Math.round(rp.pay + rp.esc) });
+        /* v3.3: name/sub feed the Underwriting Summary's MONEY OUT per-loan
+           lines (pictured "Subject-To" / "P&I"); mirrors app.py. */
+        var sub = { fixed: "P&I", amortized: "P&I", interest_only: "Interest only",
+                    principal_only: "Principal only" }[f.payment_type || "amortized"] || "P&I";
+        debtLines.push({ label: lab, payment: Math.round(rp.pay + rp.esc),
+                         name: f.preset || f.type || lab, sub: sub });
       }
     });
     /* v1.8a PITI wiring (mirror of app.py): base = typed Monthly Payment, or
@@ -477,6 +482,19 @@
     var hoa = N(s.hoa_mo);
     var opexCats = { "Booking & Service Fees": feesCat, "Utilities": util, "Cleaning Service": cleaning,
       "Maintenance": maint, "Management": mgmtLines, "Taxes, Insurance & HOA": taxesMo + insMo + hoa };
+    /* v3.3: category-total overrides — a set cat_override_* REPLACES the
+       computed category total (ReiSearch: totals editable independent of
+       sub-items; mirrors app.py). Blank/unset = computed. */
+    var opexCatsComputed = Object.assign({}, opexCats);
+    var catManual = {};
+    String(s.cat_manual || "").split(",").forEach(function (x) { if (x) catManual[x] = 1; });
+    [["fees", "Booking & Service Fees"], ["utilities", "Utilities"],
+     ["cleaning", "Cleaning Service"], ["maintenance", "Maintenance"],
+     ["management", "Management"], ["taxes", "Taxes, Insurance & HOA"]
+    ].forEach(function (kv) {
+      var v = s["cat_override_" + kv[0]];
+      if (catManual[kv[0]] && v !== "" && v !== null && v !== undefined) opexCats[kv[1]] = N(v);
+    });
     var opex = 0; Object.keys(opexCats).forEach(function (k) { opex += opexCats[k]; });
     /* v2.3: the old -10 "no utilities/maintenance" penalty is REMOVED — an
        app-side invention contradicted by ReiSearch's measured states (blank
@@ -535,7 +553,7 @@
     out.gross_mo = gross; out.vacancy_loss_mo = vacLoss; out.other_income_mo = other;
     out.cleaning_income_mo = cleaningIncome; out.fees_mo = feesCat; out.booking_fee_mo = bookingFee;
     out.service_fee_mo = serviceFee; out.mgmt_fee_mo = mgmtFee; out.platform_fee_mo = platformFee;
-    out.egi_mo = egi; out.opex_mo = opex; out.opex_cats = opexCats; out.taxes_mo = taxesMo; out.insurance_mo = insMo;
+    out.egi_mo = egi; out.opex_mo = opex; out.opex_cats = opexCats; out.opex_cats_computed = opexCatsComputed; out.taxes_mo = taxesMo; out.insurance_mo = insMo;
     out.taxes_est = taxesEst; out.insurance_est = insEst;
     out.noi_mo = noi; out.cashflow_mo = cf; out.cf_per_room = metrics.cf_per_room;
     out.cash_per_room = roomsN ? cashNeeded / roomsN : null;
@@ -581,6 +599,21 @@
     if (val && opts.indexOf(val) < 0) { var o2 = el("option", "", val); o2.value = val; sel.appendChild(o2); }
     sel.value = val || opts[0];
     return sel;
+  }
+  /* v3.3: segmented toggle (ReiSearch room-row anatomy — Private|Shared and
+     A|B are button pairs, not dropdowns). The value rides a hidden input
+     carrying the SAME class the row readers query (.r-bath / .r-bathgroup),
+     so readRoom() is unchanged. Clicks are handled in the panel delegation. */
+  function segOf(cls, opts, val) {
+    var wrap = el("span", "rseg");
+    var hid = el("input", cls); hid.type = "hidden"; hid.value = val || opts[0];
+    wrap.appendChild(hid);
+    opts.forEach(function (t) {
+      var b = el("button", "r-segbtn" + (t === hid.value ? " on" : ""), t);
+      b.type = "button"; b.dataset.segval = t;
+      wrap.appendChild(b);
+    });
+    return wrap;
   }
 
   function rehabRoomRow(r) {
@@ -804,8 +837,8 @@
   function roomRow(r, idx) {
     var d = el("div", "rrow r15"); d.dataset.kind = "rooms_rows";
     d.appendChild(el("span", "r-roomno", "Bed " + (idx + 1)));
-    d.appendChild(selOf("r-bath", ["Private", "Shared"], r.bath || "Shared"));
-    d.appendChild(selOf("r-bathgroup", ["A", "B"], r.bath_group || "A"));
+    d.appendChild(segOf("r-bath", ["Private", "Shared"], r.bath || "Shared"));
+    d.appendChild(segOf("r-bathgroup", ["A", "B"], r.bath_group || "A"));
     d.appendChild(numInput("r-rentwk", r.rent_wk));
     d.appendChild(numInput("r-rentmo", r.rent_mo));
     var vw = el("span", "r-vacwrap");
@@ -816,7 +849,7 @@
     var ew = numInput("r-effwk", ""); ew.readOnly = true; ew.tabIndex = -1; d.appendChild(ew);
     d.appendChild(el("span", "r-effmo", "$0"));
     var am = el("span", "r-amenwrap");
-    var ab = el("button", "btn sm sec r-amen", "+ Amenities"); ab.type = "button";
+    var ab = el("button", "btn sm sec r-amen", "⊕"); ab.type = "button"; ab.title = "Amenities";
     var ai = numInput("r-amenmo", r.amenity_mo || 0); ai.placeholder = "$/mo";
     if (!(N(r.amenity_mo) > 0)) ai.style.display = "none";
     am.appendChild(ab); am.appendChild(ai);
@@ -952,15 +985,32 @@
       score_insight: r.insight || "",
       payback_full: r.payback_yrs ? (r.payback_yrs + " yrs") : "—",
       cf_bar_legend: (function () {
+        /* v3.3: ReiSearch's pictured legend is a THREE-way split of revenue
+           (Senisa: "Expenses 33% · Loan Payments 35% · Cash Flow 31%") — the
+           old text merged expenses+debt into one "Expenses" figure. */
         if (!r.egi_mo) return "";
-        var ep = Math.round((r.opex_mo + r.debt_service_mo) / r.egi_mo * 100);
-        return "Expenses " + ep + "% · Cash Flow " + (100 - ep) + "% of revenue";
+        var ep = Math.round((r.opex_mo || 0) / r.egi_mo * 100);
+        var dp = Math.round((r.debt_service_mo || 0) / r.egi_mo * 100);
+        var cp = Math.round((r.cashflow_mo || 0) / r.egi_mo * 100);
+        return "Expenses " + ep + "% · Loan Payments " + dp + "% · Cash Flow " + cp + "%";
       })(),
       rev_other_plain: M(N(s.pet_fees_mo) + N(s.parking_mo) + N(s.misc_mo)),
       expenses_total: M(r.expenses_total || 0), sale_price_out: M(r.sale_price || 0),
       blended_rate: r.egi_mo ? (((r.booking_fee_mo + r.service_fee_mo) / r.egi_mo * 100).toFixed(1) + "%") : "—",
-      payback: r.payback_yrs ? ("Payback " + r.payback_yrs + " yrs") : "",
-      breakeven_line: "Break-even occupancy: " + PC(r.breakeven_pct) + " — that share of gross rent must be collected to cover expenses + loan payments.",
+      payback: r.payback_yrs ? ("Payback " + r.payback_yrs + " yrs") : "Payback --",
+      blended_line: r.egi_mo ? ("PadSplit blended rate " + ((r.booking_fee_mo + r.service_fee_mo) / r.egi_mo * 100).toFixed(1) + "% of effective gross income") : "",
+      breakeven_line: (function () {
+        /* v3.3: ReiSearch's pictured sentence — "Breakeven at 62% occupancy
+           (~5 of 8 rooms filled)." Percent is the same (opex+debt)/gross the
+           score factor uses, rounded to a whole number; rooms filled is that
+           share of the room count, rounded. */
+        if (r.breakeven_pct === null || r.breakeven_pct === undefined) return "";
+        var be = Math.round(r.breakeven_pct);
+        var roomsN2 = (s.rooms_rows || []).length;
+        if (strat === "Co-Living" && roomsN2)
+          return "Breakeven at " + be + "% occupancy (~" + Math.round(r.breakeven_pct / 100 * roomsN2) + " of " + roomsN2 + " rooms filled).";
+        return "Breakeven at " + be + "% occupancy.";
+      })(),
       holding_desc: (s.holding_period || 0) + " " + (s.holding_unit || "Months") + " × " + M(N(s.holding_mo)) + "/mo ≈ " + M(r.holding_cost) + " total holding costs",
       md_monthly_payment_label: r.md_payment_mo ? (M(r.md_payment_mo) + "/mo") : "",
       profit_full: strat === "Fix & Flip" ? (M(r.profit) + (r.margin_pct != null ? " (" + PC(r.margin_pct) + " of sale price)" : "") + (hMonthsOf() === 0 ? " · no holding period set" : "")) : "",
@@ -996,6 +1046,84 @@
     panel.querySelectorAll("[data-outyr]").forEach(function (elm) {
       var v = rawFor(elm.dataset.outyr); elm.textContent = M((v || 0) * 12);
     });
+    /* v3.3: category-total inputs — the header total IS an input (ReiSearch
+       anatomy). While a category is not under manual control its input is a
+       synced display of the computed total; once the user types in it, the
+       cat_manual flag (set by the input handler) makes the typed value the
+       category total. The year figure follows the EFFECTIVE total. */
+    var manSet = {};
+    String(s.cat_manual || "").split(",").forEach(function (x) { if (x) manSet[x] = 1; });
+    panel.querySelectorAll("input.catover").forEach(function (inp) {
+      var cat = inp.dataset.catname;
+      var eff = rawFor("cat_" + inp.dataset.catkey) || 0;
+      /* the override input's placeholder is the computed total (what blank
+         means); the header <b> and the year figure show the EFFECTIVE total. */
+      var comp = (r.opex_cats_computed || {})[cat];
+      if (comp !== undefined) inp.placeholder = M(comp);
+      inp.classList.toggle("ovon", !!manSet[inp.dataset.catkey]);
+      var yr = panel.querySelector('[data-catyr="' + cat + '"]');
+      if (yr) yr.textContent = M(eff * 12);
+    });
+    /* v3.3: the main-column Underwriting Summary block (data-outsum) —
+       ReiSearch's pictured anatomy. Month|Year scales the monthly money
+       figures x12 (flag F3 in the v33 log: Year semantics unmeasured;
+       Year 1 Returns is annual in both modes, as pictured). */
+    var sumBox = panel.querySelector(".uwbottom");
+    if (sumBox) {
+      var scale = panel.dataset.sumMode === "yr" ? 12 : 1;
+      var roomsN3 = strat === "Co-Living" ? ((s.rooms_rows || []).length || (r.rooms || 0)) : (r.rooms || 0);
+      var outTotal = (r.opex_mo || 0) + (r.debt_service_mo || 0);
+      function neg(v) { return v ? ("−" + M(v * scale)) : M(0); }
+      var sumVals = {
+        sum_cash_needed: M((r.cash_needed || 0) * scale),
+        sum_cash_per_room: roomsN3 ? M((r.cash_needed || 0) / roomsN3 * scale) + " per room" : "",
+        sum_cf: M((r.cashflow_mo || 0) * scale),
+        sum_cf_per_room: roomsN3 ? M((r.cashflow_mo || 0) / roomsN3 * scale) + " per room" : "",
+        sum_dscr_note: (r.dscr !== null && r.dscr !== undefined && r.dscr >= 1) ? "Income covers the debt" : "",
+        sum_rev_head: M((r.egi_mo || 0) * scale),
+        sum_gross: M((r.gross_mo || 0) * scale),
+        sum_vac: neg(r.vacancy_loss_mo || 0),
+        sum_other: M((r.other_income_mo || 0) * scale),
+        sum_out_head: M(outTotal * scale),
+        sum_opex: neg(r.opex_mo || 0),
+        sum_ncf: M((r.cashflow_mo || 0) * scale),
+        sum_ncf_sub: M((r.egi_mo || 0) * scale) + " in − " + M(outTotal * scale) + " out",
+        sum_outlay_total: M(r.cash_needed || 0),
+        sum_y1_cf: M(r.cashflow_y1 || 0),
+        sum_y1_paydown: M(r.paydown_y1 || 0),
+        sum_y1_total: M(r.total_return_y1 || 0),
+        sum_cap: PC(r.cap_rate_pct),
+        sum_strip_rooms: roomsN3 ? String(roomsN3) : "—",
+        sum_strip_avg: roomsN3 ? M((r.gross_mo || 0) / roomsN3) : "—",
+        sum_strip_cf: roomsN3 ? M((r.cashflow_mo || 0) / roomsN3) : "—",
+        sum_strip_inv: roomsN3 ? M((r.cash_needed || 0) / roomsN3) : "—"
+      };
+      sumBox.querySelectorAll("[data-outsum]").forEach(function (elm) {
+        var k = elm.dataset.outsum;
+        if (k in sumVals) elm.textContent = sumVals[k];
+        var row = elm.closest("[data-hz]");
+        if (row) row.style.display = N(rawFor(row.dataset.hz)) ? "" : "none";
+      });
+      var ll = sumBox.querySelector("[data-loanlines]");
+      if (ll) {
+        var lh = (r.debt_lines || []).map(function (l) {
+          return '<div class="srow loanline"><span class="lname">' + l.name + '<small>' + l.sub + '</small></span>' +
+            '<span class="pencil" data-goto="funding" onclick="return uwGoto(this,\'funding\')">✎</span><b>' + neg(l.payment) + '</b></div>';
+        }).join("");
+        if (N(r.md_payment_mo)) lh += '<div class="srow loanline"><span class="lname">Existing Mortgage<small>PITI</small></span>' +
+          '<span class="pencil" data-goto="funding" onclick="return uwGoto(this,\'funding\')">✎</span><b>' + neg(r.md_payment_mo) + '</b></div>';
+        ll.innerHTML = lh;
+      }
+      var ol = sumBox.querySelector("[data-outlay]");
+      if (ol) {
+        if (N(r.cash_needed) > 0) {
+          var oh = "";
+          if (N(r.points_fees)) oh += '<div class="srow"><span>Points &amp; fees</span><b>' + M(r.points_fees) + '</b></div>';
+          if (N(r.entry_fee)) oh += '<div class="srow"><span>Entry fee</span><b>' + M(r.entry_fee) + '</b></div>';
+          ol.innerHTML = oh;
+        } else ol.innerHTML = '<p class="small muted" style="margin:0">No cash outlay entered yet.</p>';
+      }
+    }
     /* sidebar scenario chips (Co-Living Overview) */
     var scenKey = panel.dataset.scenKey || "Base Case (0%)";
     var sc = (r.scenarios || {})[scenKey] || (r.scenarios || {})["Base Case (0%)"];
@@ -1024,6 +1152,15 @@
     var ncfBase = sc ? sc.net : r.cashflow_mo;
     panel.querySelectorAll("[data-ncfdisp]").forEach(function (elm) {
       elm.textContent = M(panel.dataset.ncfMode === "yr" ? (ncfBase || 0) * 12 : ncfBase);
+    });
+    /* v3.3: sidebar NCF card subline ("$20,494 annually" in the picture) and
+       the Deal Score ring fill (score/100 of the circle, ReiSearch anatomy). */
+    panel.querySelectorAll("[data-ncfannual]").forEach(function (elm) {
+      elm.textContent = panel.dataset.ncfMode === "yr" ? (M(ncfBase) + " monthly") : (M((ncfBase || 0) * 12) + " annually");
+    });
+    panel.querySelectorAll(".scorering").forEach(function (elm) {
+      var sc2 = (r.score === null || r.score === undefined) ? 0 : Math.max(0, Math.min(100, r.score));
+      elm.style.background = "conic-gradient(#2563eb " + sc2 + "%, #e2e8f0 " + sc2 + "%)";
     });
     panel.querySelectorAll("[data-ncfunit]").forEach(function (elm) {
       elm.textContent = panel.dataset.ncfMode === "yr" ? "/yr" : "/mo";
@@ -1445,6 +1582,44 @@
   }
 
   /* ---------------- global actions (called from inline onclick) ---------------- */
+  window.uwGoto = function (btn, sec) {
+    /* v3.3: summary pencil — open the owning section and scroll to it */
+    var panel = btn.closest(".uw-panel");
+    var d = panel ? panel.querySelector('details[data-sec="' + sec + '"]') : null;
+    if (d) { d.open = true; d.scrollIntoView({ behavior: "smooth", block: "start" }); }
+    return false;
+  };
+  window.uwSumMode = function (btn, mode) {
+    /* v3.3: Underwriting Summary Month|Year toggle (see flag F3) */
+    var panel = btn.closest(".uw-panel"); if (!panel) return false;
+    panel.dataset.sumMode = mode;
+    panel.querySelectorAll("[data-summode]").forEach(function (b) { b.classList.toggle("on", b.dataset.summode === mode); });
+    recalc(panel);
+    return false;
+  };
+  window.uwBasis = function (btn, val) {
+    /* v3.3: Property Management Fee Gross|Net segmented control */
+    var panel = btn.closest(".uw-panel"); if (!panel) return false;
+    var hid = panel.querySelector('[name="mgmt_fee_basis"]');
+    if (hid) hid.value = val;
+    btn.parentNode.querySelectorAll(".segbtn").forEach(function (b) { b.classList.toggle("on", b === btn); });
+    recalc(panel);
+    return false;
+  };
+  window.uwAutoAssign = function (btn) {
+    /* v3.3: ReiSearch's "Auto assign" — re-apply the app's standard bath-group
+       pattern (A,A,B,B,...) to every room row. */
+    var panel = btn.closest(".uw-panel"); if (!panel) return false;
+    panel.querySelectorAll('[data-rows="rooms_rows"] .rrow').forEach(function (row, i) {
+      var g = (Math.floor(i / 2) % 2 === 0) ? "A" : "B";
+      var hid = row.querySelector(".r-bathgroup"); if (!hid) return;
+      hid.value = g;
+      var wrap = hid.closest(".rseg");
+      if (wrap) wrap.querySelectorAll(".r-segbtn").forEach(function (b) { b.classList.toggle("on", b.dataset.segval === g); });
+    });
+    recalc(panel);
+    return false;
+  };
   window.uwSeg = function (strat) {
     document.querySelectorAll(".uw-panel").forEach(function (p) { p.style.display = p.dataset.strategy === strat ? "" : "none"; });
     document.querySelectorAll("#segbar .seg").forEach(function (b) { b.classList.toggle("on", b.dataset.seg === strat); });
@@ -1730,6 +1905,20 @@
       var strat = panel.dataset.strategy;
       if (UW.current && UW.current[strat]) applyState(panel, UW.current[strat]);
       else recalc(panel);
+      /* v3.3 (Phase 3): area room-rent provenance under Operating Revenue —
+         the Tier-B benchmark the fresh prefill came from (methodology doc
+         2026-11-04 §4.6), or the honest Not-found line. Static per pull. */
+      var cn = panel.querySelector("[data-coli-note]");
+      if (cn) {
+        var c = UW.coli;
+        if (c && c.weekly_per_room) {
+          cn.textContent = "$" + c.weekly_per_room + "/wk per room — median of " + c.n + " area rental comps (HomeHarvest, pulled " + c.date + "). " +
+            "Tier-B estimate: derived from whole-house rents (rent ÷ bedrooms), typically below PadSplit listing rents." +
+            (c.n < 5 ? " Thin data — fewer than 5 comps." : "") + " Edit any room to override.";
+        } else {
+          cn.textContent = "Area room rent: Not found — enter per-room rent. (Pull rental comps to auto-price rooms from the area median.)";
+        }
+      }
       /* localStorage backup: only when the server has no draft for this strategy */
       if (!(UW.drafts || {})[strat]) {
         try {
@@ -1745,6 +1934,18 @@
            interaction late because readState ran before writeOutputs synced them. */
         var t = e.target;
         if (t && t.classList) {
+          if (t.classList.contains("catover")) {
+            /* v3.3: typing in a category total = taking manual control of
+               that category; clearing it hands control back to the sub-items. */
+            var manEl = panel.querySelector('[name="cat_manual"]');
+            if (manEl) {
+              var keys = manEl.value ? manEl.value.split(",").filter(Boolean) : [];
+              var ix = keys.indexOf(t.dataset.catkey);
+              if (t.value === "" && ix >= 0) keys.splice(ix, 1);
+              else if (t.value !== "" && ix < 0) keys.push(t.dataset.catkey);
+              manEl.value = keys.join(",");
+            }
+          }
           if (t.classList.contains("r-rentwk")) {
             var row = t.closest(".rrow"), mo = row && row.querySelector(".r-rentmo");
             if (mo) mo.value = Math.round(N(t.value) * 52 / 12 * 100) / 100;
@@ -1815,6 +2016,15 @@
         if (vs) {
           var inp = vs.parentNode.querySelector(".r-vac");
           inp.value = clamp(N(inp.value) + N(vs.dataset.vacstep), 0, 100);
+          recalc(panel); return;
+        }
+        var sg = t.closest ? t.closest(".r-segbtn") : null;
+        if (sg) {
+          /* v3.3: room-row segmented toggles (bath type / bath group) */
+          var segW2 = sg.closest(".rseg");
+          var hid2 = segW2 ? segW2.querySelector("input[type='hidden']") : null;
+          if (hid2) hid2.value = sg.dataset.segval;
+          segW2.querySelectorAll(".r-segbtn").forEach(function (b) { b.classList.toggle("on", b === sg); });
           recalc(panel); return;
         }
         var ab = t.closest ? t.closest(".r-amen") : null;
