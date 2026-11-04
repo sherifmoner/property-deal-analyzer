@@ -1842,10 +1842,23 @@ def _is_unreachable_err(e):
 # classified failure + a sanitized error-body snippet) that is ALWAYS
 # written to the server log as the pool detail, and the pull's banner
 # names only sources whose rows the merge actually STORED. Call budget
-# per pull: ReefAPI <= 5 pages + Redfin 2 + Sabri 1 sold, Sabri 1 rent.
-# Results persist in the comps table, so the pool is only walked on a
-# fresh pull. With NO key configured, nothing in this section ever runs
-# and the pull is the pre-RapidAPI one.
+# per pull: ReefAPI <= 5 pages + Redfin 2 + Sabri 1 sold, Sabri 1 rent
+# (v44 raises the wide-window budget — see below). Results persist in
+# the comps table, so the pool is only walked on a fresh pull. With NO
+# key configured, nothing in this section ever runs and the pull is
+# the pre-RapidAPI one.
+# v44 — wider pull windows + deeper nets (the fixture-street hunt):
+# the pull form offers Last 2 years / Last 3 years / All time beside
+# Last year (the v35 view filter's exact list), and past_days plumbs
+# through every adapter: the client horizon stays max(past_days, 1095)
+# and follows past_days beyond it (All time filters nothing); Redfin's
+# soldWithin follows the window (floor 365 — every pre-v44 window's
+# value — cap 1095); ReefAPI's page cap is 5 at Last year and 8 at
+# wider windows; Sabri's top-up pages 1..3 and sends sold_date-min on
+# finite windows, retrying a rejected page once without it (the
+# fallback is noted on the source's outcome record). Worst-case call
+# budget for one wide pull with a thin union: ReefAPI 8 + Redfin 2 +
+# Sabri 3 = 13 sold calls, plus Sabri 1 rent.
 RAPIDAPI_REEF_HOST = "realtor-com-property-data-api.p.rapidapi.com"
 RAPIDAPI_REDFIN_HOST = "redfin-com-data.p.rapidapi.com"
 RAPIDAPI_SABRI_HOST = "realtor16.p.rapidapi.com"
@@ -1866,6 +1879,13 @@ RAPIDAPI_REDFIN_AC_PATH = "/properties/auto-complete"
 RAPIDAPI_PAGE_STOP = 30
 RAPIDAPI_UNION_RICH = 25
 RAPIDAPI_REEF_PAGES = 5
+# v44: wider windows dig deeper — ReefAPI's page cap rises to
+# RAPIDAPI_REEF_PAGES_WIDE when the pull window exceeds Last year, and
+# Sabri's top-up walks up to RAPIDAPI_SABRI_PAGES pages of
+# RAPIDAPI_SABRI_PAGE_SIZE (the playground-observed page size).
+RAPIDAPI_REEF_PAGES_WIDE = 8
+RAPIDAPI_SABRI_PAGES = 3
+RAPIDAPI_SABRI_PAGE_SIZE = 50
 
 def _rapidapi_key():
     """RapidAPI key: env RAPIDAPI_API_KEY first, then the rapidapi_key
@@ -2118,6 +2138,23 @@ def _rapi_fail_detail(err):
     snip = _rapi_err_snippet(err)
     return f"{reason}: {snip}" if snip else reason
 
+# Adapter side-notes (v44): an adapter whose (rows, err, label) triple
+# cannot carry a diagnostic — e.g. Sabri's sold_date-min fallback —
+# leaves one here, keyed by its source key; _rapidapi_sold_frame takes
+# it (once) into the source's outcome record. Thread-local: concurrent
+# pulls can never read each other's notes.
+_RAPI_NOTES = threading.local()
+
+def _rapi_note(key, text):
+    notes = getattr(_RAPI_NOTES, "notes", None)
+    if notes is None:
+        notes = _RAPI_NOTES.notes = {}
+    notes[key] = text
+
+def _rapi_take_note(key):
+    notes = getattr(_RAPI_NOTES, "notes", None) or {}
+    return notes.pop(key, None)
+
 def _rapi_count_in_gate(rows, prop, radius_mi):
     """How many normalized rows the sold MERGE would accept (store
     new, or update in place as a duplicate) — the SHARED acceptance
@@ -2172,19 +2209,22 @@ def _src_reefapi_sold(prop, past_days, radius_mi=1.0):
     one page of the 100 newest sales in the whole CITY — held nothing
     inside a 1-mile gate on the live pull: ZIP narrows the net
     (playground: meta.total 3,484 for the ZIP vs 3,535 city-wide) and
-    the page walk (offsets 0..400, limit 100) digs past the newest
+    the page walk (pages of 100) digs past the newest
     cluster. After each page the accumulated rows are counted against
     BOTH gates (distance via _rapi_count_in_gate on horizon-filtered
     rows); the walk stops at RAPIDAPI_PAGE_STOP in-gate rows, a short
-    page, meta.total exhaustion, or RAPIDAPI_REEF_PAGES pages. A page
-    error after page 1 keeps the accumulated rows; on page 1 it is the
-    source's failure. A full street address as location does NOT
-    narrow (playground-verified — it returns generic city results), so
-    it is never sent; no ZIP falls back to "City, ST"."""
+    page, meta.total exhaustion, or the page cap — RAPIDAPI_REEF_PAGES
+    for a Last-year pull, RAPIDAPI_REEF_PAGES_WIDE when the window is
+    wider (v44: older fixture-street sales sit deeper in the walk).
+    A page error after page 1 keeps the accumulated rows; on page 1
+    it is the source's failure. A full street address as location
+    does NOT narrow (playground-verified — it returns generic city
+    results), so it is never sent; no ZIP falls back to "City, ST"."""
     zipc = (prop.get("zip") if hasattr(prop, "get") else prop["zip"]) or ""
     loc = str(zipc).strip() or f"{prop['city']}, {prop['state']}"
     rows = []
-    for page in range(RAPIDAPI_REEF_PAGES):
+    max_pages = RAPIDAPI_REEF_PAGES_WIDE if past_days > 365 else RAPIDAPI_REEF_PAGES
+    for page in range(max_pages):
         body = {"location": loc, "sort": "newest", "limit": 100,
                 "offset": page * 100}
         data, err = _rapidapi_post(RAPIDAPI_REEF_HOST, "/realtor/v1/sold", body)
@@ -2205,8 +2245,14 @@ def _src_redfin_sold(prop, past_days, radius_mi=1.0):
     rid, err = _redfin_region_id(prop)
     if err is not None: return [], err, RAPIDAPI_SRC_REDFIN
     if not rid: return [], None, RAPIDAPI_SRC_REDFIN
+    # soldWithin follows the pull window (v44): floored at 365 — the
+    # value every pre-v44 window used, so existing windows behave
+    # exactly as before — and capped at 1095, the deepest the client
+    # horizon can use; an All-time pull asks Redfin for its deepest
+    # 3 years and the (unbounded) client horizon keeps what returns.
     data, err = _rapidapi_get(RAPIDAPI_REDFIN_HOST, "/properties/search-sold",
-                              {"regionId": rid, "limit": 100, "soldWithin": 365})
+                              {"regionId": rid, "limit": 100,
+                               "soldWithin": min(max(past_days, 365), 1095)})
     if err is not None: return [], err, RAPIDAPI_SRC_REDFIN
     items = data.get("data") if isinstance(data, dict) else None
     rows = _rapi_rows(items if isinstance(items, list) else [], _redfin_item_to_row)
@@ -2217,12 +2263,48 @@ def _src_sabri_forsold(prop, past_days, radius_mi=1.0):
     # latitude/longitude in full, and its live 400 validation body
     # keys the complaint "latitude" — the app sent lat/lon, which the
     # validator does not recognize as the required field.
-    data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forsold/coordinates",
-                              {"latitude": prop["lat"], "longitude": prop["lon"],
-                               "radius": _sabri_radius(radius_mi), "page": 1})
-    if err is not None: return [], err, RAPIDAPI_SRC_SABRI
-    items = data.get("properties") if isinstance(data, dict) else None
-    rows = _rapi_rows(items if isinstance(items, list) else [], _sabri_item_to_row)
+    # v44: the top-up PAGES (1..RAPIDAPI_SABRI_PAGES of ~50): one page
+    # of area results rarely reaches the subject's own street (the
+    # v43 live top-up's single page held none of the fixture-street
+    # sales). The walk stops on a short page, on the API's reported
+    # total, or once Sabri's own accumulated rows reach
+    # RAPIDAPI_UNION_RICH (the union is then rich by definition). On
+    # finite windows it also sends sold_date-min at the same horizon
+    # start the client filter applies — the playground's parameter
+    # list names it, so the server's net and the client's agree. That
+    # parameter is playground-listed but not live-verified: if a call
+    # carrying it errors (any HTTP error), the page is retried ONCE
+    # without it, later pages go without it directly, and the
+    # fallback is noted on the source's outcome record (via
+    # _rapi_note) — self-healing, never silent. A page-1 failure
+    # (after any retry) is the source's failure; a later page's
+    # failure keeps the accumulated rows.
+    rows = []
+    date_min = None if past_days >= 36500 else _rapi_horizon_cutoff(past_days)
+    use_date_min = date_min is not None
+    for page in range(1, RAPIDAPI_SABRI_PAGES + 1):
+        params = {"latitude": prop["lat"], "longitude": prop["lon"],
+                  "radius": _sabri_radius(radius_mi), "page": page}
+        if use_date_min: params["sold_date-min"] = date_min
+        data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forsold/coordinates", params)
+        if err is not None and use_date_min:
+            _rapi_note("sabri_forsold",
+                       f"sold_date-min rejected ({_rapi_fail_reason(err)})"
+                       " — page retried without it")
+            use_date_min = False
+            params.pop("sold_date-min")
+            data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forsold/coordinates", params)
+        if err is not None:
+            if page == 1: return [], err, RAPIDAPI_SRC_SABRI
+            break
+        items = data.get("properties") if isinstance(data, dict) else None
+        items = items if isinstance(items, list) else []
+        rows.extend(_rapi_rows(items, _sabri_item_to_row))
+        total = data.get("total") if isinstance(data, dict) else None
+        if len(items) < RAPIDAPI_SABRI_PAGE_SIZE: break
+        if isinstance(total, (int, float)) and len(rows) >= total: break
+        if _rapi_count_in_gate(_rapi_in_horizon(rows, past_days),
+                               prop, radius_mi) >= RAPIDAPI_UNION_RICH: break
     return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_SABRI
 
 def _src_sabri_forrent(prop, past_days, radius_mi=1.0):
@@ -2266,24 +2348,28 @@ def _rapi_count_in_gate_rent(rows, prop, radius_mi):
     full acceptance test."""
     return sum(1 for r in rows or [] if _rent_row_gate(r, prop, radius_mi)[0])
 
-def _rapi_outcome(key, rows, err, label, prop, radius_mi, rent=False):
+def _rapi_outcome(key, rows, err, label, prop, radius_mi, rent=False, note=None):
     """The outcome record for one CALLED source (v42): what it did,
     in numbers. 'log' is the pool-detail text (classified reason + the
     sanitized error-body snippet on failure); 'reason' is the clean
     banner form. In-gate counts use the shared acceptance test for
     the frame's kind (sold: _rapi_count_in_gate; rent:
-    _rapi_count_in_gate_rent — v43) over the adapter's served rows."""
+    _rapi_count_in_gate_rent — v43) over the adapter's served rows.
+    A 'note' (v44 — an adapter side-note taken via _rapi_take_note,
+    e.g. Sabri's sold_date-min fallback) is appended to the log text
+    only; the banner keeps its clean forms."""
     name = _RAPIDAPI_SOURCE_NAMES[key]
+    suffix = f" [{note}]" if note else ""
     if rows:
         in_gate = (_rapi_count_in_gate_rent(rows, prop, radius_mi) if rent
                    else _rapi_count_in_gate(rows, prop, radius_mi))
         return {"name": name, "label": label, "served": True,
                 "rows": len(rows), "in_gate": in_gate, "reason": None,
-                "log": f"{name} — served {len(rows)} rows, {in_gate} in-gate"}
+                "log": f"{name} — served {len(rows)} rows, {in_gate} in-gate" + suffix}
     reason = _rapi_fail_reason(err)
     return {"name": name, "label": None, "served": False, "rows": 0,
             "in_gate": 0, "reason": reason,
-            "log": f"{name} — {_rapi_fail_detail(err)}"}
+            "log": f"{name} — {_rapi_fail_detail(err)}" + suffix}
 
 def _rapidapi_sold_frame(prop, past_days=365, radius_mi=1.0):
     """The RapidAPI sold side for one pull (v42): a sequential UNION
@@ -2300,7 +2386,8 @@ def _rapidapi_sold_frame(prop, past_days=365, radius_mi=1.0):
     for key in RAPIDAPI_SOLD_SOURCES:
         if frames and in_gate_total >= RAPIDAPI_UNION_RICH: break
         rows, err, label = _rapi_call_source(key, prop, past_days, radius_mi)
-        oc = _rapi_outcome(key, rows, err, label, prop, radius_mi)
+        oc = _rapi_outcome(key, rows, err, label, prop, radius_mi,
+                           note=_rapi_take_note(key))
         outcomes.append(oc)
         if err is not None: last_err = err
         if rows:
@@ -4763,7 +4850,7 @@ def do_pull_comps(pid):
     get_prop(pid)
     radius = fnum(request.form.get("radius_custom"), None) or fnum(request.form.get("radius"), 1.0) or 1.0
     days = int(fnum(request.form.get("window_days"), 365) or 365)
-    days = days if days in (30, 90, 180, 365) else 365
+    days = days if days in (30, 90, 180, 365, 730, 1095, 36500) else 365
     job_comps(pid, radius, days)
     flash(f"Pulling comps — sold (last {days} days) + rentals + listing photos within {radius:g} mi. "
           "This usually takes about a minute; the results will appear here automatically.", "info")
