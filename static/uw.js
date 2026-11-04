@@ -264,6 +264,10 @@
     var funded = 0, cashEquity = 0, debtAmt = 0, debtRows = 0, paydownY1 = 0, pointsFees = 0;
     var carryMo = 0, pitiIncluded = false; /* v2.1 (mirror of app.py) */
     var debtLines = [];
+    /* v3.7 (G14, mirror of app.py): the MD block's Principal is the
+       existing loan's paydown source when present; a Subject-To card for
+       the same loan then books NO card paydown (counted once, from MD). */
+    var mdPrin = strat !== "Fix & Flip" ? N(s.md_piti_principal) : 0;
     (s.funding || []).forEach(function (f) {
       var amt = N(f.amount); funded += amt;
       /* v2.8 (A8): Amount-only cards (Private Money Partner / JV Equity /
@@ -285,7 +289,7 @@
         if (rp.esc > 0 || (f.payment_type === "fixed" && rp.pay > 0)) pitiIncluded = true;
         if (f.payment_type === "fixed") carryMo += rp.pay + rp.esc;
         else carryMo += amt * N(f.rate) / 100 / 12 + rp.esc;
-        paydownY1 += paydownY1For(rr);
+        if (!(f.type === "Subject-To" && mdPrin > 0)) paydownY1 += paydownY1For(rr); /* v3.7 G14 */
         var lab = f.loan_type || f.type || "Loan";
         if (f.preset && f.preset !== lab) lab += " · " + f.preset;
         if ((f.payment_type === "amortized" || f.payment_type === "principal_only") && amt > 0 && !N(rr.amort_value) && !N(rr.term_value))
@@ -589,6 +593,9 @@
     return "loan";
   }
   var LOAN_TYPES = ["FHA", "Conventional", "DSCR", "Hard Money", "Private Money", "Seller Financing", "VA", "USDA", "Bridge", "HELOC", "Cash", "Other"];
+  /* v3.7 (G11): ReiSearch's Subject-To card carries its own Existing Loan
+     Type list — exactly these four (pass 2026-11-03 line 36). */
+  var SUBTO_LOAN_TYPES = ["HELOC", "Conventional", "FHA", "VA"];
   var PTYPES = [["amortized", "Amortized"], ["interest_only", "Interest Only"], ["principal_only", "Principal Only"], ["fixed", "Fixed Payment"]];
   function el(tag, cls, html) { var e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
   function numInput(cls, val) { var i = el("input", cls); i.type = "number"; i.step = "any"; i.value = (val === undefined || val === null) ? "" : val; return i; }
@@ -747,7 +754,7 @@
     d.appendChild(head);
     var grid = el("div", "fgrid");
     function field(lab, node, cls) { var w = el("div", "ffield" + (cls ? " " + cls : "")); w.appendChild(el("label", "", lab)); w.appendChild(node); return w; }
-    grid.appendChild(field("Existing Loan Type", selOf("f-loantype", LOAN_TYPES, f.loan_type || f.type || "Conventional")));
+    grid.appendChild(field("Existing Loan Type", selOf("f-loantype", f.type === "Subject-To" ? SUBTO_LOAN_TYPES : LOAN_TYPES, f.loan_type || f.type || "Conventional")));
     grid.appendChild(field("Loan Balance $", numInput("f-amt", f.amount)));
     var useW = el("div", "fuse");
     useW.appendChild(numInput("f-pct", f.pct));
@@ -770,8 +777,19 @@
     grid.appendChild(field("Amortization Term", termControl("f-amortval", "f-amortunit", aVal, aUnit), "fterm-field"));
     grid.appendChild(field("Points %", numInput("f-points", f.points)));
     grid.appendChild(field("Fees $", numInput("f-fees", f.fees)));
-    grid.appendChild(field("Taxes $/mo (escrow)", numInput("f-taxes", f.taxes_mo)));
-    grid.appendChild(field("Insurance $/mo (escrow)", numInput("f-ins", f.insurance_mo)));
+    /* v3.7 (G10): ReiSearch's generic card anatomy has NO Taxes/Insurance
+       fields — they exist on the Subject-To card only (pass 2026-11-03
+       lines 24 vs 36). On other cards any stored escrow rides as hidden
+       inputs, so readCard keeps feeding the identical values into the
+       math and no saved draft's totals move; the values simply stop
+       being editable there, exactly as ReiSearch presents them. */
+    if (f.type === "Subject-To") {
+      grid.appendChild(field("Taxes $/mo (escrow)", numInput("f-taxes", f.taxes_mo)));
+      grid.appendChild(field("Insurance $/mo (escrow)", numInput("f-ins", f.insurance_mo)));
+    } else {
+      var ht = numInput("f-taxes", f.taxes_mo); ht.type = "hidden"; d.appendChild(ht);
+      var hi = numInput("f-ins", f.insurance_mo); hi.type = "hidden"; d.appendChild(hi);
+    }
     d.appendChild(grid);
     var seg = el("div", "fseg");
     seg.appendChild(el("span", "fseg-lab", "Payment Type"));

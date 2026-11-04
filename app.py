@@ -853,6 +853,10 @@ def compute_underwriting(strategy, raw_inp, prop):
     holding_total = holding_mo * h_months
     # funding stack (v1.5 cards: payment type per card + points/fees into financing costs)
     stack = inp.get("funding_stack") or []
+    # v3.7 (G14): the MD block's Principal, read up front — it is the
+    # paydown source for the existing loan when present (see the funding
+    # loop). Fix & Flip has no MD block.
+    _md_prin = (fnum(inp.get("md_piti_principal"), 0) or 0) if strategy != "Fix & Flip" else 0.0
     funded = cash_equity = debt_amt = debt_rows_service = 0.0
     paydown_y1 = 0.0
     points_fees = 0.0
@@ -887,7 +891,15 @@ def compute_underwriting(strategy, raw_inp, prop):
                     s["amort_unit"] = s.get("term_unit") or "Years"
             pay, esc = _row_payment(s)
             debt_rows_service += pay + esc
-            paydown_y1 += _paydown_y1(s)
+            # v3.7 (G14, loan-mechanics §19): when the Existing Mortgage
+            # Data block carries a Principal figure, THAT is the existing
+            # loan's paydown source — a Subject-To card for the same loan
+            # must not ALSO book its fixed-payment principal split, or the
+            # same principal is counted twice (proven: Senisa card + MD
+            # Principal $1,228/mo read $29,472 = 2 x ReiSearch's pictured
+            # $14,736). Other cards' paydown is separate debt and counts.
+            if not (s.get("type") == "Subject-To" and _md_prin > 0):
+                paydown_y1 += _paydown_y1(s)
             if esc > 0 or (s.get("payment_type") == "fixed" and pay > 0): piti_included = True
             if s.get("payment_type") == "fixed": carry_mo += pay + esc
             else: carry_mo += amt * (fnum(s.get("rate"), 0) or 0) / 100 / 12 + esc
