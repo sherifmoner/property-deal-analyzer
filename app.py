@@ -1511,7 +1511,17 @@ def _source_label(url, rent=False):
     if site is None: return "HomeHarvest (rentals)" if rent else "HomeHarvest"
     return f"HomeHarvest ({site} rentals)" if rent else f"HomeHarvest ({site})"
 
-_UNIT_RE = re.compile(r"(?:unit|apt|apartment|suite|#)\s*[-#]?\s*([a-z0-9]+)", re.I)
+_UNIT_RE = re.compile(r"(?:apartment|apt|unit|suite|ste|#)\s*[-#]?\s*([a-z0-9]+)", re.I)
+
+def _unit_plausible(tok):
+    """Whether a token captured after a unit keyword plausibly IS a
+    unit designator (v49): it contains a digit ("208", "4b") or is a
+    single letter ("A", "B"). A bare alphabetic word is not a unit —
+    it is a slug/geography artifact ("# Usa" in one Sabri row's stored
+    address, "-Usa_" in a Realtor URL) or the tail of a street word
+    the keyword hid inside of ("United" -> "ed")."""
+    t = (tok or "").lower()
+    return bool(t) and (any(ch.isdigit() for ch in t) or len(t) == 1)
 
 def _unit_designator(addr, source_url=None):
     """The unit designator of a comp row, or "" when it has none (v48).
@@ -1521,13 +1531,37 @@ def _unit_designator(addr, source_url=None):
     shipped DB's 14522 N Nebraska Ave pair is told apart ONLY this
     way). Deliberately narrow: the token must follow a unit keyword or
     '#', so lookalikes never match ("-Usa_" in a Realtor URL is a
-    geography artifact, not a unit; a bare "Ste" is excluded — it is
-    also the Sainte abbreviation in street names)."""
+    geography artifact, not a unit). v49: a captured token counts only
+    when it is PLAUSIBLE (_unit_plausible) — the v48 form promoted the
+    "# Usa" slug tail stored in one live row's address into a fake
+    unit "usa", giving the artifact row an identity of its own so no
+    dedupe or collapse could ever fold it into its clean twin. An
+    implausible capture no longer ends the search: a later plausible
+    token in the same or the next text still wins. "Ste" joins the
+    keyword list under the same guard ("Ste B" -> "b"; the Sainte of
+    "Ste Marie" captures "marie", implausible, and is skipped)."""
     for text in (addr or "", source_url or ""):
         if not text: continue
-        m = _UNIT_RE.search(str(text).replace("-", " ").replace("_", " ").replace("/", " "))
-        if m: return m.group(1).lower()
+        flat = str(text).replace("-", " ").replace("_", " ").replace("/", " ")
+        for m in _UNIT_RE.finditer(flat):
+            if _unit_plausible(m.group(1)): return m.group(1).lower()
     return ""
+
+_ADDR_ARTIFACT_RE = re.compile(r"#\s*[-#]?\s*[a-z]{2,}\s*$", re.I)
+
+def _strip_addr_artifact(s):
+    """Remove a slug-artifact tail from a street address (v49): a
+    trailing "# <word>" whose token is a bare alphabetic word of 2+
+    letters ("# Usa" — a Realtor URL-slug tail that leaked into one
+    live Sabri row's stored address) is not a unit and not part of the
+    street; it is stripped wherever the address is normalized
+    (_norm_addr — the dedupe/collapse keys) or displayed
+    (_collapse_rent_view's display copies), so the artifact row folds
+    into its clean twin and the tail never renders. A trailing
+    "# 4B" / "# A" (digit or single letter — plausible units, see
+    _unit_plausible) is KEPT. Stored rows are never rewritten; this is
+    a normalization/display rule only."""
+    return _ADDR_ARTIFACT_RE.sub("", s or "").rstrip(" ,")
 
 def _dates_match(stored, incoming):
     """Sale-date equality for the sold dedupe key (v48): equal dates
@@ -1780,33 +1814,60 @@ def rent_match_group(subj, c):
     if (b is not None and abs(b - sb) <= 1) or (ba is not None and abs(ba - sba) <= 1): return 1
     return 2
 
+def _collapse_richness(d):
+    """Non-null field count of a comp row dict — the collapse's
+    'richest row' measure (v49)."""
+    return sum(1 for v in d.values() if v is not None and v != "")
+
 def _collapse_rent_view(rows):
     """Read-side duplicate safety net for the rent views (v48, audit
     D6): rows stored BEFORE the merge-side dedupe keys were fixed can
     still duplicate (same home at two prices — the shipped DB's
-    Nebraska pair class). Collapse on (normalized address, unit
-    designator, beds), keeping the FIRST row — callers pass the view
-    in its match-first display order, so the best-scored copy wins.
-    Nothing is deleted: stored rows are untouched, the view simply
-    shows each distinct home/unit once. A unit designator known only
-    from the stored listing URL is appended to the DISPLAYED address
-    ("... Unit 208") so genuinely distinct units stop looking
-    identical. Rows become plain dicts (display copies)."""
-    seen = set(); out = []
+    Nebraska pair class). Nothing is deleted: stored rows are
+    untouched, the view simply shows each distinct home/unit once. A
+    unit designator known only from the stored listing URL is appended
+    to the DISPLAYED address ("... Unit 208") so genuinely distinct
+    units stop looking identical. Rows become plain dicts (display
+    copies).
+
+    v49 loosening (live Nebraska evidence): rows group on (cleaned
+    normalized address, unit designator) and FOLD when their beds are
+    equal OR either side's beds is NULL — v48's exact-beds key kept a
+    live identical Unit-208 $1,899 pair apart because one copy's beds
+    was NULL. Compatibility is judged against the group's current
+    survivor. The survivor is the RICHEST row (most non-null fields;
+    ties go to the higher match_score, then to the earlier row —
+    callers pass match-first display order). The displayed address is
+    artifact-cleaned (_strip_addr_artifact), so the "# Usa" slug tail
+    stored in one live row never renders."""
+    out, meta = [], []   # meta[i] = (group key, survivor beds) for out[i]
     for c in rows or []:
         d = dict(c)
         unit = _unit_designator(d.get("address"), d.get("source_url"))
+        d["address"] = _strip_addr_artifact(d.get("address") or "")
         if unit:
             label = f"Unit {unit}"
-            if label.lower() not in (d.get("address") or "").lower():
-                d["address"] = f"{d.get('address') or ''} {label}".strip()
-        beds = d.get("beds")
+            if label.lower() not in d["address"].lower():
+                d["address"] = f"{d['address']} {label}".strip()
         # The key reads the row's STORED address (unit is its own key
-        # component — the display suffix above must not enter it).
-        key = (_norm_addr(c["address"] or ""), unit,
-               float(beds) if beds is not None else None)
-        if key in seen: continue
-        seen.add(key); out.append(d)
+        # component — the display suffix above must not enter it);
+        # _norm_addr strips the "# Usa" artifact, so the artifact row
+        # groups with its clean twin.
+        gkey = (_norm_addr(c["address"] or ""), unit)
+        beds = d.get("beds")
+        beds = float(beds) if beds is not None else None
+        hit = None
+        for i, (gk, kb) in enumerate(meta):
+            if gk == gkey and (kb is None or beds is None or kb == beds):
+                hit = i; break
+        if hit is None:
+            out.append(d); meta.append((gkey, beds))
+            continue
+        kept = out[hit]
+        new_rich, old_rich = _collapse_richness(d), _collapse_richness(kept)
+        new_ms = d.get("match_score") or 0; old_ms = kept.get("match_score") or 0
+        if new_rich > old_rich or (new_rich == old_rich and new_ms > old_ms):
+            out[hit] = d; meta[hit] = (gkey, beds)
     return out
 
 # ---------------------------------------------------------------- county GIS parcels (v3.4)
@@ -2056,6 +2117,52 @@ def _rapidapi_post(host, path, body):
         return r.json(), None
     except Exception as e:
         return None, e
+
+# v49: the private-zillow wrapper is flaky in production (live PA
+# evidence 2026-11-05: a sold search answered HTTP 503 {"message":
+# "503: Zillow is temporarily limiting requests, please retry in a
+# few seconds"} and the Garland subject lookup answered HTTP 404 from
+# PA minutes after the identical playground call returned 200). Both
+# pzillow calls retry BOUNDED — up to 2 extra attempts with this
+# backoff — and only on transient statuses: 503 on either call, plus
+# 404 on the subject lookup (its by-address resolution flickers; a
+# 404 surviving every attempt is the honest not-on-Zillow answer and
+# degrades exactly as v48 did). Worst added latency is 5+15s on a
+# call that would otherwise have failed outright.
+_PZ_RETRY_DELAYS = (5, 15)
+
+def _err_status(err):
+    """The HTTP status an exception carries (via its response), else
+    None — the _rapi_fail_reason read, shared."""
+    resp = getattr(err, "response", None)
+    code = getattr(resp, "status_code", None)
+    return code if isinstance(code, int) else None
+
+def _pz_get(path, params, retry_404=False):
+    """One private-zillow GET with the bounded v49 retry. Returns
+    (data, err, attempts, last_status) — data/err are _rapidapi_get's
+    pair for the FINAL attempt. The loop is contained: a failure
+    inside an attempt degrades to that attempt's error; it can never
+    raise into the pull (the v40 containment rule)."""
+    data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, path, params)
+    attempts = 1
+    last_status = _err_status(err) if err is not None else 200
+    while err is not None and attempts <= len(_PZ_RETRY_DELAYS):
+        code = _err_status(err)
+        if code != 503 and not (retry_404 and code == 404): break
+        try:
+            delay = _PZ_RETRY_DELAYS[attempts - 1]
+            if delay: time.sleep(delay)
+            data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, path, params)
+        except Exception as e:
+            data, err = None, e
+        attempts += 1
+        if err is not None:
+            c2 = _err_status(err)
+            if c2 is not None: last_status = c2
+        else:
+            last_status = 200
+    return data, err, attempts, last_status
 
 def _rapi_dig(obj, *keys):
     cur = obj
@@ -2705,18 +2812,25 @@ def _zillow_subject_fill(d, prop, today):
     at the proxy), which left PA subjects with no specs and no photos.
     Quota discipline (250/mo hard cap): the caller fires this only
     while the subject still lacks specs or photos, and this function
-    itself makes exactly one call. Blank-fill ONLY (never overwrites
+    makes one logical call — the v49 bounded retry inside _pz_get may
+    repeat the HTTP request on a transient 503/404 (the wrapper's
+    by-address resolution flickers; a 404 surviving every attempt is
+    genuinely not-on-Zillow and degrades as before). Blank-fill ONLY (never overwrites
     user/saved data); zestimate lands ONLY in est_zillow, never
     list_price. Returns {"photos": n, "fields": [...]} when it filled
     something, else None (no key / error / 404 = address not on
     Zillow / sanity no-match / nothing blank to fill) — every one of
     those degrades silently to the pre-v48 honest state, logged."""
     if not _rapidapi_key(): return None
-    data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, "/By Property Address",
-                              {"address": prop["address"]})
+    data, err, attempts, last_status = _pz_get("/By Property Address",
+                                               {"address": prop["address"]},
+                                               retry_404=True)
     if err is not None:
-        app.logger.warning(f"comp pull: private-zillow subject lookup failed for "
-                           f"{prop['address']}: {_rapi_fail_reason(err)}")
+        msg = (f"comp pull: private-zillow subject lookup failed for "
+               f"{prop['address']}: {_rapi_fail_reason(err)}")
+        if attempts > 1:
+            msg += f" (after {attempts} attempts, last status {last_status})"
+        app.logger.warning(msg)
         return None
     det = data.get("propertyDetails") if isinstance(data, dict) else None
     if not isinstance(det, dict) or not det:
@@ -2745,7 +2859,8 @@ def _zillow_subject_fill(d, prop, today):
     d.execute(f"UPDATE properties SET {','.join(k + '=?' for k in fills)} WHERE id=?",
               (*fills.values(), prop["id"]))
     app.logger.warning(f"comp pull: private-zillow subject lookup for {prop['address']}: "
-                       f"filled {', '.join(sorted(fills))} (1 call, RapidAPI (Zillow))")
+                       f"filled {', '.join(sorted(fills))} "
+                       f"({attempts} call{'s' if attempts > 1 else ''}, RapidAPI (Zillow))")
     return {"photos": len(v["photos"]) if "photos_json" in fills else 0,
             "fields": sorted(fills)}
 
@@ -2817,7 +2932,11 @@ def _src_pzillow_sold(prop, past_days, radius_mi=1.0):
     params = {"west": round(prop["lon"] - dlon, 6), "east": round(prop["lon"] + dlon, 6),
               "south": round(prop["lat"] - dlat, 6), "north": round(prop["lat"] + dlat, 6),
               "listingStatus": "Sold"}
-    data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, "/search/bymapbounds", params)
+    data, err, attempts, last_status = _pz_get("/search/bymapbounds", params)
+    if attempts > 1:
+        _rapi_note("pzillow_sold",
+                   f"{'served' if err is None else 'failed'} after {attempts} attempts "
+                   f"(last status {last_status})")
     if err is not None: return [], err, RAPIDAPI_SRC_PZ
     items = data.get("searchResults") if isinstance(data, dict) else None
     items = items if isinstance(items, list) else []
@@ -3020,7 +3139,24 @@ def _fl_cadastral_frame(prop, radius_mi=1.0):
     (None, None) for a non-FL subject (no request is made), (None,
     err) when the service fails. A spatial envelope query at the pull
     radius around the subject; rows flow through the SAME shared gate
-    + merge as every sold source."""
+    + merge as every sold source.
+
+    v49 query repair (live-validated from the sandbox against the
+    real layer, 2026-11-05 — see the v49 build log): the layer's
+    native SR is wkid 102967, so the envelope degrees must carry
+    inSR=4326 AND outSR=4326 or the server reads them in its own
+    units; returnCentroid=true with returnGeometry=false (the layer
+    answers with centroids — shipping 315 parcel polygons was the
+    slow payload; the centroid-only form answered in ~20-29s vs
+    ~36-51s with geometry, and an outSR projection of full polygons
+    gateway-timed-out at 60s); orderByFields newest-sale-first (the
+    layer publishes supportsOrderBy) so a capped answer keeps the
+    freshest sales; resultRecordCount at the layer's maxRecordCount
+    (2000). THIS frame reads with its own 90s timeout — the shared
+    30s read timeout killed every live v48 pull (the service answers
+    this query in ~20-55s). An ArcGIS 200-with-error-body (the live
+    PA failure mode) is detected below and fails the frame — it is
+    never parsed as zero results."""
     if (_s(prop["state"]) or "").strip().upper() != "FL": return None, None
     if prop["lat"] is None or prop["lon"] is None: return None, None
     dlat = (radius_mi or 1.0) / 69.0
@@ -3030,14 +3166,19 @@ def _fl_cadastral_frame(prop, radius_mi=1.0):
     try:
         r = requests.get(FL_CADASTRAL_URL, params={
             "where": "SALE_PRC1>0", "geometry": env,
-            "geometryType": "esriGeometryEnvelope", "inSR": 4326,
+            "geometryType": "esriGeometryEnvelope", "inSR": 4326, "outSR": 4326,
             "spatialRel": "esriSpatialRelIntersects", "outFields": _CAD_FIELDS,
-            "returnGeometry": "true", "returnCentroid": "true",
-            "resultRecordCount": 2000, "f": "json"}, timeout=30)
+            "returnGeometry": "false", "returnCentroid": "true",
+            "orderByFields": "SALE_YR1 DESC,SALE_MO1 DESC",
+            "resultRecordCount": 2000, "f": "json"}, timeout=90)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
         return None, e
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        ebody = data["error"]
+        return None, Exception(f"Cadastral service error {ebody.get('code')}: "
+                               f"{ebody.get('message')}")
     feats = data.get("features") if isinstance(data, dict) else None
     rows = _rapi_rows_multi(feats if isinstance(feats, list) else [], _cad_feature_rows)
     return _hh_frame(rows), None
@@ -5637,7 +5778,10 @@ _ADDR_SUFFIX = {"place": "pl", "pl": "pl", "drive": "dr", "dr": "dr", "court": "
 
 def _norm_addr(s):
     """Normalize a street address for lookup matching: lowercase, no punctuation,
-    canonical suffixes, single spaces. '15037 Abby Birch Place' -> '15037 abby birch pl'."""
+    canonical suffixes, single spaces. '15037 Abby Birch Place' -> '15037 abby birch pl'.
+    v49: a slug-artifact tail ("# Usa") is stripped first (_strip_addr_artifact),
+    so an artifact row and its clean twin normalize identically."""
+    s = _strip_addr_artifact(s)
     s = re.sub(r"[^a-z0-9 ]", " ", (s or "").lower())
     toks = [_ADDR_SUFFIX.get(t, t) for t in s.split() if t not in ("fl", "florida")]
     return " ".join(toks)

@@ -90,7 +90,7 @@
 </div>
 <div class="galmodal" id="galmodal"><button class="x" id="galclose" title="Close">✕</button>
 <div class="grid">{% for u in photos %}<img src="{{ u }}" alt="Property photo {{ loop.index }}" loading="lazy">{% endfor %}</div></div>
-<p class="small muted" style="margin-top:-8px">📷 {{ photos|length }} listing photo(s), pulled automatically from this property's listing (HomeHarvest/Realtor.com){{ ' on ' ~ p.photos_date if p.photos_date }}. Click the third photo to see all.</p>
+<p class="small muted" style="margin-top:-8px">📷 {{ photos|length }} listing photo(s), pulled automatically from this property's listing{{ ' on ' ~ p.photos_date if p.photos_date }}. Click the third photo to see all.</p>
 <script>
 (function(){var o=document.getElementById('galopen'),m=document.getElementById('galmodal'),x=document.getElementById('galclose');
 if(o&&m){o.addEventListener('click',function(){m.classList.add('open')});}
