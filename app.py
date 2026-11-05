@@ -130,6 +130,10 @@ def init_db():
     ccols = [r[1] for r in d.execute("PRAGMA table_info(comps)")]
     if "ptype" not in ccols: d.execute("ALTER TABLE comps ADD COLUMN ptype TEXT")
     if "lot_sqft" not in ccols: d.execute("ALTER TABLE comps ADD COLUMN lot_sqft REAL")
+    # v57: bulk-sale flag (Seaford defect) — a kept bulk-sale row is one
+    # stored row for a whole complex's portfolio sale, flagged so no
+    # average/median/ARV ever treats the complex total as a per-unit comp.
+    if "bulk_sale" not in ccols: d.execute("ALTER TABLE comps ADD COLUMN bulk_sale INTEGER DEFAULT 0")
     jcols = [r[1] for r in d.execute("PRAGMA table_info(jobs)")]
     if "dismissed" not in jcols: d.execute("ALTER TABLE jobs ADD COLUMN dismissed INTEGER DEFAULT 0")
     # v1.7b: overview deal-structure extras + seller finance + disposition extras
@@ -372,8 +376,10 @@ def adjusted_price(comp):
     return (comp["price"] or 0) + adj
 
 def arv_reconciliation(prop, comps):
-    """ONE reconciled ARV with the math shown: average of (adjusted avg comp price) and (avg $/sqft x subject sqft)."""
-    usable = [c for c in comps if c["kind"] == "sold" and not c["excluded"] and c["price"]]
+    """ONE reconciled ARV with the math shown: average of (adjusted avg comp price) and (avg $/sqft x subject sqft).
+    v57: the pool is stats-usable sold rows only — a bulk-flagged row or
+    a $/sqft outlier can never enter the ARV, even when pinned."""
+    usable = _stats_usable_sold(comps)
     pool = [c for c in usable if c["pinned"]] or sorted(usable, key=lambda c: -(c["match_score"] or 0))[:6]
     if not pool or not prop["sqft"]:
         return {"arv": None, "pool": pool, "note": "Not found — pull comps first."}
@@ -404,7 +410,7 @@ def verdict(prop, comps, boxes):
         reasons.append(f"Spread after repairs = {spread_pct:.1f}% of ARV")
         if mao and price <= mao: score = min(99, score + 8); reasons.append("At/under MAO (70% rule)")
         elif mao: score = max(1, score - 10); reasons.append("Above MAO (70% rule)")
-    n_sold = len([c for c in comps if c["kind"] == "sold" and not c["excluded"]])
+    n_sold = len(_stats_usable_sold(comps))  # v57: bulk/outlier rows are not market comps
     completeness = sum(1 for v in [prop["beds"], prop["sqft"], prop["year_built"], prop["list_price"]] if v) / 4
     conf_pts = min(50, n_sold * 6) + completeness * 50
     confidence = "High" if conf_pts >= 75 else ("Medium" if conf_pts >= 45 else "Low")
@@ -430,6 +436,67 @@ def _median(xs):
     if not xs: return None
     n = len(xs)
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+def _cval(c, key, default=None):
+    """One tolerant field read off a comp row (v57): sqlite3.Row raises
+    on a missing key, a plain dict answers .get — gates hand both shapes
+    to the stats helpers, so neither may crash the page."""
+    try:
+        return c[key]
+    except Exception:
+        pass
+    try:
+        return c.get(key, default)
+    except Exception:
+        return default
+
+# ---------------------------------------------------------------- v57 bulk-sale stats defense
+# Seaford defect (live 2026-11-05): the county stamps one apartment
+# complex's $31M bulk/portfolio sale price on EVERY unit's parcel
+# record, so ~120 units stored as ~120 independent $31M sales and the
+# whole-set average ($4,727,190) and Market Data median ($500,000)
+# followed them. Two layers stop it ever again:
+#   (a) the merge gate collapses a bulk group to ONE flagged row
+#       (see _bulk_group_key / _merge_sold_frame);
+#   (b) this read-side predicate keeps bulk-flagged rows AND $/sqft
+#       extreme outliers out of EVERY stat — so even a bulk row that
+#       slipped in before the fix (or a lone $35M row with no group
+#       to collapse) can never move a headline again. Rows stay
+#       LISTED in Comparables; only the stats ignore them.
+_PPSF_OUTLIER_MULT = 20      # a sold row above 20x the pool median $/sqft is not a market comp
+_PPSF_OUTLIER_MIN_N = 5      # ...but only when >= 5 rows carry a $/sqft, so the median is trustworthy
+
+def _ppsf_of(c):
+    """$/sqft for one sold row: the stored ppsf, else price/sqft, else
+    None (a row with no sqft cannot be judged on $/sqft and is kept)."""
+    p = _cval(c, "ppsf")
+    if p:
+        try: return float(p)
+        except Exception: return None
+    price, sqft = _cval(c, "price"), _cval(c, "sqft")
+    if price and sqft:
+        try: return float(price) / float(sqft)
+        except Exception: return None
+    return None
+
+def _stats_usable_sold(rows):
+    """The sold rows any average/median/ARV/trend may use (v57):
+    kind sold, priced, not excluded, not bulk-flagged, and not a
+    $/sqft extreme outlier. The median is computed over the
+    bulk/excluded-free pool first (a median is robust while the
+    outliers are a minority), then rows above 20x that median drop.
+    Callers that ALSO need the nominal filter (Market Data) apply it
+    themselves, as before — this helper never invents a price rule."""
+    base = [c for c in (rows or [])
+            if _cval(c, "kind") == "sold" and _cval(c, "price")
+            and not _cval(c, "excluded") and not _cval(c, "bulk_sale")]
+    ppsfs = sorted(p for p in (_ppsf_of(c) for c in base) if p is not None)
+    if len(ppsfs) >= _PPSF_OUTLIER_MIN_N:
+        med = _median(ppsfs)
+        if med:
+            cap = med * _PPSF_OUTLIER_MULT
+            base = [c for c in base if (_ppsf_of(c) is None or _ppsf_of(c) <= cap)]
+    return base
 
 def _pool_source_label(rows):
     """The provenance line for a comp pool (v48): the ACTUAL stored
@@ -647,8 +714,10 @@ def _padsplit_benchmark(prop):
             "padsplit_url": ps.get("url") or ""}
 
 def pinned_sold_stats(sold):
-    """Sold-view header averages from the PINNED set (falls back to top 3 by score, labeled)."""
-    pool = [c for c in sold if c["price"] and c["kind"] == "sold"]
+    """Sold-view header averages from the PINNED set (falls back to top 3 by score, labeled).
+    v57: the pool is stats-usable sold rows only — a pinned bulk row
+    (or $/sqft outlier) drops out of the basis instead of pricing it."""
+    pool = _stats_usable_sold(sold)
     if not pool: return None
     pinned = [c for c in pool if c["pinned"]]
     basis = pinned or sorted(pool, key=lambda c: -(c["match_score"] or 0))[:3]
@@ -1937,6 +2006,72 @@ def _drop_note(drops, reason, row):
             ex = f"({_s(row.get('city'))} {_s(row.get('zip_code'))})".strip() or "(no address)"
         slot[1].append(ex)
 
+# ---------------------------------------------------------------- v57 bulk-sale merge gate
+# Seaford defect (live 2026-11-05): the county stamps ONE apartment
+# complex's bulk/portfolio sale price on EVERY unit's parcel record
+# (14595-14599 Seaford Cir, units 101-206, $31,000,000, sold 2025),
+# and the merge stored each unit as its own $31M sale. Root cause:
+# the merge had no notion of a repeated sale — it dedupes on
+# address+price+date, and every unit IS a different address.
+# The rule below is deliberately narrow, so a genuine sale is never
+# collapsed: identical price AND identical sale month AND the same
+# building (same street number + street name, unit designator
+# stripped), repeated >= 3 times in ONE incoming frame. A group of 2,
+# a different price, a different month, or a different street number
+# is not a bulk group. The kept row is the lowest unit number and
+# keeps the county's $31M total untouched — a per-unit price is NEVER
+# invented (total / units is forbidden). The kept row is flagged
+# bulk_sale=1 so _stats_usable_sold keeps it out of every average,
+# median, ARV and trend; it stays listed with a badge.
+_BULK_MIN_GROUP = 3
+
+def _bulk_group_key(vals):
+    """The bulk-group key for one candidate sold row, or None when the
+    row cannot be grouped (no price, or no year-month sale date — a
+    year-only date cannot prove the units sold in the same month).
+    The key is (unit-stripped normalized base address, price, sale
+    month): "14595 Seaford Cir Unit 101" and "... Unit 204" key
+    together; "14596 Seaford Cir Unit 101" keys apart (a different
+    building number is a different group — the live complex spans
+    14595-14599 with ~24 units per number, so every number-group
+    independently meets the >= 3 rule and collapses to its own kept
+    row)."""
+    price = vals.get("price")
+    if not price: return None
+    month = _s(vals.get("event_date"))[:7]
+    if len(month) < 7: return None
+    street, _unit = _addr_unit_split(vals.get("address"))
+    base = _norm_addr(street)
+    if not base: return None
+    return (base, price, month)
+
+def _bulk_rep_key(vals):
+    """Sort key picking the group's representative: the lowest unit
+    number first (Unit 101 before Unit 204); a unitless address (or a
+    non-numeric unit) sorts after numbered units, frame order breaks
+    the remaining ties at the call site."""
+    _st, unit = _addr_unit_split(vals.get("address"))
+    try: return (0, int(unit))
+    except Exception: return (1, unit or "")
+
+def _bulk_split(cands):
+    """(kept, skip) index sets for one frame's candidate rows: every
+    bulk group (>= _BULK_MIN_GROUP sharing one _bulk_group_key) keeps
+    exactly its representative and skips the rest. Non-group rows are
+    in neither set."""
+    groups = {}
+    for i, vals in enumerate(cands):
+        k = _bulk_group_key(vals)
+        if k is None: continue
+        groups.setdefault(k, []).append(i)
+    kept, skip = set(), set()
+    for idxs in groups.values():
+        if len(idxs) < _BULK_MIN_GROUP: continue
+        rep = min(idxs, key=lambda i: (_bulk_rep_key(cands[i]), i))
+        kept.add(rep)
+        skip.update(j for j in idxs if j != rep)
+    return kept, skip
+
 def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touched=None, drops=None):
     """Merge one HomeHarvest sold frame into the comps table. Returns
     (added, updated, usable). v3.4: DISTANCE from the subject governs
@@ -1966,9 +2101,20 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
     ARV and auto-pinning. The update path never sets excluded: a
     nominal cadastral row landing on an existing comp must not
     poison a good comp another source stands behind. The threshold
-    is Cadastral-only — listing-source rows keep their behavior."""
+    is Cadastral-only — listing-source rows keep their behavior.
+    v57: BULK-SALE collapse (see _bulk_group_key) — the merge is
+    two-pass: pass 1 builds every gate-passed row's vals, pass 2
+    stores them, skipping non-representative members of a bulk group
+    (drop reason "bulk_sale") and flagging the kept representative
+    bulk_sale=1. Already-stored rows are NEVER rewritten by this:
+    a bulk member that was stored before v57 stays stored (its
+    representative updates in place and gains the flag; the other
+    members are left for the approved exclude-flag cleanup), and the
+    update path never sets excluded — the v50 posture, kept."""
     added = updated = n = 0
     if df is None: return added, updated, n
+    # --- pass 1: build the candidate rows (gate + subject check only) ---
+    cands = []
     for _, r in df.iterrows():
         ok, reason, dist = _sold_row_gate(r, prop, radius_mi)
         if not ok:
@@ -1993,6 +2139,16 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
         vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
                                                  "baths": vals["baths"], "year_built": vals["year_built"],
                                                  "lot_sqft": vals["lot_sqft"]})
+        cands.append((r, vals))
+    kept, skip = _bulk_split([v for _r, v in cands])
+    # --- pass 2: store (bulk members collapse, representative flagged) ---
+    for i, (r, vals) in enumerate(cands):
+        if i in skip:
+            if drops is not None: _drop_note(drops, "bulk_sale", r)
+            continue
+        if i in kept:
+            vals = dict(vals, bulk_sale=1)
+        addr, price = vals["address"], vals["price"]
         ex = _find_existing_comp(d, prop["id"], "sold", addr, price,
                                  event_date=vals["event_date"])
         cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
@@ -4143,6 +4299,10 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     if not pinned_now:
         rows = [dict(r) for r in d.execute(
             "SELECT * FROM comps WHERE property_id=? AND kind='sold' AND excluded=0", (prop["id"],)).fetchall()]
+        # v57: a bulk-sale row never auto-pins — the ARV is built from
+        # the pinned set, and a $31M complex total must never be one
+        # of the three comps the ARV is built from.
+        rows = [c for c in rows if not _cval(c, "bulk_sale")]
         # v56: same-street first here too — the auto-pinned set is what
         # the ARV is built from, so a same-street comp (even a Tier-3
         # county row with no beds/baths) pins ahead of off-street
@@ -5956,7 +6116,12 @@ def property_page(pid):
         # Comparables. The nearby-ZIP table keeps its radius-wide pool
         # (nominal-filtered), so its YOU row is the same ZIP pool the
         # headline reports: headline median == YOU-row median, always.
-        _mkt = [c for c in sold if c["zip"] == p["zip"] and not (c["price"] and c["price"] < _MKT_NOMINAL_MAX)]
+        # v57: both pools ALSO pass _stats_usable_sold — a bulk-flagged
+        # row or a $/sqft outlier can never move the headline, the
+        # trend, or the nearby table, even when it was stored before
+        # the merge gate existed (the live Seaford rows, until the
+        # approved cleanup exclude-flags them).
+        _mkt = _stats_usable_sold([c for c in sold if c["zip"] == p["zip"] and not (c["price"] and c["price"] < _MKT_NOMINAL_MAX)])
         msold = [c for c in _mkt if mtype == "All" or _ptype_of(c) == mtype]
         type_counts = {}
         for c in _mkt: type_counts[_ptype_of(c)] = type_counts.get(_ptype_of(c), 0) + 1
@@ -5974,9 +6139,9 @@ def property_page(pid):
             spark = " ".join(f"{round(i / (len(vals) - 1) * 300, 1)},{round(34 - (vv - lo) / span * 30, 1)}"
                              for i, vv in enumerate(vals))
         # v53: nearby table stays radius-wide but nominal-filtered (its YOU
-        # row is the ZIP pool the headline reports).
-        _rad = [c for c in sold if not (c["price"] and c["price"] < _MKT_NOMINAL_MAX)
-                and (mtype == "All" or _ptype_of(c) == mtype)]
+        # row is the ZIP pool the headline reports). v57: stats-usable too.
+        _rad = _stats_usable_sold([c for c in sold if not (c["price"] and c["price"] < _MKT_NOMINAL_MAX)
+                and (mtype == "All" or _ptype_of(c) == mtype)])
         zip_groups = {}
         for c in _rad:
             if c["zip"] and c["price"]: zip_groups.setdefault(c["zip"], []).append(c)
@@ -6197,11 +6362,19 @@ def property_page(pid):
                 pinned_rank[_c["id"]] = _n
     # v2.0: whole-filtered-set averages (the sold set the user is looking at —
     # window + radius applied) beside the pinned/top-3 line.
+    # v57: n stays the IN-VIEW count (the count-check line above uses it
+    # as "currently shows N sold", and the cards render all N), but the
+    # AVERAGES are computed over the stats-usable subset only — a bulk
+    # row or $/sqft outlier shown in the view must never price the
+    # average. stats_n / stats_excluded tell the template to say so.
     _set_sold = [c for c in sold_view if c["kind"] == "sold"]
-    _set_prices = [c["price"] for c in _set_sold if c["price"]]
-    _set_ppsf = [(c["price"] / c["sqft"]) for c in _set_sold if c["price"] and c["sqft"]]
-    _set_doms = [c["dom"] for c in _set_sold if c["dom"] is not None]
+    _set_usable = _stats_usable_sold(_set_sold)
+    _set_prices = [c["price"] for c in _set_usable if c["price"]]
+    _set_ppsf = [(c["price"] / c["sqft"]) for c in _set_usable if c["price"] and c["sqft"]]
+    _set_doms = [c["dom"] for c in _set_usable if c["dom"] is not None]
     set_stats = {"n": len(_set_sold),
+                 "stats_n": len(_set_usable),
+                 "stats_excluded": len(_set_sold) - len(_set_usable),
                  "avg": round(sum(_set_prices) / len(_set_prices)) if _set_prices else None,
                  "ppsf": round(sum(_set_ppsf) / len(_set_ppsf)) if _set_ppsf else None,
                  "dom": round(sum(_set_doms) / len(_set_doms)) if _set_doms else None}
@@ -6256,8 +6429,9 @@ def property_page(pid):
             uw_current[strat] = latest if latest is not None else fresh
     # pinned (or top-3) sold comps for the Flip Sale & Exit table
     # Fallback pool = first 3 of the tier-ordered sold view (P0-1: Tier 1 first).
-    flip_pool = [c for c in sold_view if c["pinned"] and c["kind"] == "sold"] or \
-        [c for c in sold_view if c["kind"] == "sold"][:3]
+    # v57: the flip pool is stats-usable only — a bulk row must never price the exit table.
+    flip_pool = [c for c in _stats_usable_sold(sold_view) if c["pinned"] and c["kind"] == "sold"] or \
+        [c for c in _stats_usable_sold(sold_view) if c["kind"] == "sold"][:3]
     flip_prices = [c["price"] for c in flip_pool if c["price"]]
     # ---- v1.7b comp filters popover vocabularies (Sold view) ----
     sold_years = sorted({c["event_date"][:4] for c in sold_view if c["event_date"]}, reverse=True)
