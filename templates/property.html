@@ -971,7 +971,7 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 <div><label>File (image/PDF)</label><input type="file" name="file"></div></div>
 <label>Notes (room layout, planned conversion)</label><textarea name="notes" rows="2"></textarea>
 <p><button class="btn">Save floor plan</button></p></form>
-{% for fp in plans %}<p class="small"><b>{{ fp.title or 'Plan' }}</b> — {{ fp.filename or 'notes only' }} · {{ (fp.created_at or '')[:10] }}<br>{{ fp.notes or '' }}</p>
+{% for fp in plans %}<div style="display:flex;gap:6px;align-items:flex-start;margin:5px 0"><span class="small" style="flex:1"><b>{{ fp.title or 'Plan' }}</b> — {{ fp.filename or 'notes only' }} · {{ (fp.created_at or '')[:10] }}<br>{{ fp.notes or '' }}</span><form method="post" action="{{ url_for('floorplan_delete', fid=fp.id) }}" onsubmit="return confirm('Remove this floor plan?')"><button class="btn sm sec" title="Remove this floor plan">✕</button></form></div>
 {% else %}<p class="muted">No floor plans saved yet.</p>{% endfor %}</div>
 {% endif %}
 

@@ -6312,6 +6312,17 @@ def floorplan(pid):
                  (pid, request.form.get("title"), fn, request.form.get("notes")))
     db().commit(); return redirect(url_for("property_page", pid=pid, tab="floorplans"))
 
+@app.route("/floorplan/<int:fid>/delete", methods=["POST"])
+def floorplan_delete(fid):
+    """v52 (whole-app test pass): Floor Plans had add but no delete —
+    a saved plan could never be removed from the UI. Mirrors doc_delete."""
+    row = db().execute("SELECT property_id, title FROM floorplans WHERE id=?", (fid,)).fetchone()
+    if row:
+        db().execute("DELETE FROM floorplans WHERE id=?", (fid,)); db().commit()
+        flash(f"Floor plan removed: {row['title'] or 'Plan'}", "info")
+        return redirect(url_for("property_page", pid=row["property_id"], tab="floorplans"))
+    return redirect(url_for("index"))
+
 @app.route("/settings", methods=["GET", "POST"])
 def settings_page():
     if request.method == "POST":

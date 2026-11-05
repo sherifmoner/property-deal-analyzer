@@ -619,3 +619,11 @@ td.num,th.num{text-align:right}
   .comptools input[type="search"]{min-width:140px}
   .segbar .seg{padding:8px 11px}
 }
+
+/* ---- v52 TEST PASS (whole-app test pass, 2026-11-05) ----
+   F1: the "Strongest/Weakest" insight line (.insight, #dbe7f2 pale blue)
+   was written for the pre-v51 dark-navy scorebox; v51 lightened the
+   scorebox to orange-soft on a white page, leaving the line at 1.26:1
+   contrast — effectively invisible. Dark slate restores readability.
+   (Sidecard rows keep their own #dbe7f2 on dark — untouched.) */
+.insight{color:#334155}
