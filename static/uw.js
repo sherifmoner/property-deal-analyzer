@@ -1930,8 +1930,10 @@
       if (cn) {
         var c = UW.coli;
         if (c && c.weekly_per_room) {
-          cn.textContent = "$" + c.weekly_per_room + "/wk per room — median of " + c.n + " area rental comps (HomeHarvest, pulled " + c.date + "). " +
-            "Tier-B estimate: derived from whole-house rents (rent ÷ bedrooms), typically below PadSplit listing rents." +
+          cn.textContent = "$" + c.weekly_per_room + "/wk per room — median of " + c.n + " area rental comps (" + (c.source || "rental comps") + ", pulled " + c.date + "). " +
+            ((c.source || "").indexOf("PadSplit") === 0
+              ? "Tier-A: the median of the weekly room rents actually listed on PadSplit for this area (available + waitlist)."
+              : "Tier-B estimate: derived from whole-house rents (rent ÷ bedrooms), typically below PadSplit listing rents.") +
             (c.n < 5 ? " Thin data — fewer than 5 comps." : "") + " Edit any room to override.";
         } else {
           cn.textContent = "Area room rent: Not found — enter per-room rent. (Pull rental comps to auto-price rooms from the area median.)";

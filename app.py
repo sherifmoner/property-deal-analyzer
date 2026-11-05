@@ -122,6 +122,11 @@ def init_db():
     for col in ("amenities_json", "amenities_date", "photos_json", "photos_date", "demo_json", "demo_date",
                 "demo_error", "amenities_error"):
         if col not in cols: d.execute(f"ALTER TABLE properties ADD COLUMN {col} TEXT")
+    # v56: the subject's Zillow zpid (persisted by the subject fill so the
+    # zpid-only backup APIs can answer when the by-address path cannot) and
+    # the stored official-PadSplit benchmark pull (Tier A room rents).
+    for col in ("zpid", "padsplit_json", "padsplit_date"):
+        if col not in cols: d.execute(f"ALTER TABLE properties ADD COLUMN {col} TEXT")
     ccols = [r[1] for r in d.execute("PRAGMA table_info(comps)")]
     if "ptype" not in ccols: d.execute("ALTER TABLE comps ADD COLUMN ptype TEXT")
     if "lot_sqft" not in ccols: d.execute("ALTER TABLE comps ADD COLUMN lot_sqft REAL")
@@ -452,10 +457,17 @@ def ltr_stats(rents):
             "median_rent": round(_median([c["price"] for c in pool]) or 0), "count": len(pool),
             "source": _pool_source_label(pool), "date": datetime.date.today().isoformat()}
 
-def coliving_stats(rents):
-    """Co-Living benchmark derived honestly from whole-house rental comps:
-    per-room monthly rent = listing rent / bedrooms; weekly = monthly x 12 / 52.
-    Benchmark = median across comps with usable beds+rent. Needs >= 3 comps, else Not found."""
+def coliving_stats(rents, prop=None):
+    """Co-Living benchmark. Tier A (v56): a stored official-PadSplit
+    pull for THIS property wins — it is the area's actual listed
+    $/wk per room (Sherif's PadSplit revenue rule, 2026-11-04).
+    Tier B (the fallback, unchanged): derived honestly from
+    whole-house rental comps — per-room monthly rent = listing rent /
+    bedrooms; weekly = monthly x 12 / 52; median across comps with
+    usable beds+rent; needs >= 3 comps, else Not found."""
+    if prop is not None:
+        _ta = _padsplit_benchmark(prop)
+        if _ta: return _ta
     per_room_wk = []
     for c in rents:
         if c["price"] and c["beds"] and c["beds"] >= 1:
@@ -472,6 +484,167 @@ def room_estimate_weekly(comp):
     if comp["price"] and comp["beds"] and comp["beds"] >= 1:
         return round(comp["price"] / comp["beds"] * 12 / 52)
     return None
+
+# ---------------------------------------------------------------- PadSplit Tier A (v56)
+# Sherif's PADSPLIT REVENUE RULE (2026-11-04) always named the area's
+# actual PadSplit rent per room as the standard; until now only the
+# Tier-B whole-house derivation could answer. The official PadSplit
+# search page server-renders its full result set as JSON inside
+# <script id="__NEXT_DATA__"> (Next.js dehydrated react-query state —
+# proven by direct fetch 2026-11-05, fixtures saved in research/
+# padsplit-fixture-*.html): the "properties-list" query's data holds
+# count / totalPages / results[], one card per listed home with
+# roomMinPrice / roomMaxPrice (WEEKLY dollars), status (1 = listed,
+# 0 = not yet bookable — "coming soon") and listingStatus. A plain
+# requests fetch reads it; no key, no JS execution. Pagination is
+# ?page=N. An unknown ZIP answers count=0.
+PADSPLIT_SEARCH_BASE = "https://www.padsplit.com/rooms-for-rent/"
+PADSPLIT_MIN_CARDS = 3     # below this the ZIP is too thin to benchmark
+PADSPLIT_MAX_PAGES = 3     # city-widen fetch cap
+
+def _padsplit_slug(city, state):
+    """'Tampa' + 'FL' -> 'tampa-fl' (the verified URL form)."""
+    c = re.sub(r"[^a-z0-9]+", "-", (city or "").strip().lower()).strip("-")
+    s = (state or "").strip().lower()[:2]
+    return f"{c}-{s}" if c and s else ""
+
+def _padsplit_url(city, state, zipc=None, page=1):
+    slug = _padsplit_slug(city, state)
+    if not slug: return ""
+    u = PADSPLIT_SEARCH_BASE + slug
+    qs = []
+    if zipc: qs.append(f"zip={str(zipc)[:5]}")
+    if page and page > 1: qs.append(f"page={page}")
+    return u + ("?" + "&".join(qs) if qs else "")
+
+def _padsplit_parse(html_text):
+    """One PadSplit search page -> {"cards": [...], "count": n,
+    "total_pages": n}. Each card: {"rent": weekly dollars (the card's
+    advertised lowest room price), "available": bool, "label": the
+    listingStatus text}. Any shape surprise parses to zero cards —
+    never an exception, never an invented rent."""
+    out = {"cards": [], "count": 0, "total_pages": 0}
+    if not html_text: return out
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+                  html_text, re.S)
+    if not m: return out
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return out
+    queries = _rapi_dig(data, "props", "pageProps", "dehydratedState", "queries")
+    if not isinstance(queries, list): return out
+    for q in queries:
+        if not isinstance(q, dict): continue
+        qk = q.get("queryKey")
+        if not (isinstance(qk, list) and qk and qk[0] == "properties-list"): continue
+        d = _rapi_dig(q, "state", "data")
+        if not isinstance(d, dict): continue
+        results = d.get("results")
+        if not isinstance(results, list): continue
+        for r in results:
+            if not isinstance(r, dict): continue
+            rent = _sabri_num(r.get("roomMinPrice"))
+            if rent is None: rent = _sabri_num(r.get("minPriceWithoutDiscount"))
+            if rent is None or rent <= 0: continue
+            out["cards"].append({"rent": rent,
+                                 "available": r.get("status") == 1,
+                                 "label": _s(r.get("listingStatus"))})
+        out["count"] = int(d.get("count") or len(out["cards"]))
+        out["total_pages"] = int(d.get("totalPages") or 1)
+        return out
+    return out
+
+def _padsplit_fetch(url):
+    """One PadSplit page fetch (browser UA — the site serves its SSR
+    payload to ordinary agents). Returns the HTML or None."""
+    if not url: return None
+    try:
+        r = requests.get(url, headers={"User-Agent":
+                         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"},
+                         timeout=30)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        app.logger.warning(f"comp pull: PadSplit fetch failed for {url}: {e!r}")
+        return None
+
+def _padsplit_pull(prop):
+    """Fetch the OFFICIAL PadSplit room rents for the subject (v56):
+    the ZIP search page first; when the ZIP itself yields fewer than
+    PADSPLIT_MIN_CARDS cards, widen to the city page (at most
+    PADSPLIT_MAX_PAGES pages) and label the payload city-wide with
+    the ZIP count noted. Returns the storable payload
+    {"weekly_rents", "n", "scope", "zip_n", "url", "date",
+    "available", "waitlist"} or None — any failure (blocked, no
+    data, host egress) leaves the stored Tier-B benchmark path
+    exactly as it was; the reason is logged at the failure point."""
+    city, state = _s(prop["city"]), _s(prop["state"])
+    zipc = str(prop["zip"] or "")[:5]
+    if not city or not state or not zipc: return None
+    today = datetime.date.today().isoformat()
+    def _payload(cards, scope, zip_n, url):
+        return {"weekly_rents": [c["rent"] for c in cards], "n": len(cards),
+                "scope": scope, "zip_n": zip_n, "url": url, "date": today,
+                "available": sum(1 for c in cards if c["available"]),
+                "waitlist": sum(1 for c in cards if not c["available"])}
+    zip_url = _padsplit_url(city, state, zipc)
+    got = _padsplit_parse(_padsplit_fetch(zip_url) or "")
+    zip_cards = got["cards"]
+    if len(zip_cards) >= PADSPLIT_MIN_CARDS:
+        return _payload(zip_cards, "zip", len(zip_cards), zip_url)
+    city_cards, city_url = [], _padsplit_url(city, state)
+    for page in range(1, PADSPLIT_MAX_PAGES + 1):
+        got_c = _padsplit_parse(_padsplit_fetch(_padsplit_url(city, state, page=page)) or "")
+        city_cards.extend(got_c["cards"])
+        if len(city_cards) >= PADSPLIT_MIN_CARDS: break
+        if page >= (got_c["total_pages"] or 1): break
+    if city_cards:
+        return _payload(city_cards, "city", len(zip_cards), city_url)
+    app.logger.warning(f"comp pull: PadSplit pull for {prop['address']}: "
+                       f"no room cards in ZIP {zipc} or the {city} pages")
+    return None
+
+def _padsplit_benchmark(prop):
+    """The stored Tier-A benchmark for one property, in coliving_stats'
+    dict shape — or None when no successful pull is stored (or the
+    stored pull is too thin to benchmark). Median of ALL room cards
+    the pull captured for the scope (available + waitlist, each card
+    contributing its advertised weekly rent)."""
+    try:
+        raw = prop["padsplit_json"]
+    except Exception:
+        raw = None
+    if not raw: return None
+    try:
+        ps = json.loads(raw)
+    except Exception:
+        return None
+    rents = [float(x) for x in (ps.get("weekly_rents") or [])
+             if isinstance(x, (int, float)) and x > 0]
+    if len(rents) < PADSPLIT_MIN_CARDS: return None
+    wk = _median(rents)
+    if ps.get("scope") == "city":
+        scope_txt = (f"the {prop['city']} area (city-wide listings — ZIP "
+                     f"{str(prop['zip'] or '')[:5]} itself listed "
+                     f"{ps.get('zip_n', 0)} room(s))")
+    else:
+        scope_txt = f"ZIP {str(prop['zip'] or '')[:5]}"
+    try:
+        pdate = prop["padsplit_date"]
+    except Exception:
+        pdate = None
+    return {"weekly_per_room": round(wk), "monthly_per_room": round(wk * 52 / 12),
+            "n": len(rents),
+            "method": (f"Median of the {len(rents)} weekly room rents listed on "
+                       f"PadSplit for {scope_txt} — available + waitlist rooms, "
+                       f"one advertised rent per listed home. Actual PadSplit "
+                       f"listing data (Tier A), not a whole-house estimate."),
+            "source": "PadSplit (official listings)",
+            "date": pdate or ps.get("date") or "",
+            "padsplit_n": len(rents), "padsplit_scope": ps.get("scope") or "zip",
+            "padsplit_url": ps.get("url") or ""}
 
 def pinned_sold_stats(sold):
     """Sold-view header averages from the PINNED set (falls back to top 3 by score, labeled)."""
@@ -1583,6 +1756,51 @@ def _is_subject_addr(prop, addr):
     row_street, _ru = _addr_unit_split(addr)
     subj_clean, _su = _addr_unit_split(subj_street)
     return _norm_addr(row_street) == _norm_addr(subj_clean)
+
+_STREET_TYPE = {"ct": "ct", "court": "ct", "ave": "ave", "avenue": "ave",
+                "st": "st", "street": "st", "dr": "dr", "drive": "dr",
+                "rd": "rd", "road": "rd", "ln": "ln", "lane": "ln",
+                "blvd": "blvd", "boulevard": "blvd", "cir": "cir", "circle": "cir",
+                "ter": "ter", "terrace": "ter", "pl": "pl", "place": "pl",
+                "trl": "trl", "trail": "trl", "hwy": "hwy", "highway": "hwy",
+                "way": "way", "pkwy": "pkwy", "parkway": "pkwy"}
+
+def _street_type(street_text):
+    """The canonical street-TYPE suffix of an address (ct/ave/st/...)
+    or None when the address carries none. The last token decides:
+    '110 Garland Ct' -> 'ct', '1210 E 140th Ave' -> 'ave'."""
+    toks = re.findall(r"[a-z0-9]+", (street_text or "").lower())
+    if toks and toks[0].isdigit(): toks = toks[1:]
+    return _STREET_TYPE.get(toks[-1]) if toks else None
+
+def _same_street(prop, comp_addr):
+    """0 when the comp sits on the SUBJECT'S OWN STREET, else 1 (v56 —
+    Sherif's same-street-first rule, 2026-11-05: "It has to pull comps
+    on the same street first"). Street identity is the _street_key
+    CORE (street name minus suffixes/directionals/house number) of
+    the unit-stripped address on both sides, so a different house
+    number on the subject's street counts and a unit-suffixed twin
+    of the subject counts. One guard on top of core equality: when
+    BOTH addresses carry a street-TYPE suffix, the types must agree
+    (canonicalized, so Ct == Court) — _street_key strips the type by
+    design, and without the guard "Garland Ave" would claim the
+    street of a "Garland Ct" subject (Main St is not Main Ave). A
+    missing suffix on either side is neutral. This is the FIRST sort
+    key of the sold/rent views and of the pull-time auto-pin — ahead
+    of comp_tier, which is deliberately left unchanged: ReiSearch
+    (measured live 2026-11-05) orders pinned -> weighted score and
+    holds ZERO same-street comps for Garland, so this rule is
+    Sherif's own, beyond ReiSearch."""
+    if not comp_addr: return 1
+    subj_street = prop["street"] or (prop["address"] or "").split(",")[0]
+    s_clean, _su = _addr_unit_split(subj_street)
+    c_clean, _cu = _addr_unit_split(comp_addr)
+    _sn, s_core = _street_key(s_clean)
+    _cn, c_core = _street_key(c_clean)
+    if not (s_core and c_core and s_core == c_core): return 1
+    s_type, c_type = _street_type(s_clean), _street_type(c_clean)
+    if s_type and c_type and s_type != c_type: return 1
+    return 0
 
 _ADDR_ARTIFACT_RE = re.compile(r"#\s*[-#]?\s*[a-z]{2,}\s*$", re.I)
 
@@ -2913,6 +3131,15 @@ def _zillow_subject_fill(d, prop, today):
                            f"the subject — treated as no-match, nothing filled")
         return None
     v = _pz_subject_values(det)
+    if v.get("zpid") and not prop["zpid"]:
+        # v56: persist the zpid the by-address payload carried. The
+        # zpid-only backup APIs (ReefAPI Zillow detail, Unofficial
+        # images) can only answer with it — v48 extracted it in
+        # _pz_subject_values and then discarded it, so no backup path
+        # could ever fire for a subject the primary path had touched.
+        d.execute("UPDATE properties SET zpid=? WHERE id=?",
+                  (str(v["zpid"]), prop["id"]))
+        d.commit()
     fills = {}
     for col in ("beds", "baths", "sqft", "year_built", "lat", "lon"):
         if not prop[col] and v[col]:
@@ -2933,6 +3160,161 @@ def _zillow_subject_fill(d, prop, today):
                        f"({attempts} call{'s' if attempts > 1 else ''}, RapidAPI (Zillow))")
     return {"photos": len(v["photos"]) if "photos_json" in fills else 0,
             "fields": sorted(fills)}
+
+# v56: the two Zillow BACKUP subject paths (capture doc 2026-11-05).
+# Both are zpid-only APIs, which is why the primary fill now persists
+# the zpid: when private-zillow's by-address path cannot answer from
+# a host (live PA evidence all night 2026-11-05: 503 throttling, then
+# 404s), these are the remaining free routes to the subject's own
+# Zillow record — same blank-fill discipline, same sanity posture.
+RAPIDAPI_REEF_ZILLOW_HOST = "zillow-real-estate-data-api.p.rapidapi.com"
+RAPIDAPI_UNOFF_ZILLOW_HOST = "unofficial-zillow-api2.p.rapidapi.com"
+
+def _pz_autocomplete_zpid(prop):
+    """ONE private-zillow /autocomplete attempt resolving the
+    subject's zpid from its full address (v56). The response shape
+    was not captured in the playground (the by-address endpoint made
+    it unnecessary there), so the zpid is searched recursively —
+    any nesting that carries one answers; no zpid anywhere is an
+    honest None and no further backup fires."""
+    data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, "/autocomplete",
+                              {"query": prop["address"]})
+    if err is not None or data is None: return None
+    def _find(o):
+        if isinstance(o, dict):
+            z = o.get("zpid")
+            if z not in (None, ""): return z
+            for v in o.values():
+                r = _find(v)
+                if r is not None: return r
+        elif isinstance(o, list):
+            for v in o:
+                r = _find(v)
+                if r is not None: return r
+        return None
+    z = _find(data)
+    return str(z) if z is not None else None
+
+def _reef_zillow_values(det):
+    """One ReefAPI Zillow /property_detail `data` object -> candidate
+    subject fill values (pure; no I/O). Captured shape (2026-11-05):
+    beds / baths / sqft / year_built, zestimate_usd, list_price_usd
+    (the SAME Zestimate-equivalent on an off-market property — read
+    only as the estimate, never a list price), latitude / longitude,
+    photos[] as plain URL strings."""
+    if not isinstance(det, dict): return {}
+    photos = []
+    for u in det.get("photos") or []:
+        u = _s(u)
+        if u.startswith("http") and u not in photos: photos.append(u)
+    return {"beds": _sabri_num(det.get("beds")),
+            "baths": _sabri_num(det.get("baths")),
+            "sqft": _sabri_num(det.get("sqft")),
+            "year_built": (int(_sabri_num(det.get("year_built")))
+                           if _sabri_num(det.get("year_built")) else None),
+            "lat": _sabri_num(det.get("latitude")), "lon": _sabri_num(det.get("longitude")),
+            "photos": photos,
+            "zestimate": _sabri_num(det.get("zestimate_usd")) or _sabri_num(det.get("list_price_usd")),
+            "city": _s(det.get("city")), "zip": _s(det.get("zipcode")) or _s(det.get("zip"))}
+
+def _reef_zillow_subject_fill(d, prop, today):
+    """The ReefAPI Zillow subject backup (v56): POST /property_detail
+    by zpid — the STORED zpid when the subject has one, else ONE pz
+    /autocomplete attempt. Fires only when the primary by-address
+    fill returned nothing. Sanity posture mirrors _pz_subject_match
+    (a contradicting city/ZIP, or coordinates over a mile away, is a
+    no-match and fills nothing — and does not persist the zpid).
+    A sanity-passed payload persists its zpid even when every field
+    was already filled, so the images fallback below can trust it.
+    Blank-fill ONLY; the Zestimate-shaped price lands in est_zillow,
+    never list_price. Returns the fill summary or None."""
+    if not _rapidapi_key(): return None
+    zpid = prop["zpid"] or _pz_autocomplete_zpid(prop)
+    if not zpid:
+        app.logger.warning(f"comp pull: ReefAPI Zillow subject backup for "
+                           f"{prop['address']}: no zpid resolvable — backup cannot fire")
+        return None
+    data, err = _rapidapi_post(RAPIDAPI_REEF_ZILLOW_HOST, "/property_detail",
+                               {"zpid": str(zpid)})
+    if err is not None:
+        app.logger.warning(f"comp pull: ReefAPI Zillow subject backup failed for "
+                           f"{prop['address']}: {_rapi_fail_reason(err)}")
+        return None
+    det = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(det, dict) or not det:
+        app.logger.warning(f"comp pull: ReefAPI Zillow subject backup for "
+                           f"{prop['address']}: no data in response")
+        return None
+    v = _reef_zillow_values(det)
+    if v["city"] and prop["city"] and v["city"].strip().lower() != prop["city"].strip().lower():
+        app.logger.warning(f"comp pull: ReefAPI Zillow subject backup for "
+                           f"{prop['address']}: city contradicts the subject — no-match")
+        return None
+    if v["zip"] and prop["zip"] and str(v["zip"])[:5] != str(prop["zip"])[:5]:
+        app.logger.warning(f"comp pull: ReefAPI Zillow subject backup for "
+                           f"{prop['address']}: ZIP contradicts the subject — no-match")
+        return None
+    if v["lat"] is not None and v["lon"] is not None and prop["lat"] is not None and prop["lon"] is not None:
+        dist = haversine_mi(prop["lat"], prop["lon"], v["lat"], v["lon"])
+        if dist is not None and dist > 1.0:
+            app.logger.warning(f"comp pull: ReefAPI Zillow subject backup for "
+                               f"{prop['address']}: payload sits {dist} mi away — no-match")
+            return None
+    if not prop["zpid"]:
+        d.execute("UPDATE properties SET zpid=? WHERE id=?", (str(zpid), prop["id"]))
+        d.commit()
+    fills = {}
+    for col in ("beds", "baths", "sqft", "year_built", "lat", "lon"):
+        if not prop[col] and v[col]:
+            fills[col] = v[col]
+    if v["photos"] and not prop["photos_json"] and not prop["photo_url"]:
+        fills["photos_json"] = json.dumps(v["photos"]); fills["photos_date"] = today
+        fills["photo_url"] = v["photos"][0]
+    if v["zestimate"] and not prop["est_zillow"]:
+        fills["est_zillow"] = v["zestimate"]; fills["est_date"] = today
+    if not fills:
+        app.logger.warning(f"comp pull: ReefAPI Zillow subject backup for "
+                           f"{prop['address']}: matched, but every field was already filled")
+        return None
+    d.execute(f"UPDATE properties SET {','.join(k + '=?' for k in fills)} WHERE id=?",
+              (*fills.values(), prop["id"]))
+    app.logger.warning(f"comp pull: ReefAPI Zillow subject backup for {prop['address']}: "
+                       f"filled {', '.join(sorted(fills))} (zpid {zpid})")
+    return {"photos": len(v["photos"]) if "photos_json" in fills else 0,
+            "fields": sorted(fills)}
+
+def _unofficial_zillow_photos_fill(d, prop, today):
+    """The third subject fallback (v56): Unofficial-Zillow images by
+    zpid (captured shape: data.images[].url — 23 for Garland). It
+    fills PHOTOS ONLY, and only under a TRUSTED zpid: the stored
+    column, which is written solely by a sanity-matched primary or
+    ReefAPI payload. With no trusted zpid it never fires — an
+    address-autocomplete guess alone does not put another house's
+    photos on this subject. Returns the fill summary or None."""
+    if not _rapidapi_key(): return None
+    zpid = prop["zpid"]
+    if not zpid: return None
+    if prop["photos_json"] or prop["photo_url"]: return None
+    data, err = _rapidapi_get(RAPIDAPI_UNOFF_ZILLOW_HOST, "/api/property/images",
+                              {"zpid": str(zpid)})
+    if err is not None:
+        app.logger.warning(f"comp pull: Unofficial-Zillow images failed for "
+                           f"{prop['address']}: {_rapi_fail_reason(err)}")
+        return None
+    imgs = _rapi_dig(data, "data", "images")
+    photos = []
+    for im in imgs if isinstance(imgs, list) else []:
+        u = _s(im.get("url")) if isinstance(im, dict) else _s(im)
+        if u.startswith("http") and u not in photos: photos.append(u)
+    if not photos:
+        app.logger.warning(f"comp pull: Unofficial-Zillow images for "
+                           f"{prop['address']}: no images in response")
+        return None
+    d.execute("UPDATE properties SET photos_json=?, photos_date=?, photo_url=? WHERE id=?",
+              (json.dumps(photos), today, photos[0], prop["id"]))
+    app.logger.warning(f"comp pull: Unofficial-Zillow images for {prop['address']}: "
+                       f"filled {len(photos)} photos (zpid {zpid})")
+    return {"photos": len(photos), "fields": ["photo_url", "photos_date", "photos_json"]}
 
 def _pz_sold_item_to_row(item):
     """One private-zillow /search/bymapbounds item -> the standard
@@ -3081,8 +3463,19 @@ def _rapidapi_sold_frame(prop, past_days=365, radius_mi=1.0):
     Sabri tops up. A source that errors never blocks the others."""
     if not _rapidapi_key(): return [], None, []
     frames, outcomes, in_gate_total, last_err = [], [], 0, None
+    ss_found = False   # v56: any accumulated row on the subject's own street
     for key in RAPIDAPI_SOLD_SOURCES:
-        if frames and in_gate_total >= RAPIDAPI_UNION_RICH: break
+        # v56 SAME-STREET GUARANTEE (Sherif 2026-11-05): the rich-stop
+        # may only fire once the accumulated rows include the subject's
+        # own street. A rich union of off-street rows (the live Garland
+        # failure: 295 comps, none from Garland Ct in the top ranks)
+        # must NOT skip the address-centered sources — Sabri's
+        # coordinate search, then private-zillow's bounds search —
+        # which are the ones that can answer street-level. When a
+        # same-street row already exists the stop is exactly as before,
+        # so the guarantee adds NO Sabri calls in that case (Sabri is
+        # 30/mo; the discipline is part of the rule).
+        if frames and in_gate_total >= RAPIDAPI_UNION_RICH and ss_found: break
         rows, err, label = _rapi_call_source(key, prop, past_days, radius_mi)
         oc = _rapi_outcome(key, rows, err, label, prop, radius_mi,
                            note=_rapi_take_note(key))
@@ -3091,6 +3484,8 @@ def _rapidapi_sold_frame(prop, past_days=365, radius_mi=1.0):
         if rows:
             frames.append((_hh_frame(rows), label))
             in_gate_total += oc["in_gate"]
+            if not ss_found:
+                ss_found = any(_same_street(prop, r.get("street")) == 0 for r in rows)
     if not frames: return [], last_err, outcomes
     return frames, None, outcomes
 
@@ -3579,11 +3974,18 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     # on already-complete ones. Failure/no-match changes nothing: the
     # honest could-not-be-filled state above stands. ---
     if _rapidapi_key():
+        def _still_lacks(row):
+            return (not row["beds"] or not row["baths"] or not row["sqft"]
+                    or not row["year_built"]
+                    or (not row["photos_json"] and not row["photo_url"]))
+        def _note_zfill(res, label):
+            nonlocal photos_found
+            d.commit()
+            photos_found = max(photos_found, res["photos"])
+            warnings[:] = [w for w in warnings if "could not be auto-filled" not in w]
+            warnings.append(label)
         _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
-        _lacks = (not _prop_now["beds"] or not _prop_now["baths"] or not _prop_now["sqft"]
-                  or not _prop_now["year_built"]
-                  or (not _prop_now["photos_json"] and not _prop_now["photo_url"]))
-        if _lacks:
+        if _still_lacks(_prop_now):
             try:
                 _zf = _zillow_subject_fill(d, _prop_now, today)
             except Exception as _ze:
@@ -3591,10 +3993,36 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                                    f"{addr_line}: {_ze!r}")
                 _zf = None
             if _zf:
-                d.commit()
-                photos_found = max(photos_found, _zf["photos"])
-                warnings[:] = [w for w in warnings if "could not be auto-filled" not in w]
-                warnings.append("subject specs/photos filled from Zillow via RapidAPI")
+                _note_zfill(_zf, "subject specs/photos filled from Zillow via RapidAPI")
+            # v56 backups: the by-address path is ONE wrapper; when it
+            # cannot answer from this host, the zpid-only ReefAPI
+            # Zillow detail is the second route, and the Unofficial
+            # images endpoint (trusted stored zpid only) the third.
+            # Each step re-reads the subject and fires only while the
+            # lack it can cure persists.
+            _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
+            if _still_lacks(_prop_now):
+                try:
+                    _zf2 = _reef_zillow_subject_fill(d, _prop_now, today)
+                except Exception as _ze2:
+                    app.logger.warning(f"comp pull: ReefAPI Zillow subject backup raised for "
+                                       f"{addr_line}: {_ze2!r}")
+                    _zf2 = None
+                if _zf2:
+                    _note_zfill(_zf2, "subject specs/photos filled from Zillow via RapidAPI "
+                                      "(ReefAPI backup)")
+            _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
+            if (not _prop_now["photos_json"] and not _prop_now["photo_url"]
+                    and _prop_now["zpid"]):
+                try:
+                    _zf3 = _unofficial_zillow_photos_fill(d, _prop_now, today)
+                except Exception as _ze3:
+                    app.logger.warning(f"comp pull: Unofficial-Zillow images fill raised for "
+                                       f"{addr_line}: {_ze3!r}")
+                    _zf3 = None
+                if _zf3:
+                    _note_zfill(_zf3, "subject photos filled from Zillow via RapidAPI "
+                                      "(Unofficial-Zillow backup)")
     # --- county parcel record (v3.4): blank-fill APN / assessor value / last
     # sale from the county GIS where a probed endpoint covers the county ---
     try:
@@ -3604,6 +4032,25 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     except Exception as e:
         app.logger.warning(f"comp pull: county parcel fill failed for {addr_line}: {e!r}")
         warnings.append("county parcel lookup failed")
+    # --- official PadSplit benchmark pull (v56, Tier A): the area's
+    # actual listed $/wk per room, stored on the property for
+    # coliving_stats to prefer over the Tier-B derivation. Best-effort
+    # like every frame here: any failure leaves the stored state and
+    # Tier B exactly as they were (the reason is logged inside
+    # _padsplit_pull / _padsplit_fetch). ---
+    try:
+        _ps = _padsplit_pull(prop)
+    except Exception as _pse:
+        app.logger.warning(f"comp pull: PadSplit pull raised for {addr_line}: {_pse!r}")
+        _ps = None
+    if _ps:
+        d.execute("UPDATE properties SET padsplit_json=?, padsplit_date=? WHERE id=?",
+                  (json.dumps(_ps), today, prop["id"])); d.commit()
+        _ps_med = _median([float(x) for x in _ps["weekly_rents"]]) or 0
+        _ps_scope = (f"ZIP {str(prop['zip'] or '')[:5]}" if _ps["scope"] == "zip"
+                     else f"{prop['city']} city-wide (ZIP itself listed {_ps['zip_n']})")
+        warnings.append(f"PadSplit (official listings): {_ps['n']} rooms listed in "
+                        f"{_ps_scope} — median ${_ps_med:,.0f}/wk per room")
     # --- P0-1/P0-2 widening (Sherif 2026-11-02): the match-first views need a
     # real matched set. If the stored sold set holds <10 Tier-1 matches, run ONE
     # widened sold scrape (2x radius, min 2 mi; 730 days) and merge it; if the
@@ -3635,6 +4082,32 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             if wide is None: continue
             a3, u3, _ = _merge_sold_frame(d, prop2, wide, wide_r, subj2)
             added += a3; updated += u3; got = True
+        # v56: on egress-restricted hosts the HomeHarvest widening above
+        # can never answer (PA blocks realtor.com), which left the
+        # widening a no-op exactly where it was needed. The widening
+        # now ALSO re-runs the two frames that CAN answer there — the
+        # FL Cadastral frame (self-guards to FL subjects) and the
+        # RapidAPI sold union — at the widened radius / 730 days,
+        # merged through the same shared gate as every sold frame.
+        try:
+            cad_wide, _cadw_err = _fl_cadastral_frame(prop2, wide_r)
+        except Exception as _cadw_boom:
+            cad_wide = None
+            app.logger.warning(f"comp pull: widened FL Cadastral frame raised for {addr_line}: {_cadw_boom!r}")
+        if cad_wide is not None:
+            a3, u3, _ = _merge_sold_frame(d, prop2, cad_wide, wide_r, subj2,
+                                          source_override=CADASTRAL_SRC)
+            added += a3; updated += u3; got = True
+        if _rapidapi_key():
+            try:
+                rapi_wide, _rwide_err, _rwide_oc = _rapidapi_sold_frame(prop2, 730, wide_r)
+            except Exception as _rwide_boom:
+                rapi_wide = []
+                app.logger.warning(f"comp pull: widened RapidAPI sold frame raised for {addr_line}: {_rwide_boom!r}")
+            for _wdf, _wlbl in rapi_wide:
+                a3, u3, _ = _merge_sold_frame(d, prop2, _wdf, wide_r, subj2,
+                                              source_override=_wlbl)
+                added += a3; updated += u3; got = True
         if got:
             d.commit()
             t1b = _tier1_count(); t1wb = _tier1_count(past_days)
@@ -3670,7 +4143,12 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     if not pinned_now:
         rows = [dict(r) for r in d.execute(
             "SELECT * FROM comps WHERE property_id=? AND kind='sold' AND excluded=0", (prop["id"],)).fetchall()]
-        rows.sort(key=lambda c: (comp_tier(subj2, c), -(c["match_score"] or 0),
+        # v56: same-street first here too — the auto-pinned set is what
+        # the ARV is built from, so a same-street comp (even a Tier-3
+        # county row with no beds/baths) pins ahead of off-street
+        # Tier-1 matches; tier/score/distance order inside the bucket.
+        rows.sort(key=lambda c: (_same_street(prop2, c["address"]), comp_tier(subj2, c),
+                                 -(c["match_score"] or 0),
                                  c["distance_mi"] if c["distance_mi"] is not None else 9e9))
         for t in rows[:3]: d.execute("UPDATE comps SET pinned=1 WHERE id=?", (t["id"],))
         d.commit()
@@ -5684,11 +6162,19 @@ def property_page(pid):
     # orders WITHIN a tier, it no longer outranks a better beds/baths/sqft
     # match. Rentals: exact beds/baths matches first, then near, then the rest.
     _subj = {"beds": p["beds"], "baths": p["baths"], "sqft": p["sqft"]}
-    sold_view.sort(key=lambda c: (comp_tier(_subj, dict(c)), -(c["pinned"] or 0),
+    # v56: SAME STREET FIRST (Sherif 2026-11-05) — the street bucket
+    # leads both sorts; tier / match group / pinned / score / distance
+    # keep their established order inside it.
+    sold_view.sort(key=lambda c: (_same_street(p, c["address"]), comp_tier(_subj, dict(c)),
+                                  -(c["pinned"] or 0),
                                   -(c["match_score"] or 0),
                                   c["distance_mi"] if c["distance_mi"] is not None else 9e9))
-    rents_view.sort(key=lambda c: (rent_match_group(_subj, dict(c)), -(c["match_score"] or 0),
+    rents_view.sort(key=lambda c: (_same_street(p, c["address"]), rent_match_group(_subj, dict(c)),
+                                   -(c["match_score"] or 0),
                                    c["distance_mi"] if c["distance_mi"] is not None else 9e9))
+    # v56: the cards carrying the "Same street" badge (comp ids in view).
+    same_street_ids = {c["id"] for c in sold_view + rents_view
+                       if _same_street(p, c["address"]) == 0}
     # v48 D6: collapse stored duplicates for display (best-scored copy
     # of each address+unit+beds wins — the list is already in display
     # order). Header counts below read THIS list, so they reflect the
@@ -5724,7 +6210,7 @@ def property_page(pid):
     # older than the window. Both bases are labeled on the page.
     sold_older_n = len([c for c in sold if c["event_date"] and c["event_date"] < cutoff])
     ltr = ltr_stats(rents_view)
-    coli = coliving_stats(rents_view)
+    coli = coliving_stats(rents_view, p)
     med_rent = ltr["median_rent"] if ltr else None
     afford_view = [c for c in rents_view if med_rent and c["price"] and c["price"] < med_rent]
     breakdowns = {}
@@ -5783,7 +6269,7 @@ def property_page(pid):
                            trend_svg=trend_svg, tab=tab, amort=amort, amenities=amenities,
                            photos=photos, job=banner_job, steps=steps,
                            cview=cview, window=window, rmax=rmax, sold_view=sold_view, rents_view=rents_view,
-                           rent_match=rent_match,
+                           rent_match=rent_match, same_street_ids=same_street_ids,
                            sold_stats=sold_stats, set_stats=set_stats, sold_older_n=sold_older_n,
                            ltr=ltr, coli=coli, med_rent=med_rent, afford_view=afford_view,
                            breakdowns=breakdowns, room_est=room_est,

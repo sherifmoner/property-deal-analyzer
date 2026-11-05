@@ -24,6 +24,12 @@
 {# fallback ONLY when the row carries no stored listing URL #}
 <a class="sl-chip" target="_blank" rel="noopener" href="https://www.zillow.com/homes/{{ zslug }}_rb/">Zillow ↗</a>
 <a class="sl-chip" target="_blank" rel="noopener" href="https://www.realtor.com/realestateandhomes-search/{{ street|replace(' ', '-') }}_{{ city|replace(' ', '-') }}_{{ state }}_{{ zip }}">Realtor ↗</a>{% endif %}
+{# v56 (Sherif 2026-11-05): a PadSplit chip on EVERY card — comp cards and
+   the subject card alike (this macro serves both). Verified URL form:
+   padsplit.com/rooms-for-rent/{city-slug}-{state}?zip={zip} — the ZIP is
+   a query param; there is no ZIP path segment. Searches the CARD's own
+   city/ZIP (for the subject card, the subject's). #}
+{% if city and zip %}<a class="sl-chip" target="_blank" rel="noopener" href="https://www.padsplit.com/rooms-for-rent/{{ city|lower|replace(' ', '-') }}-{{ state|lower }}?zip={{ zip }}" title="Rooms for rent in this area on PadSplit">PadSplit ↗</a>{% endif %}
 </div>{% endif %}
 {% endmacro %}
 {% macro compcard(c, mode) %}
@@ -34,6 +40,7 @@
  <div class="cprice">{% if mode=='rent' %}{{ c.price|money }}<span class="small muted">/mo rent</span>{% else %}{{ c.price|money }}{% endif %}</div>
  {% if mode=='sold' %}<div class="small" data-comp-status>{% if c.kind=='active' %}Listed · {{ c.event_date|datefmt }} (asking) · <span class="badge" style="background:#fef3c7;color:#92400e">● ACTIVE LISTING</span>{% else %}Sold · {{ c.event_date|datefmt }}{% endif %}</div>{% endif %}
  {% if c.pinned %}<div class="small" data-comp-pin><span class="pin">📌 Pinned #{{ pinned_rank.get(c.id, '') }}</span></div>{% endif %}
+ {% if same_street_ids and c.id in same_street_ids %}<div class="small" data-comp-street><span class="badge" data-same-street style="background:#dcfce7;color:#166534">📍 Same street</span></div>{% endif %}
  <div class="small" data-comp-address><b>{{ c.address }}</b>, {{ c.city }} {{ c.zip }}</div>
  <div class="small muted" data-comp-specs>{{ c.beds|num }}bd • {{ c.baths|num }}ba • {{ (c.sqft|int) if c.sqft else '—' }}sqft • Built {{ c.year_built or '—' }}{% if c.distance_mi is not none %} • 📍 {{ c.distance_mi|num(2) }} mi{% endif %}</div>
  {% if mode=='sold' %}
@@ -68,12 +75,13 @@
  <div class="cprice">{{ p.list_price|money }}<span class="small muted"> list</span></div>
  <div class="small" data-subj-address><b>{{ p.address }}</b></div>
  <div class="small muted" data-subj-specs>{{ p.beds|num }}bd • {{ p.baths|num }}ba • {{ (p.sqft|int) if p.sqft else '—' }}sqft • Built {{ p.year_built or '—' }}</div>
+ <div class="small" data-subj-street><span class="badge" data-same-street style="background:#dcfce7;color:#166534">📍 Same street — this property's street; its comps sort first</span></div>
  {% if p.lot_sqft and p.list_price and p.sqft %}<div class="small muted" data-subj-lot>Lot size: {{ '%.2f'|format(p.lot_sqft / 43560) }} acres · Sqft Price: ${{ (p.list_price / p.sqft)|round|int }}</div>{% endif %}
  {% if mode=='sold' %}<div class="small">Status {{ p.status }} · {{ p.deal_method }} · Flood zone {{ p.flood_zone or 'Not found' }}</div>
  {% elif mode=='coliving' %}
  <div class="small"><b>ZIP {{ p.zip }} stats</b><br>
- {% if coli %}Avg shared-bath room rent: <b>${{ coli.weekly_per_room }}/wk</b> (from {{ coli.n }} rental comps)<br>{% else %}Room rent: Not found — pull comps<br>{% endif %}
- Occupancy: Not found (no free PadSplit feed)<br>Active rooms: Not found</div>
+ {% if coli %}Avg shared-bath room rent: <b>${{ coli.weekly_per_room }}/wk</b> (from {{ coli.n }} {{ 'rooms listed on PadSplit' if coli.padsplit_n else 'rental comps' }})<br>{% else %}Room rent: Not found — pull comps<br>{% endif %}
+ {% if coli and coli.padsplit_n %}Active rooms: {{ coli.padsplit_n }} rooms listed on PadSplit in ZIP {{ p.zip }} (pulled {{ coli.date }})<br>Occupancy: Not found{% else %}Occupancy: Not found (no free PadSplit feed)<br>Active rooms: Not found{% endif %}</div>
  {% elif mode=='rent' %}<div class="small">Rent benchmark for this ZIP: {% if ltr %}<b>{{ ltr.avg_rent|money }}/mo</b> avg of {{ ltr.basis }} set{% else %}Not found — pull comps{% endif %}</div>
  {% endif %}
  {{ sitelinks(p.street, p.city, p.state, p.zip, none, none) }}
@@ -106,7 +114,13 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 · <a target="_blank" href="https://www.google.com/maps/search/{{ p.address|urlencode }}">Maps</a>
 · <a target="_blank" href="https://www.zillow.com/homes/{{ ((p.street or p.address) ~ ' ' ~ p.city ~ ' ' ~ p.state ~ ' ' ~ p.zip)|replace(',', '')|replace(' ', '-') }}_rb/">Zillow</a>
 · <a target="_blank" href="https://www.realtor.com/realestateandhomes-search/{{ (p.street or p.address)|replace(' ', '-') }}_{{ p.city|replace(' ', '-') }}_{{ p.state }}_{{ p.zip }}">Realtor</a>
-· <a target="_blank" href="https://www.redfin.com/search?query={{ p.address|urlencode }}">Redfin</a></p>
+· <a target="_blank" href="https://www.redfin.com/search?query={{ p.address|urlencode }}">Redfin</a>
+· <a target="_blank" href="https://www.padsplit.com/rooms-for-rent/{{ (p.city or '')|lower|replace(' ', '-') }}-{{ (p.state or '')|lower }}?zip={{ p.zip }}">PadSplit</a></p>
+{# v56 (Sherif 2026-11-05): the subject's own specs line IN THE HEADER —
+   it renders above the tab dispatch, so Overview, Comparables and
+   Underwriting all carry it. Values are the property record's own;
+   a missing value shows —, never an invented number. #}
+<p class="specsline" data-subj-specs style="margin-top:-6px;font-size:15px"><b>{{ p.beds|num }} bd • {{ p.baths|num }} ba • {{ p.sqft|num }} sqft • Built {{ p.year_built or '—' }}</b>{% if p.lot_sqft %} • Lot {{ p.lot_sqft|num }} sqft{% endif %}</p>
 <p class="small muted" data-added-line style="margin-top:-6px">Added {{ added_pretty }}</p>
 
 {% if job %}
@@ -496,10 +510,10 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div class="card"><h2>Co-Living benchmark — ZIP {{ p.zip }}</h2>
 {% if coli %}<div class="kv">
 <div><span>Estimated room rent (shared bath)</span><b>${{ coli.weekly_per_room }}/wk · ${{ coli.monthly_per_room }}/mo</b></div>
-<div><span>Based on</span><b>{{ coli.n }} rental comps</b></div>
+<div><span>Based on</span><b>{{ coli.n }} {{ 'PadSplit rooms listed' if coli.padsplit_n else 'rental comps' }}</b></div>
 <div><span>How it's estimated</span><b style="font-size:12px">{{ coli.method }}</b></div>
 <div><span>Source</span><b style="font-size:12px">{{ coli.source }} · {{ coli.date }}</b></div></div>
-<p class="small muted">This benchmark pre-fills the Co-Living underwriting rent per room from ZIP room-rent stats. It is an estimate from whole-house rents, not live PadSplit listings (no free PadSplit feed exists).</p>
+{% if coli.padsplit_n %}<p class="small muted">This benchmark pre-fills the Co-Living underwriting rent per room from the official PadSplit listings pulled for this area — the median of the listed weekly room rents (available + waitlist). See the PadSplit link on the subject card.</p>{% else %}<p class="small muted">This benchmark pre-fills the Co-Living underwriting rent per room from ZIP room-rent stats. It is an estimate from whole-house rents, not live PadSplit listings (no free PadSplit feed exists).</p>{% endif %}
 {% else %}<p class="muted">Not found — not enough rental comps with bedroom counts to estimate a per-room rent yet. Pull comps (with a wider radius if needed) and this benchmark will appear.</p>{% endif %}</div>
 {% if rents_view %}<p class="small muted" data-match-note>Subject match ({{ p.beds|num }} bd / {{ p.baths|num }} ba): <b>{{ rent_match.exact }} exact</b> beds/baths matches · <b>{{ rent_match.near }}</b> near (beds or baths within ±1) · {{ rent_match.total }} rental listings shown, best matches first. Room rents in this view are per-room estimates from these whole-house listings (see the ZIP benchmark above).{% if not rent_match.exact %} No exact beds/baths-match rentals exist in the free listing sources for this subject — nothing was padded or invented to fill the view.{% endif %}</p>
 <div class="compcards">{{ subjcard('coliving') }}{% for c in rents_view %}{{ compcard(c, 'coliving') }}{% endfor %}</div>
