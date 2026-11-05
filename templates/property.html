@@ -4,18 +4,25 @@
    Built from the row's own stored address fields; only links the data supports. #}
 {% set street = (street or '')|trim %}{% set city = (city or '')|trim %}{% set state = (state or '')|trim %}{% set zip = (zip or '')|string|trim %}
 {% if street or source_url %}<div class="sitelinks">
-{% if source_url %}<a class="sl-chip src" target="_blank" rel="noopener" href="{{ source_url }}" title="The actual listing this row came from">🏠 Listing · {{ source_name or 'source' }} ↗</a>
-{# v3.4 (Sherif 2026-11-04): the site chip for the site this listing actually
-   came from links the STORED listing URL. Hand-built search URLs are dead
-   ends (the Redfin /search?query= form redirects to Redfin's homepage —
-   live-verified) and a working page on another site needs that site's own
-   property ID, which only the stored URL carries. No fabricated chips. #}
+{% set zslug = (street ~ ' ' ~ city ~ ' ' ~ state ~ ' ' ~ zip)|replace(',', '')|replace(' ', '-') %}
+{% if source_url %}
+{# v48 (Sherif 2026-11-05): every card carries its stored listing link AND a
+   Zillow link — his live complaint was that cards had no Zillow link at all.
+   When the stored URL IS the property's Zillow page (a Zillow-sourced row,
+   whose URL is built from its real zpid), the listing chip and the Zillow
+   chip are the same link: ONE chip, labeled as both, no duplicate. For
+   other rows the Zillow chip is an address search on Zillow (labeled as a
+   plain site link, the form the subject header has always used). The
+   hand-built Redfin search chip stays dead (live-verified redirect to
+   Redfin's homepage) and is not emitted. #}
 {% set su = source_url|lower %}{% set host_site = 'Zillow' if 'zillow.' in su else ('Redfin' if 'redfin.' in su else ('Realtor' if 'realtor.' in su else '')) %}
+{% if host_site == 'Zillow' %}<a class="sl-chip src" target="_blank" rel="noopener" href="{{ source_url }}" title="This property's page on Zillow (the stored listing URL)">🏠 Listing · Zillow ↗</a>
+{% else %}<a class="sl-chip src" target="_blank" rel="noopener" href="{{ source_url }}" title="The actual listing this row came from">🏠 Listing · {{ source_name or 'source' }} ↗</a>
 {% if host_site %}<a class="sl-chip" target="_blank" rel="noopener" href="{{ source_url }}" title="This property's page on {{ host_site }} (the stored listing URL)">{{ host_site }} ↗</a>{% endif %}
-{% elif street %}{% set zslug = (street ~ ' ' ~ city ~ ' ' ~ state ~ ' ' ~ zip)|replace(',', '')|replace(' ', '-') %}
-{# last-resort fallback ONLY when the row carries no stored listing URL #}
+{% if street %}<a class="sl-chip" target="_blank" rel="noopener" href="https://www.zillow.com/homes/{{ zslug }}_rb/" title="This property's address on Zillow">Zillow ↗</a>{% endif %}{% endif %}
+{% elif street %}
+{# fallback ONLY when the row carries no stored listing URL #}
 <a class="sl-chip" target="_blank" rel="noopener" href="https://www.zillow.com/homes/{{ zslug }}_rb/">Zillow ↗</a>
-<a class="sl-chip" target="_blank" rel="noopener" href="https://www.redfin.com/search?query={{ (street ~ ', ' ~ city ~ ', ' ~ state ~ ' ' ~ zip)|urlencode }}">Redfin ↗</a>
 <a class="sl-chip" target="_blank" rel="noopener" href="https://www.realtor.com/realestateandhomes-search/{{ street|replace(' ', '-') }}_{{ city|replace(' ', '-') }}_{{ state }}_{{ zip }}">Realtor ↗</a>{% endif %}
 </div>{% endif %}
 {% endmacro %}
@@ -28,7 +35,7 @@
  {% if mode=='sold' %}<div class="small" data-comp-status>{% if c.kind=='active' %}Listed · {{ c.event_date|datefmt }} (asking) · <span class="badge" style="background:#fef3c7;color:#92400e">● ACTIVE LISTING</span>{% else %}Sold · {{ c.event_date|datefmt }}{% endif %}</div>{% endif %}
  {% if c.pinned %}<div class="small" data-comp-pin><span class="pin">📌 Pinned #{{ pinned_rank.get(c.id, '') }}</span></div>{% endif %}
  <div class="small" data-comp-address><b>{{ c.address }}</b>, {{ c.city }} {{ c.zip }}</div>
- <div class="small muted" data-comp-specs>{{ c.beds|num }}bd • {{ c.baths|num }}ba • {{ (c.sqft|int) if c.sqft else '—' }}sqft • Built {{ c.year_built or '—' }}</div>
+ <div class="small muted" data-comp-specs>{{ c.beds|num }}bd • {{ c.baths|num }}ba • {{ (c.sqft|int) if c.sqft else '—' }}sqft • Built {{ c.year_built or '—' }}{% if c.distance_mi is not none %} • 📍 {{ c.distance_mi|num(2) }} mi{% endif %}</div>
  {% if mode=='sold' %}
  <div class="small" data-comp-diffs>
  {% if p.list_price and c.price %}{% set pd = c.price - p.list_price %}<div data-comp-diff="price">Price Difference {% if pd > 0 %}↑{% elif pd < 0 %}↓{% endif %} {{ (pd|abs)|money }} ({{ ((pd|abs) / p.list_price * 100)|round|int }}%)</div>{% endif %}
@@ -38,7 +45,10 @@
  {% elif mode=='coliving' %}
  <div class="small">Whole-house rent {{ c.price|money }}/mo · {{ c.beds|num }} bedrooms<br>Estimated room rent: <b style="font-size:15px">${{ room_est[c.id] or '—' }}/wk per room</b> <span class="muted">(rent ÷ bedrooms)</span></div>
  {% elif mode=='rent' %}
- <div class="small">{{ ('$' ~ c.ppsf|round(2) ~ '/sqft/mo') if c.ppsf else '' }}{% if room_est[c.id] %} · est. ${{ room_est[c.id] }}/wk per room{% endif %}</div>
+ {# v48 (audit D5): the derived per-room estimate belongs ONLY on Co-Living
+    cards, where it is labeled with its method — on a plain Long-Term card
+    it read as a second, unexplained rent. #}
+ <div class="small">{{ ('$' ~ c.ppsf|round(2) ~ '/sqft/mo') if c.ppsf else '' }}</div>
  {% endif %}
  <details><summary>Score breakdown</summary><div class="small muted">{% for k, val in breakdowns[c.id].items() %}{{ k }}: {{ val }} · {% endfor %}</div>
  <div class="small muted" data-comp-facts>Garage: Not found · Lot: {% if c.lot_sqft %}{{ c.lot_sqft|num }} sqft{% else %}Not found{% endif %} · Type: {{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }} · Distance: {% if c.distance_mi is not none %}{{ c.distance_mi|num(2) }} mi{% else %}Not found{% endif %}{% if mode=='sold' %} · DOM {% if c.dom is not none %}{{ c.dom|num }}{% else %}Not found{% endif %} · {% if c.ppsf %}${{ '%.2f'|format(c.ppsf) }}/sqft{% else %}$/sqft Not found{% endif %}{% endif %}</div></details>

@@ -426,6 +426,20 @@ def _median(xs):
     n = len(xs)
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
 
+def _pool_source_label(rows):
+    """The provenance line for a comp pool (v48): the ACTUAL stored
+    sources present in the rows, never a hardcoded origin — the audit
+    found these headers claiming 'HomeHarvest rental comps
+    (Realtor.com)' for pools that came entirely from RapidAPI.
+    Distinct stored labels, in first-seen order; 'Not found' when the
+    rows carry none."""
+    seen = []
+    for c in rows or []:
+        try: s = c["source"]
+        except Exception: s = None
+        if s and s not in seen: seen.append(s)
+    return " + ".join(seen) if seen else "Not found"
+
 def ltr_stats(rents):
     """Long Term Rental view stats. Header average = average monthly rent of the PINNED rental
     comps when any are pinned, else of the top 3 by match score (ReiSearch behavior)."""
@@ -436,7 +450,7 @@ def ltr_stats(rents):
     avg = sum(c["price"] for c in basis) / len(basis)
     return {"avg_rent": round(avg), "basis": "pinned" if pinned else "top3", "basis_n": len(basis),
             "median_rent": round(_median([c["price"] for c in pool]) or 0), "count": len(pool),
-            "source": "HomeHarvest rental comps (Realtor.com)", "date": datetime.date.today().isoformat()}
+            "source": _pool_source_label(pool), "date": datetime.date.today().isoformat()}
 
 def coliving_stats(rents):
     """Co-Living benchmark derived honestly from whole-house rental comps:
@@ -451,7 +465,7 @@ def coliving_stats(rents):
     return {"weekly_per_room": round(wk), "monthly_per_room": round(wk * 52 / 12), "n": len(per_room_wk),
             "method": "Median of (monthly rent ÷ bedrooms × 12 ÷ 52) across pulled whole-house rental comps — "
                       "an estimate of shared-bath room rent for this ZIP, not PadSplit listing data.",
-            "source": "Derived from HomeHarvest rental comps (Realtor.com)", "date": datetime.date.today().isoformat()}
+            "source": "Derived from " + _pool_source_label(rents), "date": datetime.date.today().isoformat()}
 
 def room_estimate_weekly(comp):
     """Per-room weekly rent estimate for one rental comp (same method as the benchmark)."""
@@ -1497,14 +1511,65 @@ def _source_label(url, rent=False):
     if site is None: return "HomeHarvest (rentals)" if rent else "HomeHarvest"
     return f"HomeHarvest ({site} rentals)" if rent else f"HomeHarvest ({site})"
 
-def _find_existing_comp(d, pid, kind, addr, price):
-    """Dedupe key: normalized address + price (v3.4). Address casing/spacing
-    differs between frames for the same house; the raw-string match used to
-    store the same sale twice."""
+_UNIT_RE = re.compile(r"(?:unit|apt|apartment|suite|#)\s*[-#]?\s*([a-z0-9]+)", re.I)
+
+def _unit_designator(addr, source_url=None):
+    """The unit designator of a comp row, or "" when it has none (v48).
+    Read first from the street address itself ("123 Main St Unit 5"),
+    then from the stored listing URL, whose path often carries it when
+    the address doesn't (Realtor's "...-Unit-208_..." form — the
+    shipped DB's 14522 N Nebraska Ave pair is told apart ONLY this
+    way). Deliberately narrow: the token must follow a unit keyword or
+    '#', so lookalikes never match ("-Usa_" in a Realtor URL is a
+    geography artifact, not a unit; a bare "Ste" is excluded — it is
+    also the Sainte abbreviation in street names)."""
+    for text in (addr or "", source_url or ""):
+        if not text: continue
+        m = _UNIT_RE.search(str(text).replace("-", " ").replace("_", " ").replace("/", " "))
+        if m: return m.group(1).lower()
+    return ""
+
+def _dates_match(stored, incoming):
+    """Sale-date equality for the sold dedupe key (v48): equal dates
+    match; a MONTH-precision date ("2024-03" — the FL Cadastral form)
+    also matches a full date inside that month, in either direction,
+    so the county record and a listing source's record of the SAME
+    sale merge instead of duplicating. Two full dates must be equal;
+    a missing date on either side matches (nothing to contradict)."""
+    a, b = _s(stored)[:10], _s(incoming)[:10]
+    if not a or not b: return True
+    if a == b: return True
+    if len(a) in (4, 7) and b.startswith(a): return True
+    if len(b) in (4, 7) and a.startswith(b): return True
+    return False
+
+def _find_existing_comp(d, pid, kind, addr, price, beds=None, event_date=None, source_url=None):
+    """Dedupe keys (v48, from the 2026-11-05 rent audit):
+    rent — normalized address + unit designator + beds, PRICE REMOVED:
+    the same home re-listed (or cross-quoted) at a new rent used to
+    store a twin card; now the stored row UPDATES in place, latest
+    pull wins. The unit designator keeps genuinely distinct units of
+    one address distinct (it lives in the address or only in the
+    listing URL — both are read).
+    sold/active — normalized address + price + event_date (v3.4's
+    address+price, plus the sale date so two genuinely different
+    sales of one house at one price both survive; month-precision
+    dates match their full-date twins, see _dates_match)."""
     want = _norm_addr(addr)
-    for r in d.execute("SELECT id, address FROM comps WHERE property_id=? AND kind=? AND price=?",
+    if kind == "rent":
+        want_unit = _unit_designator(addr, source_url)
+        for r in d.execute("SELECT id, address, beds, source_url FROM comps "
+                           "WHERE property_id=? AND kind='rent'", (pid,)).fetchall():
+            if _norm_addr(r["address"]) != want: continue
+            if _unit_designator(r["address"], r["source_url"]) != want_unit: continue
+            rb, nb = r["beds"], beds
+            if rb is not None and nb is not None and float(rb) != float(nb): continue
+            return r["id"]
+        return None
+    for r in d.execute("SELECT id, address, event_date FROM comps WHERE property_id=? AND kind=? AND price=?",
                        (pid, kind, price)).fetchall():
-        if _norm_addr(r["address"]) == want: return r["id"]
+        if _norm_addr(r["address"]) == want and _dates_match(r["event_date"], event_date):
+            return r["id"]
     return None
 
 def _row_gate(row, prop, radius_mi, price_key, horizon_cutoff=None):
@@ -1627,7 +1692,8 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
         vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
                                                  "baths": vals["baths"], "year_built": vals["year_built"],
                                                  "lot_sqft": vals["lot_sqft"]})
-        ex = _find_existing_comp(d, prop["id"], "sold", addr, price)
+        ex = _find_existing_comp(d, prop["id"], "sold", addr, price,
+                                 event_date=vals["event_date"])
         cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
         if ex:
             d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex)); updated += 1
@@ -1678,7 +1744,8 @@ def _merge_rent_frame(d, prop, df, radius_mi, subj, source_override=None, drops=
         vals["match_score"] = match_score(subj, {"distance_mi": dist, "sqft": sqft, "beds": vals["beds"],
                                                  "baths": vals["baths"], "year_built": vals["year_built"],
                                                  "lot_sqft": vals["lot_sqft"]})
-        ex = _find_existing_comp(d, prop["id"], "rent", addr, price)
+        ex = _find_existing_comp(d, prop["id"], "rent", addr, price,
+                                 beds=vals["beds"], source_url=vals["source_url"])
         cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
         if ex:
             d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex)); updated += 1
@@ -1712,6 +1779,35 @@ def rent_match_group(subj, c):
     if b == sb and ba == sba: return 0
     if (b is not None and abs(b - sb) <= 1) or (ba is not None and abs(ba - sba) <= 1): return 1
     return 2
+
+def _collapse_rent_view(rows):
+    """Read-side duplicate safety net for the rent views (v48, audit
+    D6): rows stored BEFORE the merge-side dedupe keys were fixed can
+    still duplicate (same home at two prices — the shipped DB's
+    Nebraska pair class). Collapse on (normalized address, unit
+    designator, beds), keeping the FIRST row — callers pass the view
+    in its match-first display order, so the best-scored copy wins.
+    Nothing is deleted: stored rows are untouched, the view simply
+    shows each distinct home/unit once. A unit designator known only
+    from the stored listing URL is appended to the DISPLAYED address
+    ("... Unit 208") so genuinely distinct units stop looking
+    identical. Rows become plain dicts (display copies)."""
+    seen = set(); out = []
+    for c in rows or []:
+        d = dict(c)
+        unit = _unit_designator(d.get("address"), d.get("source_url"))
+        if unit:
+            label = f"Unit {unit}"
+            if label.lower() not in (d.get("address") or "").lower():
+                d["address"] = f"{d.get('address') or ''} {label}".strip()
+        beds = d.get("beds")
+        # The key reads the row's STORED address (unit is its own key
+        # component — the display suffix above must not enter it).
+        key = (_norm_addr(c["address"] or ""), unit,
+               float(beds) if beds is not None else None)
+        if key in seen: continue
+        seen.add(key); out.append(d)
+    return out
 
 # ---------------------------------------------------------------- county GIS parcels (v3.4)
 # Subject facts from the county's own parcel record — the assessor carries
@@ -1895,7 +1991,15 @@ def _is_unreachable_err(e):
 RAPIDAPI_REEF_HOST = "realtor-com-property-data-api.p.rapidapi.com"
 RAPIDAPI_REDFIN_HOST = "redfin-com-data.p.rapidapi.com"
 RAPIDAPI_SABRI_HOST = "realtor16.p.rapidapi.com"
+# v48: private-zillow (ONEAPI) — playground-captured 2026-11-05
+# (research/zillow-api-capture-2026-11-05.md): subject detail BY PLAIN
+# STREET ADDRESS (/By Property Address) and sold comps by map bounds
+# (/search/bymapbounds). BASIC plan 250 requests/month HARD cap — the
+# subject lookup fires at most once per pull and only while the subject
+# still lacks specs or photos; the bounds pull is one call per pull.
+RAPIDAPI_PZ_HOST = "private-zillow.p.rapidapi.com"
 RAPIDAPI_SRC_REEF = "RapidAPI (ReefAPI)"
+RAPIDAPI_SRC_PZ = "RapidAPI (Zillow)"
 RAPIDAPI_SRC_REDFIN = "RapidAPI (Redfin)"
 RAPIDAPI_SRC_SABRI = "RapidAPI (Realtor16)"
 # The Redfin auto-complete endpoint is LIVE-CAPTURED (playground,
@@ -2137,7 +2241,25 @@ def _sabri_spec(desc, keys, min_key=None, max_key=None):
         if lo is not None and lo == hi: return lo
     return None
 
-def _sabri_item_to_row(item, rent=False, unit=None):
+def _sabri_plan_tag(unit, idx=None):
+    """The floor-plan identity of one Sabri community unit (v48):
+    '2 bd · 1,034 sqft' from the unit's own specs, '1,034 sqft' or
+    '2 bd' when only one is known, 'Unit N' (its position in the
+    units[] list) when neither is. Appended to the row's street so a
+    community's floor plans are VISIBLY distinct cards and the rent
+    dedupe key (which reads the normalized address) keeps them apart
+    instead of collapsing or cloning them."""
+    desc = unit.get("description") or {}
+    if not isinstance(desc, dict): desc = {}
+    beds = _sabri_spec(desc, ("beds",), "beds_min", "beds_max")
+    sqft = _sabri_spec(desc, ("sqft",), "sqft_min", "sqft_max")
+    parts = []
+    if beds: parts.append(f"{beds:g} bd")
+    if sqft: parts.append(f"{int(sqft):,} sqft")
+    if parts: return " · ".join(parts)
+    return f"Unit {idx + 1}" if idx is not None else "Unit"
+
+def _sabri_item_to_row(item, rent=False, unit=None, unit_idx=None):
     """One Sabri realtor16 item -> the standard HomeHarvest columns.
     The item is the Realtor data model (playground-verified for
     /search/forsold/coordinates 2026-11-04; year_built is read when
@@ -2166,13 +2288,16 @@ def _sabri_item_to_row(item, rent=False, unit=None):
     ptype = _s(desc.get("type")) if isinstance(desc.get("type"), str) else ""
     if rent:
         specs = desc
+        street = _s(addr.get("line"))
         if unit is not None:
             specs = unit.get("description") or {}
             if not isinstance(specs, dict): specs = {}
             price = _sabri_num(unit.get("list_price"))
+            if street:
+                street = f"{street} (Plan {_sabri_plan_tag(unit, unit_idx)})"
         else:
             price = _sabri_num(item.get("list_price"))
-        return dict(street=_s(addr.get("line")), city=_s(addr.get("city")),
+        return dict(street=street, city=_s(addr.get("city")),
                     zip_code=_s(addr.get("postal_code")),
                     sold_price=None, list_price=price,
                     sqft=_sabri_spec(specs, ("sqft",), "sqft_min", "sqft_max"),
@@ -2221,11 +2346,11 @@ def _sabri_rent_rows(item):
     units = item.get("units")
     if (top is None or top <= 0) and isinstance(units, list) and units:
         rows = []
-        for u in units:
+        for _ui, u in enumerate(units):
             if not isinstance(u, dict): continue
             rent = _sabri_num(u.get("list_price"))
             if rent is None or rent <= 0: continue
-            rows.append(_sabri_item_to_row(item, rent=True, unit=u))
+            rows.append(_sabri_item_to_row(item, rent=True, unit=u, unit_idx=_ui))
         if rows: return rows
     return [_sabri_item_to_row(item, rent=True)]
 
@@ -2509,15 +2634,207 @@ def _src_sabri_forrent(prop, past_days, radius_mi=1.0):
         if _rapi_count_in_gate_rent(rows, prop, radius_mi) >= RAPIDAPI_UNION_RICH: break
     return rows, None, RAPIDAPI_SRC_SABRI
 
+def _pz_subject_values(det):
+    """One private-zillow propertyDetails object -> the candidate
+    subject fill values (pure; no I/O). Shape is the playground
+    capture (2026-11-05): bedrooms / bathrooms / livingArea,
+    resoFacts.yearBuilt, zestimate, latitude/longitude, photos at
+    originalPhotos[].mixedSources.jpeg[].url (several widths — the
+    LARGEST is kept), hiResImageLink / desktopWebHdpImageLink as
+    fallbacks. `price` on an off-market (homeStatus OTHER) property
+    IS the Zestimate — it is read only as the estimate fallback and
+    is NEVER a list price. The address sub-object's city/ZIP feed the
+    sanity match (_pz_subject_match); they are read defensively and
+    may be absent, in which case the match falls back to coords."""
+    if not isinstance(det, dict): return {}
+    photos = []
+    for ph in det.get("originalPhotos") or []:
+        if not isinstance(ph, dict): continue
+        jpegs = _rapi_dig(ph, "mixedSources", "jpeg") or []
+        best, best_w = None, -1
+        for j in jpegs:
+            if not isinstance(j, dict): continue
+            u = j.get("url")
+            if not u: continue
+            try: w = float(j.get("width") or 0)
+            except (TypeError, ValueError): w = 0
+            if w >= best_w: best, best_w = u, w
+        if best and best not in photos: photos.append(best)
+    if not photos:
+        for k in ("hiResImageLink", "desktopWebHdpImageLink"):
+            if _s(det.get(k)):
+                photos = [_s(det.get(k))]; break
+    addr = det.get("address") if isinstance(det.get("address"), dict) else {}
+    rf = det.get("resoFacts") if isinstance(det.get("resoFacts"), dict) else {}
+    yb = _sabri_num(rf.get("yearBuilt"))
+    return {"beds": _sabri_num(det.get("bedrooms")),
+            "baths": _sabri_num(det.get("bathrooms")),
+            "sqft": _sabri_num(det.get("livingArea")),
+            "year_built": int(yb) if yb else None,
+            "lat": _sabri_num(det.get("latitude")), "lon": _sabri_num(det.get("longitude")),
+            "photos": photos,
+            "zestimate": _sabri_num(det.get("zestimate")) or _sabri_num(det.get("price")),
+            "city": _s(addr.get("city")) or _s(det.get("city")),
+            "zip": _s(addr.get("zipcode")) or _s(det.get("zipcode")) or _s(det.get("zip")),
+            "zpid": det.get("zpid")}
+
+def _pz_subject_match(prop, det):
+    """Sanity gate for the Zillow subject fill (v48): a detail payload
+    whose city or ZIP (when it carries them) contradicts the subject
+    is NO match and fills nothing — an address lookup that resolved
+    to a different property must never write its specs/photos here.
+    When both sides carry coordinates, the payload must sit within a
+    mile of the subject (a same-name street across town fails). With
+    neither signal present the by-address endpoint's own resolution
+    stands."""
+    v = _pz_subject_values(det)
+    if v["city"] and prop["city"] and v["city"].strip().lower() != prop["city"].strip().lower():
+        return False
+    if v["zip"] and prop["zip"] and str(v["zip"])[:5] != str(prop["zip"])[:5]:
+        return False
+    if v["lat"] is not None and v["lon"] is not None and prop["lat"] is not None and prop["lon"] is not None:
+        dist = haversine_mi(prop["lat"], prop["lon"], v["lat"], v["lon"])
+        if dist is not None and dist > 1.0: return False
+    return True
+
+def _zillow_subject_fill(d, prop, today):
+    """The private-zillow subject lookup (v48, item A): ONE
+    /By Property Address call filling the subject's BLANK specs and
+    photos from Zillow's own record — the HomeHarvest subject path
+    cannot answer on egress-restricted hosts (its listing frames die
+    at the proxy), which left PA subjects with no specs and no photos.
+    Quota discipline (250/mo hard cap): the caller fires this only
+    while the subject still lacks specs or photos, and this function
+    itself makes exactly one call. Blank-fill ONLY (never overwrites
+    user/saved data); zestimate lands ONLY in est_zillow, never
+    list_price. Returns {"photos": n, "fields": [...]} when it filled
+    something, else None (no key / error / 404 = address not on
+    Zillow / sanity no-match / nothing blank to fill) — every one of
+    those degrades silently to the pre-v48 honest state, logged."""
+    if not _rapidapi_key(): return None
+    data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, "/By Property Address",
+                              {"address": prop["address"]})
+    if err is not None:
+        app.logger.warning(f"comp pull: private-zillow subject lookup failed for "
+                           f"{prop['address']}: {_rapi_fail_reason(err)}")
+        return None
+    det = data.get("propertyDetails") if isinstance(data, dict) else None
+    if not isinstance(det, dict) or not det:
+        app.logger.warning(f"comp pull: private-zillow subject lookup for "
+                           f"{prop['address']}: no propertyDetails in response")
+        return None
+    if not _pz_subject_match(prop, det):
+        app.logger.warning(f"comp pull: private-zillow subject lookup for "
+                           f"{prop['address']}: response city/ZIP/coords contradict "
+                           f"the subject — treated as no-match, nothing filled")
+        return None
+    v = _pz_subject_values(det)
+    fills = {}
+    for col in ("beds", "baths", "sqft", "year_built", "lat", "lon"):
+        if not prop[col] and v[col]:
+            fills[col] = v[col]
+    if v["photos"] and not prop["photos_json"] and not prop["photo_url"]:
+        fills["photos_json"] = json.dumps(v["photos"]); fills["photos_date"] = today
+        fills["photo_url"] = v["photos"][0]
+    if v["zestimate"] and not prop["est_zillow"]:
+        fills["est_zillow"] = v["zestimate"]; fills["est_date"] = today
+    if not fills:
+        app.logger.warning(f"comp pull: private-zillow subject lookup for "
+                           f"{prop['address']}: matched, but every field was already filled")
+        return None
+    d.execute(f"UPDATE properties SET {','.join(k + '=?' for k in fills)} WHERE id=?",
+              (*fills.values(), prop["id"]))
+    app.logger.warning(f"comp pull: private-zillow subject lookup for {prop['address']}: "
+                       f"filled {', '.join(sorted(fills))} (1 call, RapidAPI (Zillow))")
+    return {"photos": len(v["photos"]) if "photos_json" in fills else 0,
+            "fields": sorted(fills)}
+
+def _pz_sold_item_to_row(item):
+    """One private-zillow /search/bymapbounds item -> the standard
+    HomeHarvest columns (playground-captured 2026-11-05): the sold
+    price is price.value, the date lastSoldDate as EPOCH MILLISECONDS,
+    and the row's listing URL is Zillow's own homedetails page built
+    from its zpid (the zpid is data; the URL form is Zillow's). The
+    address arrives as a sub-object (streetAddress/city/state/zipcode)
+    or as one "street, city, ST ZIP" string — both are read. A row
+    without a usable price keeps sold_price=None and the shared gate
+    drops it as no_price, like every source."""
+    addr = item.get("address")
+    street = city = zipc = ""
+    if isinstance(addr, dict):
+        street = _s(addr.get("streetAddress")); city = _s(addr.get("city"))
+        zipc = _s(addr.get("zipcode"))
+    elif isinstance(addr, str):
+        parts = [p.strip() for p in addr.split(",")]
+        street = parts[0] if parts else ""
+        if len(parts) >= 2: city = parts[1]
+        if len(parts) >= 3:
+            tail = parts[2].split()
+            if tail: zipc = tail[-1]
+    price = item.get("price")
+    if isinstance(price, dict): price = price.get("value")
+    ms = item.get("lastSoldDate")
+    date_iso = None
+    if isinstance(ms, (int, float)) and ms > 0:
+        try:
+            date_iso = datetime.datetime.fromtimestamp(
+                ms / 1000, tz=datetime.timezone.utc).date().isoformat()
+        except (OverflowError, OSError, ValueError):
+            date_iso = None
+    elif isinstance(ms, str) and ms[:4].isdigit():
+        date_iso = ms[:10]
+    thumb = item.get("thumb") or []
+    photo = None
+    if isinstance(thumb, list) and thumb and isinstance(thumb[0], dict):
+        photo = _s(thumb[0].get("url")) or None
+    zpid = item.get("zpid")
+    return dict(street=street, city=city, zip_code=zipc,
+                sold_price=_sabri_num(price), list_price=None,
+                sqft=_sabri_num(item.get("sqft") or item.get("livingArea")),
+                beds=_sabri_num(item.get("beds") or item.get("bedrooms")),
+                full_baths=_sabri_num(item.get("baths") or item.get("bathrooms")),
+                year_built=None, lot_sqft=None, last_sold_date=date_iso,
+                days_on_mls=None,
+                latitude=item.get("latitude"), longitude=item.get("longitude"),
+                style=None, property_type=None,
+                property_url=(f"https://www.zillow.com/homedetails/{zpid}_zpid/"
+                              if zpid else ""),
+                primary_photo=photo, alt_photos=[photo] if photo else [],
+                estimated_value=None, price_per_sqft=None)
+
+def _src_pzillow_sold(prop, past_days, radius_mi=1.0):
+    """private-zillow sold comps by map bounds (v48): ONE call with a
+    bounds box derived from the subject coords and the pull radius
+    (degrees ~ radius/69 of latitude, longitude scaled by cos(lat)),
+    listingStatus=Sold. Top-up source — it joins the union AFTER
+    Sabri and is skipped whenever the union is already rich (the
+    250/mo hard cap is spent only when the pull still needs rows)."""
+    if prop["lat"] is None or prop["lon"] is None:
+        return [], None, RAPIDAPI_SRC_PZ
+    dlat = (radius_mi or 1.0) / 69.0
+    coslat = max(math.cos(math.radians(prop["lat"])), 0.2)
+    dlon = (radius_mi or 1.0) / (69.0 * coslat)
+    params = {"west": round(prop["lon"] - dlon, 6), "east": round(prop["lon"] + dlon, 6),
+              "south": round(prop["lat"] - dlat, 6), "north": round(prop["lat"] + dlat, 6),
+              "listingStatus": "Sold"}
+    data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, "/search/bymapbounds", params)
+    if err is not None: return [], err, RAPIDAPI_SRC_PZ
+    items = data.get("searchResults") if isinstance(data, dict) else None
+    items = items if isinstance(items, list) else []
+    rows = _rapi_rows(items, _pz_sold_item_to_row)
+    return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_PZ
+
 _RAPIDAPI_ADAPTERS = {"reefapi_sold": _src_reefapi_sold,
                       "redfin_sold": _src_redfin_sold,
                       "sabri_forsold": _src_sabri_forsold,
-                      "sabri_forrent": _src_sabri_forrent}
+                      "sabri_forrent": _src_sabri_forrent,
+                      "pzillow_sold": _src_pzillow_sold}
 _RAPIDAPI_SOURCE_NAMES = {"reefapi_sold": "ReefAPI Realtor sold",
                           "redfin_sold": "Redfin.Com Data sold search",
                           "sabri_forsold": "Realtor16 (Sabri) sold search",
-                          "sabri_forrent": "Realtor16 (Sabri) rent search"}
-RAPIDAPI_SOLD_SOURCES = ("reefapi_sold", "redfin_sold", "sabri_forsold")
+                          "sabri_forrent": "Realtor16 (Sabri) rent search",
+                          "pzillow_sold": "private-zillow sold search (Zillow)"}
+RAPIDAPI_SOLD_SOURCES = ("reefapi_sold", "redfin_sold", "sabri_forsold", "pzillow_sold")
 RAPIDAPI_RENT_SOURCES = ("sabri_forrent",)
 
 def _rapi_call_source(key, prop, past_days, radius_mi):
@@ -2601,6 +2918,130 @@ def _rapidapi_rent_frame(prop, radius_mi=1.0):
         if err is not None: last_err = err
     return None, last_err, None, outcomes
 
+# ---------------------------------------------------------------- FL Statewide
+# Cadastral (v48) — OFFICIAL-RECORD sold comps for Florida subjects:
+# the Florida Dept. of Revenue's statewide parcel layer (each county
+# appraiser's tax-roll data, one schema for all 67 counties), served
+# as an ArcGIS FeatureServer — no key, no signup. Fields (read from
+# the live layer, research report 2026-11-05 section A): SALE_PRC1
+# with SALE_YR1/SALE_MO1 (+ the PRC2/YR2/MO2 prior-sale set),
+# TOT_LVG_AR living sqft, ACT_YR_BLT / EFF_YR_BLT, PHY_ADDR1/CITY/
+# ZIPCD, PARCEL_ID, LND_SQFOOT. HARD LIMITS of the source, honored
+# here: it carries NO beds/baths (rows store NULL — never invented),
+# and sale dates are YEAR+MONTH only — the stored event_date is
+# "YYYY-MM" and the display renders month+year (datefmt), never a
+# fabricated day. QUAL_CD: the report names the field but no clean
+# code rule, so ALL sales with SALE_PRC1 > 0 are taken (documented
+# in the v48 build log). Vintage is annual-ish (tax roll), so this
+# frame is the trust backbone, not the freshest feed. Host
+# reachability from any given deployment is NOT assumed — a failure
+# is just a failed frame, like every other source.
+FL_CADASTRAL_URL = ("https://services9.arcgis.com/Gh9awoU677aKree0/ArcGIS/rest/services/"
+                    "Florida_Statewide_Cadastral/FeatureServer/0/query")
+CADASTRAL_SRC = "FL Official Records (Cadastral)"
+_CAD_FIELDS = ("PARCEL_ID,PHY_ADDR1,PHY_CITY,PHY_ZIPCD,SALE_PRC1,SALE_YR1,SALE_MO1,"
+               "SALE_PRC2,SALE_YR2,SALE_MO2,TOT_LVG_AR,ACT_YR_BLT,EFF_YR_BLT,LND_SQFOOT")
+
+def _cad_num(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return v if math.isfinite(v) else None
+
+def _cad_centroid(feature):
+    """(lat, lon) for one Cadastral feature: the service's returned
+    centroid when present (returnCentroid), else the average of the
+    polygon's exterior-ring vertices — a parcel is small, so the
+    ring average is well inside the distance gate's tolerance; the
+    shared gate remains the arbiter either way."""
+    c = feature.get("centroid")
+    if isinstance(c, dict) and _cad_num(c.get("x")) is not None and _cad_num(c.get("y")) is not None:
+        return float(c["y"]), float(c["x"])
+    geom = feature.get("geometry") or {}
+    rings = geom.get("rings") if isinstance(geom, dict) else None
+    if rings and isinstance(rings[0], list) and rings[0]:
+        xs = [p[0] for p in rings[0] if isinstance(p, (list, tuple)) and len(p) >= 2
+              and _cad_num(p[0]) is not None]
+        ys = [p[1] for p in rings[0] if isinstance(p, (list, tuple)) and len(p) >= 2
+              and _cad_num(p[1]) is not None]
+        if xs and ys: return sum(ys) / len(ys), sum(xs) / len(xs)
+    coords = geom.get("coordinates") if isinstance(geom, dict) else None
+    if coords and isinstance(coords[0], list) and coords[0]:
+        ring = coords[0]
+        xs = [p[0] for p in ring if isinstance(p, (list, tuple)) and len(p) >= 2]
+        ys = [p[1] for p in ring if isinstance(p, (list, tuple)) and len(p) >= 2]
+        if xs and ys: return sum(ys) / len(ys), sum(xs) / len(xs)
+    return None, None
+
+def _cad_feature_rows(feature):
+    """One Cadastral feature -> the standard rows (one per recorded
+    sale): the most recent sale (PRC1) whenever it has a price and a
+    year, plus the prior sale (PRC2) ONLY when it is clearly a
+    distinct OLDER sale — a different price in an earlier year-month;
+    a PRC2 echoing PRC1 (same price, same month — a roll artifact)
+    yields no second row. Beds/baths are ALWAYS None (the layer has
+    no such fields) and the date is month-precision "YYYY-MM"."""
+    attrs = (feature or {}).get("attributes") or {}
+    if not isinstance(attrs, dict): return []
+    lat, lon = _cad_centroid(feature)
+    street = _s(attrs.get("PHY_ADDR1")).strip()
+    zipc = attrs.get("PHY_ZIPCD")
+    zipc = str(int(zipc)) if _cad_num(zipc) else _s(zipc)
+    yb = _cad_num(attrs.get("ACT_YR_BLT")) or _cad_num(attrs.get("EFF_YR_BLT"))
+    base = dict(street=street, city=_s(attrs.get("PHY_CITY")).strip(),
+                zip_code=zipc, list_price=None,
+                sqft=_cad_num(attrs.get("TOT_LVG_AR")),
+                beds=None, full_baths=None,
+                year_built=int(yb) if yb else None, lot_sqft=_cad_num(attrs.get("LND_SQFOOT")),
+                days_on_mls=None, latitude=lat, longitude=lon,
+                style=None, property_type=None, property_url="",
+                primary_photo=None, alt_photos=[], estimated_value=None,
+                price_per_sqft=None)
+    rows = []
+    def _sale(prc, yr, mo):
+        prc, yr = _cad_num(prc), _cad_num(yr)
+        if not prc or prc <= 0 or not yr: return None
+        mo = _cad_num(mo)
+        # A missing/invalid month stores the YEAR only ("2024") — the
+        # display shows it as-is; defaulting to January would fabricate
+        # a month the record doesn't carry.
+        date = f"{int(yr):04d}-{int(mo):02d}" if mo and 1 <= mo <= 12 else f"{int(yr):04d}"
+        return dict(base, sold_price=prc, last_sold_date=date)
+    r1 = _sale(attrs.get("SALE_PRC1"), attrs.get("SALE_YR1"), attrs.get("SALE_MO1"))
+    if r1 is None: return []
+    rows.append(r1)
+    r2 = _sale(attrs.get("SALE_PRC2"), attrs.get("SALE_YR2"), attrs.get("SALE_MO2"))
+    if r2 is not None and (r2["last_sold_date"], r2["sold_price"]) != (r1["last_sold_date"], r1["sold_price"]) \
+            and r2["last_sold_date"] < r1["last_sold_date"]:
+        rows.append(r2)
+    return rows
+
+def _fl_cadastral_frame(prop, radius_mi=1.0):
+    """The Cadastral sold frame for one pull: (DataFrame, err) —
+    (None, None) for a non-FL subject (no request is made), (None,
+    err) when the service fails. A spatial envelope query at the pull
+    radius around the subject; rows flow through the SAME shared gate
+    + merge as every sold source."""
+    if (_s(prop["state"]) or "").strip().upper() != "FL": return None, None
+    if prop["lat"] is None or prop["lon"] is None: return None, None
+    dlat = (radius_mi or 1.0) / 69.0
+    dlon = (radius_mi or 1.0) / (69.0 * max(math.cos(math.radians(prop["lat"])), 0.2))
+    env = (f"{prop['lon'] - dlon},{prop['lat'] - dlat},"
+           f"{prop['lon'] + dlon},{prop['lat'] + dlat}")
+    try:
+        r = requests.get(FL_CADASTRAL_URL, params={
+            "where": "SALE_PRC1>0", "geometry": env,
+            "geometryType": "esriGeometryEnvelope", "inSR": 4326,
+            "spatialRel": "esriSpatialRelIntersects", "outFields": _CAD_FIELDS,
+            "returnGeometry": "true", "returnCentroid": "true",
+            "resultRecordCount": 2000, "f": "json"}, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return None, e
+    feats = data.get("features") if isinstance(data, dict) else None
+    rows = _rapi_rows_multi(feats if isinstance(feats, list) else [], _cad_feature_rows)
+    return _hh_frame(rows), None
+
 def pull_comps(prop, radius_mi=1.0, past_days=365):
     """Multi-frame union pull (v3.4). Frames: a SUBJECT-CENTERED radius frame
     (the scraper's comps mode — address + radius) at a 3-year horizon, unioned
@@ -2655,11 +3096,29 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             # sources behind the last error — the v39 PA incident).
             app.logger.warning(f"comp pull: RapidAPI sold pool detail for {addr_line}: "
                                + "; ".join(o["log"] for o in rapi_outcomes))
+    # --- FL Statewide Cadastral sold frame (v48): official records,
+    # FL subjects only, keyless. Merged FIRST — it is the trust floor:
+    # richer listing frames (RapidAPI, then HomeHarvest) update its
+    # rows in place when they record the same sale (same address +
+    # price + month-matching date), so a sale both sources know ends
+    # stored once, in its richest form. ---
+    cad_frame = None
+    if (_s(prop["state"]) or "").strip().upper() == "FL":
+        try:
+            cad_frame, cad_err = _fl_cadastral_frame(prop, radius_mi)
+        except Exception as _cad_boom:
+            cad_frame, cad_err = None, _cad_boom
+        if cad_err is not None:
+            app.logger.warning(f"comp pull: FL Cadastral frame failed for {addr_line}: {cad_err!r}")
     # --- sold frames: centered (3-yr horizon) UNION ZIP area (requested window) ---
     sold_frames = []
     frame_sources = {}
+    rapi_ids = set()
+    if cad_frame is not None:
+        sold_frames.append(cad_frame); frame_sources[id(cad_frame)] = CADASTRAL_SRC
     for _rapi_df, _rapi_lbl in rapi_frames:
         sold_frames.append(_rapi_df); frame_sources[id(_rapi_df)] = _rapi_lbl
+        rapi_ids.add(id(_rapi_df))
     centered, err_c = _scrape(location=addr_line, listing_type="sold",
                               past_days=max(past_days, 1095), radius=radius_mi)
     if centered is not None: sold_frames.append(centered)
@@ -2678,11 +3137,11 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                            "came back — nothing was added or changed; please try again")
     if err_c is not None:
         app.logger.warning(f"comp pull: centered sold frame failed for {addr_line}: {err_c!r}")
-        if not rapi_frames:
+        if not rapi_frames and cad_frame is None:
             warnings.append("centered sold frame failed — results came from the ZIP-area frame")
     if err_a is not None:
         app.logger.warning(f"comp pull: ZIP sold frame failed for {addr_line}: {err_a!r}")
-        if not rapi_frames:
+        if not rapi_frames and cad_frame is None:
             warnings.append("ZIP-area sold frame failed — results came from the address-centered frame")
     added = updated = n_sold = 0
     sold_touched = []
@@ -2693,7 +3152,7 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     rapi_drops = {}
     rapi_served = rapi_added = rapi_updated = 0
     for fr in sold_frames:
-        _is_rapi = id(fr) in frame_sources
+        _is_rapi = id(fr) in rapi_ids
         a1, u1, n1 = _merge_sold_frame(d, prop, fr, radius_mi, subj,
                                        source_override=frame_sources.get(id(fr)),
                                        touched=sold_touched,
@@ -2719,6 +3178,13 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             + (f" + {rapi_updated} duplicate updates" if rapi_updated else "")
             + (f" ({'; '.join(_dup[1])})" if _dup and _dup[1] else "")
             + f"; drops: {', '.join(_parts) if _parts else 'none'}")
+    # v48: the Cadastral include-line, same truthful-attribution rule
+    # as the RapidAPI banner below — named only when a stored row's
+    # final touch is the Cadastral merge.
+    _last_lbl = {}
+    for _cid, _clbl in sold_touched: _last_lbl[_cid] = _clbl
+    if CADASTRAL_SRC in _last_lbl.values():
+        warnings.append("sold comps include results from " + CADASTRAL_SRC)
     if rapi_outcomes:
         # v42 TRUTHFUL BANNER. The v41 line named the serving source
         # even when the merge stored ZERO of its rows (the live pull's
@@ -2829,10 +3295,23 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     if not fs_frames:
         app.logger.warning(f"comp pull: for-sale lookup failed for {addr_line}: {err_f!r}")
         warnings.append("for-sale lookup for subject photos failed")
-    srow = None
+    # v48: the subject row is the RICHEST exact match across all
+    # frames, not the first — the FL Cadastral frame (merged first for
+    # comps) also contains the subject's own parcel, but its row
+    # carries no beds/baths/photos, and letting it win here silently
+    # starved the subject fill whenever the official record answered
+    # (gate_v20 SP1 caught exactly that). Photos weigh most, then
+    # spec/price completeness; ties keep frame order.
+    def _srow_richness(r):
+        n = 10 if extract_photos(r) else 0
+        return n + sum(1 for k in ("beds", "full_baths", "sqft", "year_built",
+                                   "sold_price", "list_price", "lot_sqft")
+                       if r.get(k) is not None)
+    srow, _srow_best = None, -1
     for fr in fs_frames + sold_frames + rent_frames:
-        srow = find_subject_row(fr, prop, exact_only=True)
-        if srow is not None: break
+        cand = find_subject_row(fr, prop, exact_only=True)
+        if cand is not None and _srow_richness(cand) > _srow_best:
+            srow, _srow_best = cand, _srow_richness(cand)
     if srow is None:
         # v1.6 (item N): DEEP subject lookup — the subject's own last sale is often
         # older than the comp window, so the frames above miss it and photos/specs
@@ -2875,6 +3354,30 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         if fills:
             d.execute(f"UPDATE properties SET {','.join(k+'=?' for k in fills)} WHERE id=?",
                       (*fills.values(), prop["id"])); d.commit()
+    # --- private-zillow subject fill (v48): when a RapidAPI key is
+    # configured and the subject STILL lacks specs or photos after the
+    # HomeHarvest path (on egress-restricted hosts that path can never
+    # answer), ONE Zillow by-address lookup fills the blanks — the
+    # 250/mo hard cap is spent only on subjects that need it, never
+    # on already-complete ones. Failure/no-match changes nothing: the
+    # honest could-not-be-filled state above stands. ---
+    if _rapidapi_key():
+        _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
+        _lacks = (not _prop_now["beds"] or not _prop_now["baths"] or not _prop_now["sqft"]
+                  or not _prop_now["year_built"]
+                  or (not _prop_now["photos_json"] and not _prop_now["photo_url"]))
+        if _lacks:
+            try:
+                _zf = _zillow_subject_fill(d, _prop_now, today)
+            except Exception as _ze:
+                app.logger.warning(f"comp pull: private-zillow subject fill raised for "
+                                   f"{addr_line}: {_ze!r}")
+                _zf = None
+            if _zf:
+                d.commit()
+                photos_found = max(photos_found, _zf["photos"])
+                warnings[:] = [w for w in warnings if "could not be auto-filled" not in w]
+                warnings.append("subject specs/photos filled from Zillow via RapidAPI")
     # --- county parcel record (v3.4): blank-fill APN / assessor value / last
     # sale from the county GIS where a probed endpoint covers the county ---
     try:
@@ -4726,7 +5229,10 @@ def property_page(pid):
     plans = d.execute("SELECT * FROM floorplans WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
     v = verdict(p, comps, all_boxes())
     sold = [c for c in comps if c["kind"] == "sold" and not c["excluded"]]
-    rents = [c for c in comps if c["kind"] == "rent"]
+    # v48: rents respect `excluded` exactly like sold (the audit's
+    # adjacent integrity gap — an excluded rental used to keep
+    # rendering in every rent view).
+    rents = [c for c in comps if c["kind"] == "rent" and not c["excluded"]]
     market = None
     if sold:
         # v1.6 working controls: property-type filter recomputes cards + trend +
@@ -4940,6 +5446,11 @@ def property_page(pid):
                                   c["distance_mi"] if c["distance_mi"] is not None else 9e9))
     rents_view.sort(key=lambda c: (rent_match_group(_subj, dict(c)), -(c["match_score"] or 0),
                                    c["distance_mi"] if c["distance_mi"] is not None else 9e9))
+    # v48 D6: collapse stored duplicates for display (best-scored copy
+    # of each address+unit+beds wins — the list is already in display
+    # order). Header counts below read THIS list, so they reflect the
+    # collapsed count.
+    rents_view = _collapse_rent_view(rents_view)
     rent_match = {"exact": 0, "near": 0, "total": len(rents_view)}
     for c in rents_view:
         _g = rent_match_group(_subj, dict(c))
@@ -5195,13 +5706,26 @@ def lookup_comp_by_address(prop, address, kind_choice):
     return None
 
 def _insert_comp(prop, vals):
+    """Insert one comp from the add-by-address / manual paths (v48:
+    dedupe FIRST, via the same keys the merges use — the add paths
+    used to blind-insert, so adding an already-stored comp cloned
+    it). A hit updates the stored row in place and returns ITS id."""
     d = db()
     subj = {"sqft": prop["sqft"], "beds": prop["beds"], "baths": prop["baths"],
             "year_built": prop["year_built"], "lot_sqft": prop["lot_sqft"]}
     vals["match_score"] = match_score(subj, {"distance_mi": vals.get("distance_mi"), "sqft": vals.get("sqft"),
                                              "beds": vals.get("beds"), "baths": vals.get("baths"),
                                              "year_built": vals.get("year_built"), "lot_sqft": vals.get("lot_sqft")})
+    ex = _find_existing_comp(d, prop["id"], vals.get("kind") or "sold",
+                             vals.get("address") or "", vals.get("price"),
+                             beds=vals.get("beds"), event_date=vals.get("event_date"),
+                             source_url=vals.get("source_url"))
     cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
+    if ex:
+        d.execute(f"UPDATE comps SET {','.join(k + '=?' for k in vals)} WHERE id=?",
+                  (*vals.values(), ex))
+        d.commit()
+        return ex
     cur = d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values()))
     d.commit()
     return cur.lastrowid
@@ -5658,10 +6182,16 @@ def numf(v, dec=0):
 
 @app.template_filter("datefmt")
 def datefmt(v):
-    """ISO date -> ReiSearch's display form ('Oct 27, 2025')."""
+    """ISO date -> ReiSearch's display form ('Oct 27, 2025').
+    Month-precision dates ('2025-06' — the FL Cadastral form) render
+    as 'Jun 2025': the source records no day, so no day is shown."""
     if not v: return "—"
-    try: return datetime.datetime.strptime(str(v)[:10], "%Y-%m-%d").strftime("%b %d, %Y").replace(" 0", " ")
-    except Exception: return str(v)
+    s = str(v)
+    if re.fullmatch(r"\d{4}-\d{2}", s):
+        try: return datetime.datetime.strptime(s, "%Y-%m").strftime("%b %Y")
+        except Exception: return s
+    try: return datetime.datetime.strptime(s[:10], "%Y-%m-%d").strftime("%b %d, %Y").replace(" 0", " ")
+    except Exception: return s
 
 @app.template_filter("jload")
 def jload(v):
