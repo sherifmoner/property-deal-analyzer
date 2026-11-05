@@ -472,7 +472,7 @@ button:focus-visible, a:focus-visible {
 .dlgsec h5{margin:14px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#64748b}
 .dlgitem{display:block;width:100%;text-align:left;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:4px 0;cursor:pointer;font-size:14px}
 .dlgitem:hover{background:#eef2ff;border-color:#c7d2fe}
-.uses-pencil{background:none;border:none;cursor:pointer;font-size:13px;color:#6366f1;padding:0 2px}
+.uses-pencil{background:none;border:none;cursor:pointer;font-size:13px;color:var(--accent2);padding:0 2px}
 .uses-editor{margin:4px 0 8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .uses-editor[hidden]{display:none}
 .uses-editor input{width:130px}
@@ -559,3 +559,63 @@ input.catover.ovon{border-color:#2563eb;background:#eff6ff;font-weight:700}
 .cfcols span{display:block;font-size:12px;color:var(--muted)}
 .cfcols b{font-size:16px}
 .vfabtn{display:block;text-align:center;margin-top:6px}
+
+/* ---- v51 POLISH — one design system over the v1.6 ReiSearch visual
+   language. Presentation only: no markup, words, or behavior change.
+   Color discipline (the language v1.6/v2.0 already spoke, now applied
+   consistently): ORANGE (--orange) = selection/active states, GREEN
+   (--accent) = primary actions, BLUE (--accent2) = secondary actions,
+   links and focus, AMBER = pins, RED = danger. Neutral slate surfaces
+   and hairlines everywhere else. Radius + spacing now come from one
+   token scale instead of the historical 6/7/8/10/12/14px mix. ---- */
+:root{--rad-s:6px;--rad-m:10px;--rad-l:14px;--pad-card:18px;--gap-card:16px}
+.main{min-width:0;padding:24px 28px}
+h1{letter-spacing:-.01em}
+h2{margin:0 0 12px}
+h3{margin:16px 0 8px}
+.card{padding:var(--pad-card);margin-bottom:var(--gap-card)}
+.btn,button{font-family:inherit}
+.btn{padding:8px 16px;border:1px solid transparent;border-radius:var(--rad-m);font-weight:600;line-height:1.35}
+.btn.sec{background:#fff;border-color:#cbd5e1}
+.btn.sec:hover{background:#f8fafc;border-color:#94a3b8}
+.btn.danger{border-color:#fecaca}
+.btn.sm{padding:5px 11px;border-radius:8px}
+.btn:disabled,.btn[disabled],button:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none;filter:none}
+.btn:focus-visible,button:focus-visible,.vpill:focus-visible,.seg:focus-visible,.dlgitem:focus-visible,summary:focus-visible{outline:2px solid var(--accent2);outline-offset:2px}
+.pinbtn{padding:9px 13px;border-radius:var(--rad-m);font-weight:600}
+.pinbtn.off:hover{background:#dbe3ec}
+.tabs a{padding:10px 14px}
+.tabs a:hover{background:#f1f5f9;text-decoration:none}
+#viewpills{gap:7px}
+.badge{padding:3px 10px}
+.sl-chip{padding:3px 10px}
+input,select,textarea{padding:8px 10px;border-radius:var(--rad-m)}
+label{font-weight:600;margin:8px 0 4px}
+th{background:#f1f5f9;color:#334155;cursor:default}
+th[data-sort]{cursor:pointer}
+table{font-variant-numeric:tabular-nums}
+.card table tbody tr:nth-child(even)>td,.dcard table tbody tr:nth-child(even)>td,table.complist tbody tr:not([data-subject]):nth-child(even)>td{background:#fbfcfe}
+td.num,th.num{text-align:right}
+.ccard .cb{padding:13px 15px}
+.ccard .cprice{letter-spacing:-.01em}
+.fcard{padding:14px 16px}
+.dcard{border-radius:var(--rad-l);padding:14px}
+.snapcard,.sumpanel{padding:14px 16px}
+.srcdlg-card{border-radius:var(--rad-l)}
+.dlgitem{border-radius:var(--rad-m)}
+.dlgitem:hover{background:#eff6ff;border-color:#bfdbfe}
+@media (max-width:700px){
+  details.acc .acc-b{overflow-x:auto}
+  .rhead,.rrow{min-width:540px}
+}
+@media (max-width:480px){
+  .main{padding:16px 14px}
+  .card{padding:14px}
+  h1{font-size:20px}
+  .card table,table.complist{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .gallery .cover,.gallery .coverwrap img.cover{height:230px}
+  .gallery .thumb{height:110px}
+  .statbar{gap:14px;padding:12px 14px}
+  .comptools input[type="search"]{min-width:140px}
+  .segbar .seg{padding:8px 11px}
+}
