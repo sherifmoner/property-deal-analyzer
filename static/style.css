@@ -123,7 +123,18 @@ select.inline{width:auto;display:inline-block}
 .segtools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .segtools select{width:auto}
 .uw-grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
-@media(max-width:1000px){.uw-grid{grid-template-columns:1fr}}
+@media(max-width:1000px){.uw-grid{grid-template-columns:1fr}
+  /* v54 NARROW-WIDTH (380-480px, gate_narrow): the single-column .uw-grid
+     used `grid-template-columns:1fr`, whose implicit minimum is the items'
+     content size — the Co-Living rooms grid (.r15, ~789px min-content) and
+     the Payment Type segmented control (~450px) stretched .uw-main to
+     819px and the page to scrollWidth 833 at 380px. The v51
+     `details.acc .acc-b{overflow-x:auto}` scroll region never engaged
+     because the grid item itself refused to shrink. min-width:0 on both
+     grid items lets the track follow the viewport; the wide row grids then
+     scroll inside their own cards, exactly as v51 intended. Desktop
+     (two-column, minmax(0,1fr)) is untouched. */
+  .uw-main,.uw-side{min-width:0}}
 .uw-side{position:sticky;top:14px;max-height:calc(100vh - 28px);overflow-y:auto}
 details.acc{border:1px solid var(--line);border-radius:10px;margin:0 0 10px;background:#fff}
 details.acc>summary{list-style:none;display:flex;align-items:center;gap:10px;padding:11px 14px;font-size:14px;color:var(--ink)}
@@ -608,6 +619,13 @@ td.num,th.num{text-align:right}
   details.acc .acc-b{overflow-x:auto}
   .rhead,.rrow{min-width:540px}
 }
+/* v54 NARROW-WIDTH (gate_narrow): Documents checklist slot name. Desktop
+   keeps the 230px column so names, notes input and Save/✕ stay on one
+   line; the <=480px block below shrinks it to 120px. (Was inline
+   style="min-width:230px" — moved to this class so the narrow rule can
+   override it. This base rule sits BEFORE the 480px block so the later
+   same-specificity media rule wins at narrow widths.) */
+.docslot{min-width:230px}
 @media (max-width:480px){
   .main{padding:16px 14px}
   .card{padding:14px}
@@ -618,6 +636,22 @@ td.num,th.num{text-align:right}
   .statbar{gap:14px;padding:12px 14px}
   .comptools input[type="search"]{min-width:140px}
   .segbar .seg{padding:8px 11px}
+  /* v54 NARROW-WIDTH (gate_narrow): the Payment Type segmented control
+     (.fseg, flex-wrap:nowrap) has ~450px of button min-content — its four
+     buttons refuse to shrink below their text, so it was the second UW
+     overflow driver (page 531px wide with rows hidden). At <=480px the
+     label takes its own line and the four buttons form a 2x2 grid; the
+     Fixed-amount box narrows so the Fixed button fits its half-row.
+     Desktop layout (one full-width row) is untouched. */
+  .fseg{flex-wrap:wrap}
+  .fseg .fseg-lab{flex:1 1 100%;margin-bottom:2px}
+  .fseg .f-pt{flex:1 1 45%}
+  .f-pt-fixed input.f-fixed{width:56px;flex-basis:56px}
+  /* v54 NARROW-WIDTH (gate_narrow): Documents rows overflowed 36px at
+     380px — the slot-name span's 230px min-width plus the notes input's
+     flex min-content could not fit the 324px card. The span shrinks to
+     120px here (see .docslot below); the row itself wraps (template). */
+  .docslot{min-width:120px}
 }
 
 /* ---- v52 TEST PASS (whole-app test pass, 2026-11-05) ----

@@ -1127,10 +1127,10 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 <input name="notes" placeholder="file ref / note (optional)" style="flex:1;min-width:160px">
 <button class="btn">＋ Add document</button></form>
 {% set cats = docs|groupby('category') %}{% for cat, items in cats %}<h3>{{ cat }}</h3>
-{% for d in items %}<div style="display:flex;gap:6px;align-items:center;margin:5px 0"><form method="post" action="{{ url_for('doc_update', did=d.id) }}" style="display:flex;gap:8px;align-items:center;flex:1">
+{% for d in items %}<div style="display:flex;gap:6px;align-items:center;margin:5px 0;flex-wrap:wrap"><form method="post" action="{{ url_for('doc_update', did=d.id) }}" style="display:flex;gap:8px;align-items:center;flex:1;min-width:0;flex-wrap:wrap">
 <input type="checkbox" name="done" {% if d.done %}checked{% endif %} onchange="this.form.submit()">
-<span style="min-width:230px" class="{% if d.done %}muted{% endif %}">{{ d.slot }}</span>
-<input name="notes" value="{{ d.notes or '' }}" placeholder="file ref / note" style="flex:1">
+<span class="docslot {% if d.done %}muted{% endif %}">{{ d.slot }}</span>
+<input name="notes" value="{{ d.notes or '' }}" placeholder="file ref / note" style="flex:1;min-width:0">
 <button class="btn sm sec">Save</button></form><form method="post" action="{{ url_for('doc_delete', did=d.id) }}" onsubmit="return confirm('Remove this document row?')"><button class="btn sm sec" title="Remove this document">✕</button></form></div>{% endfor %}{% endfor %}</div>
 {% endif %}
 {% endblock %}
