@@ -5397,6 +5397,18 @@ def add_property():
         return redirect(url_for("property_page", pid=pid))
     return render_template("add.html")
 
+_MKT_NOMINAL_MAX = 1000  # v53: county nominal-consideration marker for Market Data stats
+def _market_pct_line(first, last):
+    """Snapshot % line between two trend buckets, or None when the baseline
+    median is nominal (< $1,000) — a % computed off a $100/$200 county
+    quitclaim-style baseline is an artifact, never a market move."""
+    if not first or not last: return None
+    f, l = first.get("median"), last.get("median")
+    if f is None or l is None or f < _MKT_NOMINAL_MAX: return None
+    chg = (l - f) / f * 100
+    return (f"Median sale price moved from {money(f)} ({first['month']}) to "
+            f"{money(l)} ({last['month']}) — {'+' if chg >= 0 else ''}{chg:.1f}% over the stored trend window.")
+
 @app.route("/property/<int:pid>", methods=["GET", "POST"])
 def property_page(pid):
     p = get_prop(pid); d = db()
@@ -5459,9 +5471,17 @@ def property_page(pid):
         mrange = request.args.get("mrange", "3Y")
         if mrange not in ("1Y", "3Y", "5Y"): mrange = "3Y"
         def _ptype_of(c): return (c["ptype"] if "ptype" in c.keys() else None) or "Single Family"  # pre-v1.6 rows/DBs carry no stored type
-        msold = [c for c in sold if mtype == "All" or _ptype_of(c) == mtype]
+        # v53: Market Data is ZIP-scoped (the page's own claim: "Market
+        # Overview for ZIP 33613" / "across N stored sold comps in ZIP ...")
+        # and nominal county-consideration sales (< $1,000) are excluded
+        # from the STATS ONLY — the rows stay stored and listed in
+        # Comparables. The nearby-ZIP table keeps its radius-wide pool
+        # (nominal-filtered), so its YOU row is the same ZIP pool the
+        # headline reports: headline median == YOU-row median, always.
+        _mkt = [c for c in sold if c["zip"] == p["zip"] and not (c["price"] and c["price"] < _MKT_NOMINAL_MAX)]
+        msold = [c for c in _mkt if mtype == "All" or _ptype_of(c) == mtype]
         type_counts = {}
-        for c in sold: type_counts[_ptype_of(c)] = type_counts.get(_ptype_of(c), 0) + 1
+        for c in _mkt: type_counts[_ptype_of(c)] = type_counts.get(_ptype_of(c), 0) + 1
         prices = sorted(c["price"] for c in msold if c["price"]); ppsfs = sorted(c["ppsf"] for c in msold if c["ppsf"])
         doms = sorted(c["dom"] for c in msold if c["dom"])
         med = lambda xs: xs[len(xs)//2] if xs else None
@@ -5475,8 +5495,12 @@ def property_page(pid):
             vals = [t["median"] for t in trend]; lo, hi = min(vals), max(vals); span = (hi - lo) or 1
             spark = " ".join(f"{round(i / (len(vals) - 1) * 300, 1)},{round(34 - (vv - lo) / span * 30, 1)}"
                              for i, vv in enumerate(vals))
+        # v53: nearby table stays radius-wide but nominal-filtered (its YOU
+        # row is the ZIP pool the headline reports).
+        _rad = [c for c in sold if not (c["price"] and c["price"] < _MKT_NOMINAL_MAX)
+                and (mtype == "All" or _ptype_of(c) == mtype)]
         zip_groups = {}
-        for c in msold:
+        for c in _rad:
             if c["zip"] and c["price"]: zip_groups.setdefault(c["zip"], []).append(c)
         nearby = []
         for z, cs in zip_groups.items():
@@ -5492,10 +5516,12 @@ def property_page(pid):
             snap.append(f"Median sale price {money(med(prices))} across {len(msold)} stored sold "
                         f"comps in ZIP {p['zip']}" + (f" (property-type filter: {mtype})" if mtype != "All" else "") + ".")
         if len(trend_all) >= 2 and trend_all[0]["median"]:
-            _f, _l = trend_all[0], trend_all[-1]
-            _chg = (_l["median"] - _f["median"]) / _f["median"] * 100
-            snap.append(f"Median sale price moved from {money(_f['median'])} ({_f['month']}) to "
-                        f"{money(_l['median'])} ({_l['month']}) — {'+' if _chg >= 0 else ''}{_chg:.1f}% over the stored trend window.")
+            _line = _market_pct_line(trend_all[0], trend_all[-1])
+            if _line:
+                snap.append(_line)
+            else:
+                # v53 defense-in-depth: never print a % off a nominal baseline.
+                snap.append("Trend window starts from a nominal-consideration sale — no % change is shown.")
         if med(doms) is not None:
             snap.append(f"Median days on market: {med(doms):g} (of the stored sold comps with a recorded DOM).")
         if med(ppsfs) is not None:
@@ -5506,7 +5532,7 @@ def property_page(pid):
                   "trend_min": min([t["median"] for t in trend]) if trend else None,
                   "trend_max": max([t["median"] for t in trend]) if trend else None,
                   "nearby": nearby, "mtype": mtype, "mrange": mrange, "type_counts": type_counts,
-                  "untyped": sum(1 for c in sold if not ("ptype" in c.keys() and c["ptype"])),
+                  "untyped": sum(1 for c in _mkt if not ("ptype" in c.keys() and c["ptype"])),
                   "source": "Computed from your stored HomeHarvest sold comps", "date": datetime.date.today().isoformat()}
     # demographics: served from cache (async job fills it); never block page load on Census
     demo = None
