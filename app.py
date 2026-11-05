@@ -375,11 +375,11 @@ def adjusted_price(comp):
     adj = (comp["adj_condition"] or 0) + (comp["adj_size"] or 0) + (comp["adj_other"] or 0)
     return (comp["price"] or 0) + adj
 
-def arv_reconciliation(prop, comps):
+def arv_reconciliation(prop, comps, bulk_keys=None):
     """ONE reconciled ARV with the math shown: average of (adjusted avg comp price) and (avg $/sqft x subject sqft).
     v57: the pool is stats-usable sold rows only — a bulk-flagged row or
     a $/sqft outlier can never enter the ARV, even when pinned."""
-    usable = _stats_usable_sold(comps)
+    usable = _stats_usable_sold(comps, bulk_keys)
     pool = [c for c in usable if c["pinned"]] or sorted(usable, key=lambda c: -(c["match_score"] or 0))[:6]
     if not pool or not prop["sqft"]:
         return {"arv": None, "pool": pool, "note": "Not found — pull comps first."}
@@ -396,9 +396,9 @@ def arv_reconciliation(prop, comps):
                     f"(${round(avg_ppsf,2)}/sqft x {int(prop['sqft'])} sqft = ${round(ppsf_value):,}), "
                     f"over {basis}. Source: HomeHarvest sold data, pulled {datetime.date.today().isoformat()}."}
 
-def verdict(prop, comps, boxes):
+def verdict(prop, comps, boxes, bulk_keys=None):
     """Sticky verdict: score + confidence + MAO + buy-box PASS/FAIL."""
-    rec = arv_reconciliation(prop, comps)
+    rec = arv_reconciliation(prop, comps, bulk_keys)
     arv = prop["arv"] or rec["arv"]
     repairs = prop["repairs"] or 0
     price = prop["purchase_price"] or prop["list_price"]
@@ -410,7 +410,7 @@ def verdict(prop, comps, boxes):
         reasons.append(f"Spread after repairs = {spread_pct:.1f}% of ARV")
         if mao and price <= mao: score = min(99, score + 8); reasons.append("At/under MAO (70% rule)")
         elif mao: score = max(1, score - 10); reasons.append("Above MAO (70% rule)")
-    n_sold = len(_stats_usable_sold(comps))  # v57: bulk/outlier rows are not market comps
+    n_sold = len(_stats_usable_sold(comps, bulk_keys))  # v57: bulk/outlier rows are not market comps
     completeness = sum(1 for v in [prop["beds"], prop["sqft"], prop["year_built"], prop["list_price"]] if v) / 4
     conf_pts = min(50, n_sold * 6) + completeness * 50
     confidence = "High" if conf_pts >= 75 else ("Medium" if conf_pts >= 45 else "Low")
@@ -479,17 +479,27 @@ def _ppsf_of(c):
         except Exception: return None
     return None
 
-def _stats_usable_sold(rows):
-    """The sold rows any average/median/ARV/trend may use (v57):
-    kind sold, priced, not excluded, not bulk-flagged, and not a
-    $/sqft extreme outlier. The median is computed over the
+def _stats_usable_sold(rows, bulk_keys=None):
+    """The sold rows any average/median/ARV/trend may use (v57, v57.1):
+    kind sold, priced, not excluded, not bulk-flagged, not a member of
+    a bulk group (v57.1 — read-side detection over the STORED pool, so
+    already-stored bulk rows are fixed without any DB write; ALL
+    members are excluded, the kept representative included, because
+    its price is the complex total, not a per-unit market price), and
+    not a $/sqft extreme outlier. The median is computed over the
     bulk/excluded-free pool first (a median is robust while the
     outliers are a minority), then rows above 20x that median drop.
-    Callers that ALSO need the nominal filter (Market Data) apply it
-    themselves, as before — this helper never invents a price rule."""
+    bulk_keys may be supplied (the view computes it once over the full
+    stored pool so a group split by a date window still counts);
+    otherwise it is detected within rows. Callers that ALSO need the
+    nominal filter (Market Data) apply it themselves, as before —
+    this helper never invents a price rule."""
+    if bulk_keys is None:
+        bulk_keys = _bulk_group_keys(rows)
     base = [c for c in (rows or [])
             if _cval(c, "kind") == "sold" and _cval(c, "price")
-            and not _cval(c, "excluded") and not _cval(c, "bulk_sale")]
+            and not _cval(c, "excluded") and not _cval(c, "bulk_sale")
+            and _bulk_group_key(c) not in bulk_keys]
     ppsfs = sorted(p for p in (_ppsf_of(c) for c in base) if p is not None)
     if len(ppsfs) >= _PPSF_OUTLIER_MIN_N:
         med = _median(ppsfs)
@@ -713,11 +723,11 @@ def _padsplit_benchmark(prop):
             "padsplit_n": len(rents), "padsplit_scope": ps.get("scope") or "zip",
             "padsplit_url": ps.get("url") or ""}
 
-def pinned_sold_stats(sold):
+def pinned_sold_stats(sold, bulk_keys=None):
     """Sold-view header averages from the PINNED set (falls back to top 3 by score, labeled).
     v57: the pool is stats-usable sold rows only — a pinned bulk row
     (or $/sqft outlier) drops out of the basis instead of pricing it."""
-    pool = _stats_usable_sold(sold)
+    pool = _stats_usable_sold(sold, bulk_keys)
     if not pool: return None
     pinned = [c for c in pool if c["pinned"]]
     basis = pinned or sorted(pool, key=lambda c: -(c["match_score"] or 0))[:3]
@@ -2023,25 +2033,56 @@ def _drop_note(drops, reason, row):
 # invented (total / units is forbidden). The kept row is flagged
 # bulk_sale=1 so _stats_usable_sold keeps it out of every average,
 # median, ARV and trend; it stays listed with a badge.
+# v57.1: the live Cadastral layer carries condo units as a BARE
+# trailing number with NO Unit/# keyword ("14599 SEAFORD CIR 201"),
+# and _addr_unit_split only strips keyworded units — so every live
+# unit keyed as its own building and B1 could never group (or collapse)
+# a re-pulled frame; the live 0-new-rows re-pull was dedupe, not a
+# collapse. _bulk_group_key now also strips that bare trailing unit
+# from the NORMALIZED base (a trailing number after a street suffix
+# only), so keyword + bare forms unify to one key. _addr_unit_split
+# itself is untouched — no dedupe / subject / same-street change.
 _BULK_MIN_GROUP = 3
+
+# Street suffixes (canonical, post-_norm_addr) after which a bare
+# trailing number is a unit ("cir 201", "st 5"). "hwy" is deliberately
+# ABSENT: "1234 US Highway 41" carries the highway number, not a unit.
+_BULK_STRIP_SUFFIXES = frozenset({"pl", "dr", "ct", "ave", "st", "ln", "rd",
+                                  "cir", "blvd", "ter", "trl", "way", "pkwy"})
+
+def _strip_bare_unit_norm(base):
+    """Strip a bare trailing unit number from a NORMALIZED base address
+    (v57.1): the Cadastral layer emits condo units as a bare number
+    ("14599 seaford cir 201") with no Unit/# keyword, so without this
+    every unit keys as a different building. A trailing purely-numeric
+    token is a unit ONLY when it follows a street suffix; a number that
+    IS the street ("314 e 137th ave") sits mid-address and is never
+    stripped, and a highway number is never stripped (no "hwy" in the
+    suffix set)."""
+    toks = (base or "").split()
+    if len(toks) >= 3 and toks[-1].isdigit() and toks[-2] in _BULK_STRIP_SUFFIXES:
+        return " ".join(toks[:-1])
+    return base
 
 def _bulk_group_key(vals):
     """The bulk-group key for one candidate sold row, or None when the
     row cannot be grouped (no price, or no year-month sale date — a
     year-only date cannot prove the units sold in the same month).
     The key is (unit-stripped normalized base address, price, sale
-    month): "14595 Seaford Cir Unit 101" and "... Unit 204" key
-    together; "14596 Seaford Cir Unit 101" keys apart (a different
-    building number is a different group — the live complex spans
-    14595-14599 with ~24 units per number, so every number-group
-    independently meets the >= 3 rule and collapses to its own kept
-    row)."""
-    price = vals.get("price")
+    month): "14595 Seaford Cir Unit 101", "... Unit 204" AND the live
+    bare form "14595 Seaford Cir 204" key together; "14596 Seaford
+    Cir Unit 101" keys apart (a different building number is a
+    different group — the live complex spans 14595-14599 with ~24
+    units per number, so every number-group independently meets the
+    >= 3 rule and collapses to its own kept row). Reads via _cval so
+    it works on stored sqlite3.Rows as well as frame dicts (the
+    read-side path, v57.1)."""
+    price = _cval(vals, "price")
     if not price: return None
-    month = _s(vals.get("event_date"))[:7]
+    month = _s(_cval(vals, "event_date"))[:7]
     if len(month) < 7: return None
-    street, _unit = _addr_unit_split(vals.get("address"))
-    base = _norm_addr(street)
+    street, _unit = _addr_unit_split(_cval(vals, "address"))
+    base = _strip_bare_unit_norm(_norm_addr(street))
     if not base: return None
     return (base, price, month)
 
@@ -2071,6 +2112,26 @@ def _bulk_split(cands):
         kept.add(rep)
         skip.update(j for j in idxs if j != rep)
     return kept, skip
+
+def _bulk_group_keys(rows):
+    """The bulk-group keys present >= _BULK_MIN_GROUP times among rows
+    (v57.1, read-side): identical price + sale month + building
+    (street number + street name, unit stripped — including the bare
+    trailing unit the Cadastral layer emits) repeated >= 3 times is
+    the bulk-sale fingerprint. Works on dicts and sqlite3.Rows (via
+    _cval); rows without a price or a year-month date never key, and
+    a group of 2 is within coincidence and does not count. Callers
+    pass the result into _stats_usable_sold so a group split by a
+    date window still counts (a lone member inside a window is
+    still bulk)."""
+    counts = {}
+    for c in (rows or []):
+        if _cval(c, "kind") not in (None, "sold"):
+            continue
+        k = _bulk_group_key(c)
+        if k is None: continue
+        counts[k] = counts.get(k, 0) + 1
+    return {k for k, n in counts.items() if n >= _BULK_MIN_GROUP}
 
 def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touched=None, drops=None):
     """Merge one HomeHarvest sold frame into the comps table. Returns
@@ -4303,6 +4364,11 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         # the pinned set, and a $31M complex total must never be one
         # of the three comps the ARV is built from.
         rows = [c for c in rows if not _cval(c, "bulk_sale")]
+        # v57.1: a legacy bulk-group member (stored before v57, so
+        # unflagged) never auto-pins either — read-side detection over
+        # the stored pool, same rule as the stats path.
+        _bk = _bulk_group_keys(rows)
+        rows = [c for c in rows if _bulk_group_key(c) not in _bk]
         # v56: same-street first here too — the auto-pinned set is what
         # the ARV is built from, so a same-street comp (even a Tier-3
         # county row with no beds/baths) pins ahead of off-street
@@ -6072,6 +6138,12 @@ def property_page(pid):
             # edits — redirect to the same tab instead of re-rendering here.
             return redirect(url_for("property_page", pid=pid, tab=request.args.get("tab", "overview")))
     comps = d.execute("SELECT * FROM comps WHERE property_id=? ORDER BY excluded, pinned DESC, match_score DESC", (pid,)).fetchall()
+    # v57.1: bulk-group keys over the FULL stored sold pool, computed
+    # once so the stats and the card badges agree even when a date
+    # window splits a group (a lone group member inside a window is
+    # still bulk); bulk_group_ids is the member-row ids for the badge.
+    _bulk_keys = _bulk_group_keys([c for c in comps if c["kind"] == "sold"])
+    bulk_group_ids = {c["id"] for c in comps if c["kind"] == "sold" and _bulk_group_key(c) in _bulk_keys}
     liens = d.execute("SELECT * FROM liens WHERE property_id=?", (pid,)).fetchall()
     docs = d.execute("SELECT * FROM documents WHERE property_id=? ORDER BY category, slot", (pid,)).fetchall()
     assigns = d.execute("""SELECT a.*, c.name, c.company FROM assignments a LEFT JOIN contractors c
@@ -6094,7 +6166,7 @@ def property_page(pid):
         _disp.append(_s)
     scenarios = _disp
     plans = d.execute("SELECT * FROM floorplans WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
-    v = verdict(p, comps, all_boxes())
+    v = verdict(p, comps, all_boxes(), _bulk_keys)
     sold = [c for c in comps if c["kind"] == "sold" and not c["excluded"]]
     # v48: rents respect `excluded` exactly like sold (the audit's
     # adjacent integrity gap — an excluded rental used to keep
@@ -6121,7 +6193,7 @@ def property_page(pid):
         # trend, or the nearby table, even when it was stored before
         # the merge gate existed (the live Seaford rows, until the
         # approved cleanup exclude-flags them).
-        _mkt = _stats_usable_sold([c for c in sold if c["zip"] == p["zip"] and not (c["price"] and c["price"] < _MKT_NOMINAL_MAX)])
+        _mkt = _stats_usable_sold([c for c in sold if c["zip"] == p["zip"] and not (c["price"] and c["price"] < _MKT_NOMINAL_MAX)], _bulk_keys)
         msold = [c for c in _mkt if mtype == "All" or _ptype_of(c) == mtype]
         type_counts = {}
         for c in _mkt: type_counts[_ptype_of(c)] = type_counts.get(_ptype_of(c), 0) + 1
@@ -6141,7 +6213,7 @@ def property_page(pid):
         # v53: nearby table stays radius-wide but nominal-filtered (its YOU
         # row is the ZIP pool the headline reports). v57: stats-usable too.
         _rad = _stats_usable_sold([c for c in sold if not (c["price"] and c["price"] < _MKT_NOMINAL_MAX)
-                and (mtype == "All" or _ptype_of(c) == mtype)])
+                and (mtype == "All" or _ptype_of(c) == mtype)], _bulk_keys)
         zip_groups = {}
         for c in _rad:
             if c["zip"] and c["price"]: zip_groups.setdefault(c["zip"], []).append(c)
@@ -6350,7 +6422,7 @@ def property_page(pid):
         _g = rent_match_group(_subj, dict(c))
         if _g == 0: rent_match["exact"] += 1
         elif _g == 1: rent_match["near"] += 1
-    sold_stats = pinned_sold_stats(sold_view)
+    sold_stats = pinned_sold_stats(sold_view, _bulk_keys)
     # v2.5: "Pinned #N" labels (ReiSearch comp-row anatomy) — rank among the
     # pinned comps in each view's own display (match-first) order.
     pinned_rank = {}
@@ -6368,7 +6440,7 @@ def property_page(pid):
     # row or $/sqft outlier shown in the view must never price the
     # average. stats_n / stats_excluded tell the template to say so.
     _set_sold = [c for c in sold_view if c["kind"] == "sold"]
-    _set_usable = _stats_usable_sold(_set_sold)
+    _set_usable = _stats_usable_sold(_set_sold, _bulk_keys)
     _set_prices = [c["price"] for c in _set_usable if c["price"]]
     _set_ppsf = [(c["price"] / c["sqft"]) for c in _set_usable if c["price"] and c["sqft"]]
     _set_doms = [c["dom"] for c in _set_usable if c["dom"] is not None]
@@ -6430,8 +6502,8 @@ def property_page(pid):
     # pinned (or top-3) sold comps for the Flip Sale & Exit table
     # Fallback pool = first 3 of the tier-ordered sold view (P0-1: Tier 1 first).
     # v57: the flip pool is stats-usable only — a bulk row must never price the exit table.
-    flip_pool = [c for c in _stats_usable_sold(sold_view) if c["pinned"] and c["kind"] == "sold"] or \
-        [c for c in _stats_usable_sold(sold_view) if c["kind"] == "sold"][:3]
+    flip_pool = [c for c in _stats_usable_sold(sold_view, _bulk_keys) if c["pinned"] and c["kind"] == "sold"] or \
+        [c for c in _stats_usable_sold(sold_view, _bulk_keys) if c["kind"] == "sold"][:3]
     flip_prices = [c["price"] for c in flip_pool if c["price"]]
     # ---- v1.7b comp filters popover vocabularies (Sold view) ----
     sold_years = sorted({c["event_date"][:4] for c in sold_view if c["event_date"]}, reverse=True)
@@ -6444,6 +6516,7 @@ def property_page(pid):
                            photos=photos, job=banner_job, steps=steps,
                            cview=cview, window=window, rmax=rmax, sold_view=sold_view, rents_view=rents_view,
                            rent_match=rent_match, same_street_ids=same_street_ids,
+                           bulk_group_ids=bulk_group_ids,
                            sold_stats=sold_stats, set_stats=set_stats, sold_older_n=sold_older_n,
                            ltr=ltr, coli=coli, med_rent=med_rent, afford_view=afford_view,
                            breakdowns=breakdowns, room_est=room_est,

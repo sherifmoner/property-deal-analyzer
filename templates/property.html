@@ -44,8 +44,12 @@
  {# v57 (Seaford defect): a kept bulk-sale row is ONE stored row for a whole
     complex's portfolio sale — the $31M is the complex total, not this
     unit's price. The badge says so; the row stays listed, and the stats
-    helpers already keep it out of every average/median/ARV. #}
- {% if 'bulk_sale' in c.keys() and c.bulk_sale %}<div class="small" data-comp-bulk><span class="badge" style="background:#fee2e2;color:#991b1b">🏢 Bulk sale — complex total, not a per-unit price</span></div>{% endif %}
+    helpers already keep it out of every average/median/ARV.
+    v57.1: the badge also renders for read-side-detected group members
+    (bulk_group_ids, computed over the stored pool in property_page) —
+    legacy rows stored before v57 carry no bulk_sale flag, but every
+    member of a detected group is the same complex total. #}
+ {% if ('bulk_sale' in c.keys() and c.bulk_sale) or (bulk_group_ids is defined and c.id in bulk_group_ids) %}<div class="small" data-comp-bulk><span class="badge" style="background:#fee2e2;color:#991b1b">🏢 Bulk sale — complex total, not a per-unit price</span></div>{% endif %}
  <div class="small" data-comp-address><b>{{ c.address }}</b>, {{ c.city }} {{ c.zip }}</div>
  <div class="small muted" data-comp-specs>{{ c.beds|num }}bd • {{ c.baths|num }}ba • {{ (c.sqft|int) if c.sqft else '—' }}sqft • Built {{ c.year_built or '—' }}{% if c.distance_mi is not none %} • 📍 {{ c.distance_mi|num(2) }} mi{% endif %}</div>
  {% if mode=='sold' %}
