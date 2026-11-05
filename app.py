@@ -2025,7 +2025,9 @@ def _rapi_in_horizon(rows, past_days):
 
 def _redfin_region_id(prop):
     """Resolve the property's city to a Redfin regionId via Nathan's
-    auto-complete. Returns (region_id, err). LIVE-CAPTURED request and
+    auto-complete. Returns (region_id, label, err); label is the
+    matched row's display name (v47: the success note names the region
+    as "Name id", e.g. "Tampa 6_18142"). LIVE-CAPTURED request and
     response (playground, Sherif's account, 2026-11-04): the endpoint
     takes query="City, ST" — pre-v46 the app sent a "location"
     parameter the endpoint does not take, so every live call resolved
@@ -2045,7 +2047,7 @@ def _redfin_region_id(prop):
     there)."""
     data, err = _rapidapi_get(RAPIDAPI_REDFIN_HOST, RAPIDAPI_REDFIN_AC_PATH,
                               {"query": f"{prop['city']}, {prop['state']}"})
-    if err is not None or data is None: return None, err
+    if err is not None or data is None: return None, None, err
     import re as _re
     pat = _re.compile(r"^\d+_\d+$")
     city = (prop["city"] or "").strip().lower()
@@ -2066,11 +2068,11 @@ def _redfin_region_id(prop):
         if isinstance(row, dict) and city \
                 and (row.get("name") or "").strip().lower() == city:
             rid = _rid(row)
-            if rid: return rid, None
+            if rid: return rid, (row.get("name") or "").strip() or None, None
     for row in pool:
         rid = _rid(row)
-        if rid: return rid, None
-    return None, None
+        if rid: return rid, (row.get("name") or "").strip() or None, None
+    return None, None, None
 
 def _redfin_item_to_row(item):
     """One Redfin.Com Data search-sold item -> the standard HomeHarvest
@@ -2394,8 +2396,12 @@ def _src_redfin_sold(prop, past_days, radius_mi=1.0):
     # the search failing. Each non-serving path now leaves a distinct side-note
     # (the _rapi_note channel, taken into the outcome's LOG text by
     # _rapidapi_sold_frame; the banner keeps its clean reason).
+    # v47: the SERVING path leaves one too — before v47 a successful
+    # search wrote no note at all, so no pull's pool-detail line ever
+    # named its resolved region (2026-11-05 00:44 live observation).
     _rapi_take_note("redfin_sold")  # discard any stale note from a direct call
-    rid, err = _redfin_region_id(prop)
+    rid, rlabel, err = _redfin_region_id(prop)
+    _rname = f"{rlabel} {rid}" if rlabel else rid
     if err is not None:
         _rapi_note("redfin_sold", "region lookup failed")
         return [], err, RAPIDAPI_SRC_REDFIN
@@ -2412,12 +2418,15 @@ def _src_redfin_sold(prop, past_days, radius_mi=1.0):
                               {"regionId": rid, "limit": 100,
                                "soldWithin": min(max(past_days, 365), 1095)})
     if err is not None:
-        _rapi_note("redfin_sold", f"region {rid} resolved; search failed")
+        _rapi_note("redfin_sold", f"region {_rname} resolved; search failed")
         return [], err, RAPIDAPI_SRC_REDFIN
     items = data.get("data") if isinstance(data, dict) else None
     items = items if isinstance(items, list) else []
     if not items:
-        _rapi_note("redfin_sold", f"region {rid} resolved; search returned no rows")
+        _rapi_note("redfin_sold", f"region {_rname} resolved; search returned no rows")
+    else:
+        _rapi_note("redfin_sold",
+                   f"region {_rname} resolved; search returned {len(items)} rows")
     rows = _rapi_rows(items, _redfin_item_to_row)
     return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_REDFIN
 
