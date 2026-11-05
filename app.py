@@ -459,12 +459,23 @@ def _cval(c, key, default=None):
 #   (a) the merge gate collapses a bulk group to ONE flagged row
 #       (see _bulk_group_key / _merge_sold_frame);
 #   (b) this read-side predicate keeps bulk-flagged rows AND $/sqft
-#       extreme outliers out of EVERY stat — so even a bulk row that
-#       slipped in before the fix (or a lone $35M row with no group
-#       to collapse) can never move a headline again. Rows stay
-#       LISTED in Comparables; only the stats ignore them.
+#       extreme outliers AND (v57.3) PRICE extreme outliers out of
+#       EVERY stat — so even a bulk row that slipped in before the
+#       fix (or a lone $31M/$35M singleton with no group to collapse
+#       and whole-building sqft) can never move a headline again.
+#       Rows stay LISTED in Comparables; only the stats ignore them.
 _PPSF_OUTLIER_MULT = 20      # a sold row above 20x the pool median $/sqft is not a market comp
 _PPSF_OUTLIER_MIN_N = 5      # ...but only when >= 5 rows carry a $/sqft, so the median is trustworthy
+_PRICE_OUTLIER_MULT = 20     # v57.3: a sold row above 20x the pool median PRICE is not a market comp either
+_PRICE_OUTLIER_MIN_N = 5     # ...but only when >= 5 rows carry a price, so the median is trustworthy
+
+def _price_of(c):
+    """Price for one sold row as a float, else None (v57.3 — mirrors _ppsf_of)."""
+    p = _cval(c, "price")
+    if p is None:
+        return None
+    try: return float(p)
+    except Exception: return None
 
 def _ppsf_of(c):
     """$/sqft for one sold row: the stored ppsf, else price/sqft, else
@@ -480,20 +491,26 @@ def _ppsf_of(c):
     return None
 
 def _stats_usable_sold(rows, bulk_keys=None):
-    """The sold rows any average/median/ARV/trend may use (v57, v57.1):
+    """The sold rows any average/median/ARV/trend may use (v57, v57.1, v57.3):
     kind sold, priced, not excluded, not bulk-flagged, not a member of
     a bulk group (v57.1 — read-side detection over the STORED pool, so
     already-stored bulk rows are fixed without any DB write; ALL
     members are excluded, the kept representative included, because
     its price is the complex total, not a per-unit market price), and
-    not a $/sqft extreme outlier. The median is computed over the
-    bulk/excluded-free pool first (a median is robust while the
-    outliers are a minority), then rows above 20x that median drop.
-    bulk_keys may be supplied (the view computes it once over the full
-    stored pool so a group split by a date window still counts);
-    otherwise it is detected within rows. Callers that ALSO need the
-    nominal filter (Market Data) apply it themselves, as before —
-    this helper never invents a price rule."""
+    not a $/sqft extreme outlier, and not a PRICE extreme outlier
+    (v57.3). The medians are computed over the bulk/excluded-free
+    pool first (a median is robust while the outliers are a minority),
+    then rows above 20x that median drop. The price guard is the
+    symmetric twin of the $/sqft guard: it catches a bulk SINGLETON
+    (live 2026-11-05: 14566 Seaford Cir 101, the only row for its
+    building at $31M with whole-building sqft, so no grouping rule
+    and no $/sqft rule can catch it) and any other lone $31M/$35M
+    row, while genuine high-price sales ($1-3M = 2.5-7.6x the median)
+    stay. bulk_keys may be supplied (the view computes it once over
+    the full stored pool so a group split by a date window still
+    counts); otherwise it is detected within rows. Callers that ALSO
+    need the nominal filter (Market Data) apply it themselves, as
+    before — this helper never invents a price rule."""
     if bulk_keys is None:
         bulk_keys = _bulk_group_keys(rows)
     base = [c for c in (rows or [])
@@ -506,6 +523,12 @@ def _stats_usable_sold(rows, bulk_keys=None):
         if med:
             cap = med * _PPSF_OUTLIER_MULT
             base = [c for c in base if (_ppsf_of(c) is None or _ppsf_of(c) <= cap)]
+    prices = sorted(p for p in (_price_of(c) for c in base) if p is not None)
+    if len(prices) >= _PRICE_OUTLIER_MIN_N:
+        med = _median(prices)
+        if med:
+            cap = med * _PRICE_OUTLIER_MULT
+            base = [c for c in base if (_price_of(c) is None or _price_of(c) <= cap)]
     return base
 
 def _pool_source_label(rows):
