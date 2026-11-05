@@ -1547,6 +1547,43 @@ def _unit_designator(addr, source_url=None):
             if _unit_plausible(m.group(1)): return m.group(1).lower()
     return ""
 
+def _addr_unit_split(addr):
+    """(street_text, unit) for one stored address (v50): the unit
+    segment — the same plausible keyword+token _unit_designator would
+    read — REMOVED from the address text, and the unit token itself
+    ("" when the address carries no plausible unit). The v49 collapse
+    keyed groups on _norm_addr(address) verbatim, so a unit living IN
+    the address text ("... Unit 208" / "... # 208" — the RapidAPI
+    storage shape) polluted the normalized street ("14522 n nebraska
+    ave unit 208" / "... ave 208") while the unit-in-URL shape
+    (HomeHarvest) keyed clean — the same home at the same unit keyed
+    as two different groups and the live twin never folded. Identity
+    is now derived from the cleaned display identity: this stripped
+    street, combined with the unit designator."""
+    flat = str(addr or "").replace("-", " ").replace("_", " ").replace("/", " ")
+    for m in _UNIT_RE.finditer(flat):
+        if _unit_plausible(m.group(1)):
+            street = " ".join((flat[:m.start()] + " " + flat[m.end():]).split())
+            return street, m.group(1).lower()
+    return (addr or ""), ""
+
+def _is_subject_addr(prop, addr):
+    """Whether a frame row's street address IS the subject property's
+    own address (v50). A property must never be its own comp: once the
+    Cadastral frame served, 3907 Spence Ave's own parcel row stored as
+    a sold comp for itself and auto-pinned at 0.00 mi — and the merges
+    carried no subject comparison at all, so EVERY frame shape
+    (Cadastral / RapidAPI / HomeHarvest) leaked the subject's own row
+    the same way. The comparison is on the unit-stripped normalized
+    street (a subject's own unit row is still the subject). Subject
+    ENRICHMENT is unaffected: it reads the frames themselves
+    (find_subject_row), never the comps table."""
+    if not addr: return False
+    subj_street = prop["street"] or (prop["address"] or "").split(",")[0]
+    row_street, _ru = _addr_unit_split(addr)
+    subj_clean, _su = _addr_unit_split(subj_street)
+    return _norm_addr(row_street) == _norm_addr(subj_clean)
+
 _ADDR_ARTIFACT_RE = re.compile(r"#\s*[-#]?\s*[a-z]{2,}\s*$", re.I)
 
 def _strip_addr_artifact(s):
@@ -1700,7 +1737,18 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
     decided by the SHARED acceptance test _sold_row_gate — pull_comps
     passes one for RapidAPI frames and logs the per-reason counts, so
     a served-but-not-stored pull names the exact filter that ate the
-    rows. Default None = no accounting, behavior unchanged."""
+    rows. Default None = no accounting, behavior unchanged.
+    v50: the SUBJECT's own row is never stored (see _is_subject_addr
+    — every frame shape leaked it; the row still reaches subject
+    enrichment, which reads the frames, not this table). And a
+    CADASTRAL row whose sale price is nominal (< _CAD_NOMINAL_MAX)
+    stores with excluded=1 at INSERT only: the county record exists
+    and may matter for history, but a $100 quitclaim-style transfer
+    is not a market comp — it stays out of the Sold view, averages,
+    ARV and auto-pinning. The update path never sets excluded: a
+    nominal cadastral row landing on an existing comp must not
+    poison a good comp another source stands behind. The threshold
+    is Cadastral-only — listing-source rows keep their behavior."""
     added = updated = n = 0
     if df is None: return added, updated, n
     for _, r in df.iterrows():
@@ -1710,6 +1758,7 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
             continue
         lat, lon = float(r.get("latitude")), float(r.get("longitude"))
         addr = _s(r.get("street")).strip()
+        if _is_subject_addr(prop, addr): continue
         price = _nn(r.get("sold_price")); sqft = _nn(r.get("sqft"))
         n += 1
         vals = dict(kind="sold", address=addr, city=_s(r.get("city")) or prop["city"],
@@ -1734,7 +1783,11 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
             if touched is not None: touched.append((ex, vals["source"]))
             if drops is not None: _drop_note(drops, "duplicate", r)
         else:
-            _cur = d.execute(f"INSERT INTO comps(property_id,{cols}) VALUES(?,{ph})", (prop["id"], *vals.values())); added += 1
+            ivals, icols, iph = vals, cols, ph
+            if source_override == CADASTRAL_SRC and price is not None and price < _CAD_NOMINAL_MAX:
+                ivals = dict(vals, excluded=1)
+                icols = ",".join(ivals.keys()); iph = ",".join("?" * len(ivals))
+            _cur = d.execute(f"INSERT INTO comps(property_id,{icols}) VALUES(?,{iph})", (prop["id"], *ivals.values())); added += 1
             if touched is not None: touched.append((_cur.lastrowid, vals["source"]))
     return added, updated, n
 
@@ -1763,6 +1816,9 @@ def _merge_rent_frame(d, prop, df, radius_mi, subj, source_override=None, drops=
             continue
         lat, lon = float(r.get("latitude")), float(r.get("longitude"))
         addr = _s(r.get("street")).strip(); price = _nn(r.get("list_price"))
+        # v50: the subject's own rental row is not a rental comp either
+        # (same shared store gate as the sold merge — _is_subject_addr).
+        if _is_subject_addr(prop, addr): continue
         sqft = _nn(r.get("sqft"))
         vals = dict(kind="rent", address=addr, city=_s(r.get("city")) or prop["city"],
                     zip=_s(r.get("zip_code")), price=price,
@@ -1839,21 +1895,35 @@ def _collapse_rent_view(rows):
     ties go to the higher match_score, then to the earlier row —
     callers pass match-first display order). The displayed address is
     artifact-cleaned (_strip_addr_artifact), so the "# Usa" slug tail
-    stored in one live row never renders."""
+    stored in one live row never renders.
+
+    v50 (the twin v49 missed): the pair that survived v49 on PA was
+    told apart by WHERE the unit is stored — one row carries it only
+    in its listing URL (address text clean), the other only IN its
+    address text ("... Unit 208", the RapidAPI shape). Both derive
+    the same unit, but the group key's address component was
+    _norm_addr of the raw stored address, which keeps the in-text
+    unit segment ("... ave unit 208" / "... ave 208") — two keys for
+    one home. The key now derives from the CLEANED DISPLAY identity:
+    _addr_unit_split strips the unit segment out of the street before
+    normalization, and the unit (from the address text, else the
+    listing URL) is the key's second component."""
     out, meta = [], []   # meta[i] = (group key, survivor beds) for out[i]
     for c in rows or []:
         d = dict(c)
-        unit = _unit_designator(d.get("address"), d.get("source_url"))
+        street_text, unit = _addr_unit_split(d.get("address"))
+        if not unit:
+            unit = _unit_designator(None, d.get("source_url"))
         d["address"] = _strip_addr_artifact(d.get("address") or "")
         if unit:
             label = f"Unit {unit}"
             if label.lower() not in d["address"].lower():
                 d["address"] = f"{d['address']} {label}".strip()
-        # The key reads the row's STORED address (unit is its own key
-        # component — the display suffix above must not enter it);
-        # _norm_addr strips the "# Usa" artifact, so the artifact row
-        # groups with its clean twin.
-        gkey = (_norm_addr(c["address"] or ""), unit)
+        # The key reads the row's STORED address with its unit segment
+        # stripped (unit is its own key component — the display suffix
+        # above must not enter it); _norm_addr strips the "# Usa"
+        # artifact, so the artifact row groups with its clean twin.
+        gkey = (_norm_addr(street_text), unit)
         beds = d.get("beds")
         beds = float(beds) if beds is not None else None
         hit = None
@@ -3058,6 +3128,12 @@ def _rapidapi_rent_frame(prop, radius_mi=1.0):
 FL_CADASTRAL_URL = ("https://services9.arcgis.com/Gh9awoU677aKree0/ArcGIS/rest/services/"
                     "Florida_Statewide_Cadastral/FeatureServer/0/query")
 CADASTRAL_SRC = "FL Official Records (Cadastral)"
+# v50: a Cadastral sale below this is a NOMINAL transfer (quitclaim /
+# intra-family / corrective deed — the county records them at $100 and
+# the like), not a market comp. Such rows still store at insert, but
+# excluded (see _merge_sold_frame); the threshold guards the Cadastral
+# frame ONLY.
+_CAD_NOMINAL_MAX = 10000
 _CAD_FIELDS = ("PARCEL_ID,PHY_ADDR1,PHY_CITY,PHY_ZIPCD,SALE_PRC1,SALE_YR1,SALE_MO1,"
                "SALE_PRC2,SALE_YR2,SALE_MO2,TOT_LVG_AR,ACT_YR_BLT,EFF_YR_BLT,LND_SQFOOT")
 
