@@ -2024,11 +2024,16 @@ def _drop_note(drops, reason, row):
 # the merge had no notion of a repeated sale — it dedupes on
 # address+price+date, and every unit IS a different address.
 # The rule below is deliberately narrow, so a genuine sale is never
-# collapsed: identical price AND identical sale month AND the same
-# building (same street number + street name, unit designator
-# stripped), repeated >= 3 times in ONE incoming frame. A group of 2,
-# a different price, a different month, or a different street number
-# is not a bulk group. The kept row is the lowest unit number and
+# collapsed: identical price AND identical sale PERIOD (year-month
+# when the record carries one, else the year alone — v57.2: the
+# Cadastral layer emits SALE_YR1 without SALE_MO1, so every live
+# Cadastral row is year-only, and the old month requirement returned
+# None for all of them) AND the same building (same street number +
+# street name, unit designator stripped), repeated >= 3 times in ONE
+# incoming frame. A group of 2, a different price, a different
+# period, or a different street number is not a bulk group. A
+# year-only row never groups with a year-month row (no month is
+# fabricated). The kept row is the lowest unit number and
 # keeps the county's $31M total untouched — a per-unit price is NEVER
 # invented (total / units is forbidden). The kept row is flagged
 # bulk_sale=1 so _stats_usable_sold keeps it out of every average,
@@ -2066,25 +2071,32 @@ def _strip_bare_unit_norm(base):
 
 def _bulk_group_key(vals):
     """The bulk-group key for one candidate sold row, or None when the
-    row cannot be grouped (no price, or no year-month sale date — a
-    year-only date cannot prove the units sold in the same month).
-    The key is (unit-stripped normalized base address, price, sale
-    month): "14595 Seaford Cir Unit 101", "... Unit 204" AND the live
-    bare form "14595 Seaford Cir 204" key together; "14596 Seaford
-    Cir Unit 101" keys apart (a different building number is a
-    different group — the live complex spans 14595-14599 with ~24
-    units per number, so every number-group independently meets the
-    >= 3 rule and collapses to its own kept row). Reads via _cval so
-    it works on stored sqlite3.Rows as well as frame dicts (the
-    read-side path, v57.1)."""
+    row cannot be grouped (no price, or no sale date at all). The key
+    is (unit-stripped normalized base address, price, sale PERIOD):
+    "14595 Seaford Cir Unit 101", "... Unit 204" AND the live bare
+    form "14595 Seaford Cir 204" key together; "14596 Seaford Cir
+    Unit 101" keys apart (a different building number is a different
+    group — the live complex spans 14595-14599 with ~24 units per
+    number, so every number-group independently meets the >= 3 rule
+    and collapses to its own kept row). v57.2: the period is the
+    stored date's year-month when present ("2025-06"), else the year
+    alone ("2025") — the Cadastral layer emits SALE_YR1 without
+    SALE_MO1, so every live Cadastral row is year-only, and the old
+    7-char month requirement returned None for all of them (v57.1
+    never fired live). A year-only row groups ONLY with same-building
+    + same-price + same-year rows; a year-month row ONLY with
+    same-month rows — mixed month/no-month rows do NOT group, because
+    no month is fabricated. Reads via _cval so it works on stored
+    sqlite3.Rows as well as frame dicts (the read-side path, v57.1)."""
     price = _cval(vals, "price")
     if not price: return None
-    month = _s(_cval(vals, "event_date"))[:7]
-    if len(month) < 7: return None
+    raw = _s(_cval(vals, "event_date"))
+    period = raw[:7] if len(raw) >= 7 else (raw[:4] if len(raw) >= 4 else None)
+    if not period: return None
     street, _unit = _addr_unit_split(_cval(vals, "address"))
     base = _strip_bare_unit_norm(_norm_addr(street))
     if not base: return None
-    return (base, price, month)
+    return (base, price, period)
 
 def _bulk_rep_key(vals):
     """Sort key picking the group's representative: the lowest unit
@@ -2115,15 +2127,16 @@ def _bulk_split(cands):
 
 def _bulk_group_keys(rows):
     """The bulk-group keys present >= _BULK_MIN_GROUP times among rows
-    (v57.1, read-side): identical price + sale month + building
-    (street number + street name, unit stripped — including the bare
-    trailing unit the Cadastral layer emits) repeated >= 3 times is
-    the bulk-sale fingerprint. Works on dicts and sqlite3.Rows (via
-    _cval); rows without a price or a year-month date never key, and
-    a group of 2 is within coincidence and does not count. Callers
-    pass the result into _stats_usable_sold so a group split by a
-    date window still counts (a lone member inside a window is
-    still bulk)."""
+    (v57.1, read-side; v57.2: the period is year-month when present,
+    else the year alone — Cadastral rows are year-only): identical
+    price + sale period + building (street number + street name, unit
+    stripped — including the bare trailing unit the Cadastral layer
+    emits) repeated >= 3 times is the bulk-sale fingerprint. Works on
+    dicts and sqlite3.Rows (via _cval); rows without a price or any
+    sale date never key, and a group of 2 is within coincidence and
+    does not count. Callers pass the result into _stats_usable_sold
+    so a group split by a date window still counts (a lone member
+    inside a window is still bulk)."""
     counts = {}
     for c in (rows or []):
         if _cval(c, "kind") not in (None, "sold"):
