@@ -33,7 +33,7 @@
 </div>{% endif %}
 {% endmacro %}
 {% macro compcard(c, mode) %}
-<div class="ccard {{ 'pinned' if c.pinned }}" data-cid="{{ c.id }}" data-price="{{ c.price if c.price is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}" data-beds="{{ c.beds if c.beds is not none else '' }}" data-baths="{{ c.baths if c.baths is not none else '' }}" data-sqft="{{ c.sqft if c.sqft is not none else '' }}" data-lot="{{ c.lot_sqft if ('lot_sqft' in c.keys() and c.lot_sqft is not none) else '' }}" data-year="{{ c.year_built or '' }}" data-dist="{{ c.distance_mi if c.distance_mi is not none else '' }}" data-ysold="{{ (c.event_date or '')[:4] }}" data-kind="{{ c.kind }}" data-ptype="{{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }}" data-zip="{{ c.zip or '' }}">
+<div class="ccard {{ 'pinned' if c.pinned }}" data-cid="{{ c.id }}" data-price="{{ c.price if c.price is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}" data-beds="{{ c.beds if c.beds is not none else '' }}" data-baths="{{ c.baths if c.baths is not none else '' }}" data-sqft="{{ c.sqft if c.sqft is not none else '' }}" data-lot="{{ c.lot_sqft if ('lot_sqft' in c.keys() and c.lot_sqft is not none) else '' }}" data-year="{{ c.year_built or '' }}" data-dist="{{ c.distance_mi if c.distance_mi is not none else '' }}" data-ysold="{{ (c.event_date or '')[:4] }}" data-kind="{{ c.kind }}" data-ptype="{{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }}" data-zip="{{ c.zip or '' }}"{% if stat_excluded_ids is defined and c.id in stat_excluded_ids %} data-stat-excluded="1"{% endif %}>
  {% if c.photo_url %}<img class="cphoto" src="{{ c.photo_url }}" alt="Comp photo" loading="lazy">{% else %}<div class="cphoto" style="height:150px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px">No photo available</div>{% endif %}
  <div class="cb">
  <div class="score">{{ c.match_score|num }}<small>MATCH</small></div>
@@ -507,7 +507,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <thead><tr><th>Address</th><th data-sort="beds">Beds ⇅</th><th data-sort="baths">Baths ⇅</th><th data-sort="sqft">Area ⇅</th><th data-sort="lot">Lot ⇅</th><th data-sort="year">Year ⇅</th><th data-sort="price">Price ⇅</th><th data-sort="distance">Distance ⇅</th><th>Match</th></tr></thead>
 <tbody>
 <tr data-subject="1"><td><b>{{ p.address }}</b> <span class="badge" style="background:#dbeafe;color:#1e40af">SUBJECT</span></td><td>{{ p.beds|num }}</td><td>{{ p.baths|num }}</td><td>{{ p.sqft|num }}</td><td>{{ p.lot_sqft|num }}</td><td>{{ p.year_built or '—' }}</td><td>{{ p.list_price|money }}</td><td>—</td><td>—</td></tr>
-{% for c in sold_view %}<tr data-cid="{{ c.id }}" data-price="{{ c.price or 0 }}" data-beds="{{ c.beds or 0 }}" data-baths="{{ c.baths or 0 }}" data-sqft="{{ c.sqft or 0 }}" data-lot="{{ c.lot_sqft or 0 }}" data-year="{{ c.year_built or 0 }}" data-distance="{{ c.distance_mi if c.distance_mi is not none else 999 }}" data-dist="{{ c.distance_mi if c.distance_mi is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}" data-ysold="{{ (c.event_date or '')[:4] }}" data-kind="{{ c.kind }}" data-ptype="{{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }}" data-zip="{{ c.zip or '' }}"><td>{{ c.address }}, {{ c.city }}{% if c.pinned %} 📌 Pinned #{{ pinned_rank.get(c.id, '') }}{% endif %}</td><td>{{ c.beds|num }}</td><td>{{ c.baths|num }}</td><td>{{ c.sqft|num }}</td><td>{{ (c.lot_sqft|num) if c.lot_sqft else '—' }}</td><td>{{ c.year_built or '—' }}</td><td>{{ c.price|money }}</td><td>{{ c.distance_mi|num(2) }} mi</td><td>{{ c.match_score|num }}</td></tr>{% endfor %}
+{% for c in sold_view %}<tr data-cid="{{ c.id }}" data-price="{{ c.price or 0 }}" data-beds="{{ c.beds or 0 }}" data-baths="{{ c.baths or 0 }}" data-sqft="{{ c.sqft or 0 }}" data-lot="{{ c.lot_sqft or 0 }}" data-year="{{ c.year_built or 0 }}" data-distance="{{ c.distance_mi if c.distance_mi is not none else 999 }}" data-dist="{{ c.distance_mi if c.distance_mi is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}" data-ysold="{{ (c.event_date or '')[:4] }}" data-kind="{{ c.kind }}" data-ptype="{{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }}" data-zip="{{ c.zip or '' }}"{% if stat_excluded_ids is defined and c.id in stat_excluded_ids %} data-stat-excluded="1"{% endif %}><td>{{ c.address }}, {{ c.city }}{% if c.pinned %} 📌 Pinned #{{ pinned_rank.get(c.id, '') }}{% endif %}</td><td>{{ c.beds|num }}</td><td>{{ c.baths|num }}</td><td>{{ c.sqft|num }}</td><td>{{ (c.lot_sqft|num) if c.lot_sqft else '—' }}</td><td>{{ c.year_built or '—' }}</td><td>{{ c.price|money }}</td><td>{{ c.distance_mi|num(2) }} mi</td><td>{{ c.match_score|num }}</td></tr>{% endfor %}
 </tbody></table>
 <button type="button" class="btn sec" data-viewmore>View More</button>
 </div>
@@ -712,10 +712,17 @@ function captureOrigStats(){
 function setSetStat(name, txt){ document.querySelectorAll('[data-setstat="' + name + '"]').forEach(function(e){ e.textContent = txt; }); }
 function refreshSetStats(){
   /* v2.0: the whole-set line follows the same filtered set as the cards
-     (search + comp filters), sold kind only — mirrors the server render. */
+     (search + comp filters), sold kind only — mirrors the server render.
+     v57.4: the AVERAGES run over the stats-usable subset only — cards
+     the server excluded (bulk/outlier rows) carry data-stat-excluded="1"
+     and are skipped here, exactly like the server render. Without this
+     the line re-priced itself at the raw $4,727,190 after every
+     Sold-view interaction. The `n` count still covers the whole
+     filtered set (all cards shown, excluded ones included). */
   if (!document.querySelector('[data-setstat="n"]')) return;
   var vis = filteredSoldCards().filter(function(cd){ return (cd.getAttribute('data-kind') || 'sold') === 'sold'; });
-  function avg(attr){ var xs = vis.map(function(cd){ return parseFloat(cd.getAttribute(attr)); }).filter(function(x){ return !isNaN(x); }); return xs.length ? xs.reduce(function(a, b){ return a + b; }, 0) / xs.length : null; }
+  var avgBasis = vis.filter(function(cd){ return !cd.hasAttribute('data-stat-excluded'); });
+  function avg(attr){ var xs = avgBasis.map(function(cd){ return parseFloat(cd.getAttribute(attr)); }).filter(function(x){ return !isNaN(x); }); return xs.length ? xs.reduce(function(a, b){ return a + b; }, 0) / xs.length : null; }
   var ap = avg('data-price'), af = avg('data-ppsf'), ad = avg('data-dom');
   setSetStat('n', String(vis.length));
   setSetStat('avg', ap === null ? '—' : money(ap));

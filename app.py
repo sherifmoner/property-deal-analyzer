@@ -6477,6 +6477,16 @@ def property_page(pid):
     # average. stats_n / stats_excluded tell the template to say so.
     _set_sold = [c for c in sold_view if c["kind"] == "sold"]
     _set_usable = _stats_usable_sold(_set_sold, _bulk_keys)
+    # v57.4: the id set the whole-set stats exclude — the SINGLE source
+    # of truth for the client-side whole-set line. The template marks
+    # these cards data-stat-excluded="1" and refreshSetStats() skips
+    # them, so the JS average can never re-include a row the server
+    # excluded (bulk/outlier rows were pricing the line at the raw
+    # $4,727,190 after every Sold-view interaction). Computed from the
+    # SAME _stats_usable_sold call that produces set_stats, never
+    # re-derived in the template.
+    _usable_ids = {c["id"] for c in _set_usable}
+    stat_excluded_ids = {c["id"] for c in _set_sold if c["id"] not in _usable_ids}
     _set_prices = [c["price"] for c in _set_usable if c["price"]]
     _set_ppsf = [(c["price"] / c["sqft"]) for c in _set_usable if c["price"] and c["sqft"]]
     _set_doms = [c["dom"] for c in _set_usable if c["dom"] is not None]
@@ -6553,6 +6563,7 @@ def property_page(pid):
                            cview=cview, window=window, rmax=rmax, sold_view=sold_view, rents_view=rents_view,
                            rent_match=rent_match, same_street_ids=same_street_ids,
                            bulk_group_ids=bulk_group_ids,
+                           stat_excluded_ids=stat_excluded_ids,
                            sold_stats=sold_stats, set_stats=set_stats, sold_older_n=sold_older_n,
                            ltr=ltr, coli=coli, med_rent=med_rent, afford_view=afford_view,
                            breakdowns=breakdowns, room_est=room_est,
