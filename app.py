@@ -15,6 +15,27 @@ UPLOAD_DIR = os.path.join(BASE, "uploads"); os.makedirs(UPLOAD_DIR, exist_ok=Tru
 app = Flask(__name__)
 app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 
+# v58.2: the build tag — bumped every lap. It is logged at pull start
+# and sent as an X-App-Build header on every response, so a deploy is
+# verifiable in seconds (curl -sI <live-url> | grep X-App-Build) with no
+# browser and no pull. The 2026-11-06 v58.1 proof pull ran stale v58
+# code with no way to tell (the log lacked the v58.1 first-row-keys
+# line, the pool read 0 in-gate) and the worker died mid-pull; the tag
+# makes the live code visible.
+BUILD_TAG = "v58.2"
+
+
+@app.after_request
+def _build_tag_header(resp):
+    """Every response carries the build tag (see BUILD_TAG). Metadata
+    only — no page, math, or behavior changes."""
+    try:
+        resp.headers["X-App-Build"] = BUILD_TAG
+    except Exception:
+        pass
+    return resp
+
+
 @app.before_request
 def _require_login():
     """Optional password gate. Set PDA_PASSWORD (and optionally PDA_USER, default 'admin') in the
@@ -4540,6 +4561,9 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     d = db(); today = datetime.date.today().isoformat()
     warnings = []
     addr_line = prop["address"]
+    # v58.2: which code ran this pull, in the log — the 2026-11-06 v58.1
+    # proof pull ran stale v58 code and the log gave no way to tell.
+    app.logger.warning(f"comp pull: {addr_line} [build {BUILD_TAG}]")
     _pull_started = time.time()  # v58: the pull-wide HomeHarvest budget clock
     def _scrape(**kw):
         # v58: HomeHarvest never answers from PA (proxy block) and its
@@ -7366,9 +7390,15 @@ def _lookup_in_frame(address, z, kind_choice):
     kw = {"location": z, "listing_type": lt}
     if lt == "sold": kw["past_days"] = 365
     try:
-        df = scrape_property(**kw)
+        # v58.2: HomeHarvest calls have no timeout of their own — the
+        # pull caps every call at 20s in a thread, and this Add-Comp
+        # lookup was the one uncapped call left in a user-facing path
+        # (a blackholed call hung the request forever). A capped-out
+        # call reads as "not found", exactly like any other failure.
+        df = _run_capped(lambda: scrape_property(**kw), _PULL_HH_CAP_S)
     except Exception:
         return None
+    if df is None: return None
     if df is None or len(df) == 0: return None
     target = _norm_addr(address)
     ttoks = target.split(" ")
