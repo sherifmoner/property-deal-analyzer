@@ -22,7 +22,7 @@ app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 # code with no way to tell (the log lacked the v58.1 first-row-keys
 # line, the pool read 0 in-gate) and the worker died mid-pull; the tag
 # makes the live code visible.
-BUILD_TAG = "v58.2"
+BUILD_TAG = "v59"
 
 
 @app.after_request
@@ -403,18 +403,28 @@ def adjusted_price(comp):
 def arv_reconciliation(prop, comps, bulk_keys=None):
     """ONE reconciled ARV with the math shown: average of (adjusted avg comp price) and (avg $/sqft x subject sqft).
     v57: the pool is stats-usable sold rows only — a bulk-flagged row or
-    a $/sqft outlier can never enter the ARV, even when pinned."""
+    a $/sqft outlier can never enter the ARV, even when pinned.
+    v59 D2: when the subject has no sqft on file, ARV is the average
+    sale price of the pool directly (ReiSearch's own ARV is the average
+    of the top-3 sale prices — no sqft needed); the $/sqft leg is
+    skipped, not zeroed, and the note says so."""
     usable = _stats_usable_sold(comps, bulk_keys)
     pool = [c for c in usable if c["pinned"]] or sorted(usable, key=lambda c: -(c["match_score"] or 0))[:6]
-    if not pool or not prop["sqft"]:
+    if not pool:
         return {"arv": None, "pool": pool, "note": "Not found — pull comps first."}
     adj_prices = [adjusted_price(c) for c in pool]
     avg_price = sum(adj_prices) / len(adj_prices)
+    basis = f"your {len(pool)} pinned comp(s)" if any(c["pinned"] for c in pool) else f"top {len(pool)} comps by match score (pin comps to choose your own)"
+    if not prop["sqft"]:
+        return {"arv": round(avg_price), "pool": pool, "avg_price": round(avg_price),
+                "avg_ppsf": None, "ppsf_value": None, "count": len(pool),
+                "note": f"ARV = average of top {len(pool)} sale price(s) (${round(avg_price):,}) "
+                        f"— subject sqft missing, so no $/sqft value. Over {basis}. "
+                        f"Source: HomeHarvest sold data, pulled {datetime.date.today().isoformat()}."}
     ppsfs = [(adjusted_price(c) / c["sqft"]) for c in pool if c["sqft"]]
     avg_ppsf = sum(ppsfs) / len(ppsfs) if ppsfs else 0
     ppsf_value = avg_ppsf * prop["sqft"]
     arv = round((avg_price + ppsf_value) / 2) if ppsf_value else round(avg_price)
-    basis = f"your {len(pool)} pinned comp(s)" if any(c["pinned"] for c in pool) else f"top {len(pool)} comps by match score (pin comps to choose your own)"
     return {"arv": arv, "pool": pool, "avg_price": round(avg_price), "avg_ppsf": round(avg_ppsf, 2),
             "ppsf_value": round(ppsf_value), "count": len(pool),
             "note": f"ARV = average of adjusted comp average (${round(avg_price):,}) and $/sqft method "
@@ -533,13 +543,17 @@ def _stats_usable_sold(rows, bulk_keys=None):
     row, while genuine high-price sales ($1-3M = 2.5-7.6x the median)
     stay. bulk_keys may be supplied (the view computes it once over
     the full stored pool so a group split by a date window still
-    counts); otherwise it is detected within rows. Callers that ALSO
-    need the nominal filter (Market Data) apply it themselves, as
-    before — this helper never invents a price rule."""
+    counts); otherwise it is detected within rows. v59: nominal county
+    sales below _CAD_NOMINAL_MAX ($10,000 — the v50 insert guard's
+    threshold, now applied read-side so pre-fix pools are fixed
+    without any DB write) never enter any average/ARV: a $100
+    deed-transfer row can no longer poison a top-3. Market Data's own
+    $1,000 pre-filter stays as a redundant no-op."""
     if bulk_keys is None:
         bulk_keys = _bulk_group_keys(rows)
     base = [c for c in (rows or [])
             if _cval(c, "kind") == "sold" and _cval(c, "price")
+            and _cval(c, "price") >= _CAD_NOMINAL_MAX
             and not _cval(c, "excluded") and not _cval(c, "bulk_sale")
             and _bulk_group_key(c) not in bulk_keys]
     ppsfs = sorted(p for p in (_ppsf_of(c) for c in base) if p is not None)
@@ -1125,8 +1139,8 @@ def score_factors(m):
          "value": "No data" if coc_val is None else _fmt_pct1(coc_val * 100),
          "score": None if coc_val is None else _pw_curve(coc_val * 100, _SCORE_CURVES["coc"])},
         {"key": "be", "name": "Break-even occupancy", "weight": 12,
-         "value": _fmt_pct1(m.get("breakeven", 0) * 100),
-         "score": _pw_curve(m.get("breakeven", 0) * 100, _SCORE_CURVES["be"])},
+         "value": "No data" if m.get("breakeven") is None else _fmt_pct1(m["breakeven"] * 100),
+         "score": None if m.get("breakeven") is None else _pw_curve(m["breakeven"] * 100, _SCORE_CURVES["be"])},
         {"key": "ds", "name": "Downside cash flow per room", "weight": 8,
          "value": _fmt_money0(m.get("downside_cf_per_room", 0)),
          "score": _pw_curve(m.get("downside_cf_per_room", 0), _SCORE_CURVES["ds"])},
@@ -1327,7 +1341,11 @@ def compute_underwriting(strategy, raw_inp, prop):
     # (gap-inclusive) IS the flip's Cash Needed (test_fixtures_v15.py:
     # FF Cash Needed $61,684; parity-plan-v16-v17 Senisa fixture list).
     cash_needed = cash_in if strategy == "Fix & Flip" else points_fees + entry_fee
-    if funded <= 0:
+    # v59 D7: with no project to fund (uses <= 0 — blank purchase price,
+    # no rehab, no holding), a funding card cannot make the project
+    # "Over Funded"; it is Not Funded Yet. (A $0 project has no funding
+    # requirement to exceed.)
+    if funded <= 0 or uses <= 0:
         funding_status = "Not Funded Yet"
     elif gap < -0.05 * max(uses, 1):
         funding_status = "Over Funded"
@@ -1348,7 +1366,7 @@ def compute_underwriting(strategy, raw_inp, prop):
     if uses_override:
         snap_uses = uses_override
         snap_gap = snap_uses - funded
-        if funded <= 0: snap_status = "Not Funded Yet"
+        if funded <= 0 or snap_uses <= 0: snap_status = "Not Funded Yet"
         elif snap_gap < -0.05 * max(snap_uses, 1): snap_status = "Over Funded"
         elif snap_gap <= 0: snap_status = "Fully Funded"
         else: snap_status = "Partially Funded"
@@ -1543,7 +1561,7 @@ def compute_underwriting(strategy, raw_inp, prop):
                "dscr": (noi / debt_service) if debt_service else (1.5 if noi > 0 else 0),
                "coc": (cf * 12 / cash_needed) if cash_needed else 0,
                "cap_rate": (noi * 12 / value) if value else 0,
-               "breakeven": ((opex + debt_service) / (gross + other)) if (gross + other) else 1.3,
+               "breakeven": ((opex + debt_service) / (gross + other)) if (gross + other) else None,
                "downside_cf": (egi * 0.9 - opex - debt_service)}
     # v2.9 score-factor inputs (mirrors uw.js): Cash-on-cash is scored on
     # ReiSearch's Cash Needed (v2.9 definition: points/fees + entry fee
@@ -1610,7 +1628,7 @@ def compute_underwriting(strategy, raw_inp, prop):
                 "dscr": round(metrics["dscr"], 2) if debt_service else None,   # v2.1: N/A when there is no debt
                 "coc_pct": round(metrics["coc"] * 100, 1) if cash_needed else None,
                 "cap_rate_pct": round(metrics["cap_rate"] * 100, 2),
-                "breakeven_pct": round(metrics["breakeven"] * 100, 1),
+                "breakeven_pct": round(metrics["breakeven"] * 100, 1) if metrics["breakeven"] is not None else None,
                 "payback_yrs": round(1 / metrics["coc"], 1) if metrics["coc"] > 0 else None,
                 "scenarios": scen, "rooms": rooms_n,
                 "refi_proceeds": refi_gross, "remaining_in_deal": round(max(0, cash_in - refi_net)),
@@ -1671,7 +1689,14 @@ def uw_state(strategy, prop, saved_inp, ctx):
     beds = int(prop["beds"] or 4)
     st = {"strategy": strategy}
     st["purchase_price"] = g("purchase_price", prop["purchase_price"] or prop["list_price"] or "")
-    st["arv"] = g("arv", prop["arv"] or ctx.get("rec_arv") or "")
+    # v59 D5: ONE ARV — precedence is manual prop.arv > live reconciled ARV >
+    # saved panel input. The old line routed through g() with the live rec as
+    # the DEFAULT, so a stale saved input (e.g. Garland's frozen 406032) won
+    # over the live rec (382403) — the saved value is only the fallback when
+    # no live rec exists (no comps). A panel-typed ARV no longer sticks
+    # across reloads while comps exist; the manual channel is the property
+    # edit form's ARV field (prop.arv).
+    st["arv"] = prop["arv"] or ctx.get("rec_arv") or g("arv", "")
     st["closing_costs"] = g("closing_costs", 3000)
     # post-reno details
     st["postreno_beds"] = g("postreno_beds", prop["beds"] or "")

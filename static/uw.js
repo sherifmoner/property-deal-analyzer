@@ -180,8 +180,8 @@
       { key: "coc", name: "Cash-on-cash", weight: 20,
         value: m.coc_val === null ? "No data" : fmtPct1(m.coc_val * 100),
         score: m.coc_val === null ? null : pwCurve(m.coc_val * 100, SCORE_CURVES.coc) },
-      { key: "be", name: "Break-even occupancy", weight: 12, value: fmtPct1(m.breakeven * 100),
-        score: pwCurve(m.breakeven * 100, SCORE_CURVES.be) },
+      { key: "be", name: "Break-even occupancy", weight: 12, value: m.breakeven === null ? "No data" : fmtPct1(m.breakeven * 100),
+        score: m.breakeven === null ? null : pwCurve(m.breakeven * 100, SCORE_CURVES.be) }, /* v59 D3: unscored when no gross */
       { key: "ds", name: "Downside cash flow per room", weight: 8, value: fmtMoney0(m.downside_cf_per_room),
         score: pwCurve(m.downside_cf_per_room, SCORE_CURVES.ds) },
       { key: "cap", name: "Cap rate", weight: 15, value: fmtPct1(m.cap_rate * 100),
@@ -352,7 +352,7 @@
        (gap-inclusive) IS the flip's Cash Needed (fixtures v15: $61,684).
        Mirrors app.py. */
     var cashNeeded = strat === "Fix & Flip" ? cashIn : pointsFees + entryFee;
-    var fundingStatus = funded <= 0 ? "Not Funded Yet" : (gap < -0.05 * Math.max(uses, 1) ? "Over Funded" : (gap <= 0 ? "Fully Funded" : "Partially Funded"));
+    var fundingStatus = (funded <= 0 || uses <= 0) ? "Not Funded Yet" : (gap < -0.05 * Math.max(uses, 1) ? "Over Funded" : (gap <= 0 ? "Fully Funded" : "Partially Funded")); /* v59 D7: uses <= 0 (blank price) can never be Over Funded */
     /* v2.8 (A10, evening pass 2026-11-03): Override Total Uses — while set,
        the Funding Snapshot's Total Uses / Gap / status read the OVERRIDE;
        Cash Needed, debt service and everything else keep the REAL uses
@@ -361,7 +361,7 @@
     var snapUses = uses, snapGap = gap, snapStatus = fundingStatus;
     if (usesOverride) {
       snapUses = usesOverride; snapGap = snapUses - funded;
-      snapStatus = funded <= 0 ? "Not Funded Yet" : (snapGap < -0.05 * Math.max(snapUses, 1) ? "Over Funded" : (snapGap <= 0 ? "Fully Funded" : "Partially Funded"));
+      snapStatus = (funded <= 0 || snapUses <= 0) ? "Not Funded Yet" : (snapGap < -0.05 * Math.max(snapUses, 1) ? "Over Funded" : (snapGap <= 0 ? "Fully Funded" : "Partially Funded")); /* v59 D7 */
     }
     var out = { strategy: strat, arv: arv, purchase_price: price, rehab: rehab, rehab_calc: rehabCalc,
       rehab_mode: rehabMode, appliances: appliances, furnishing: furnishing, conversion: conversion,
@@ -509,7 +509,7 @@
       dscr: debtService ? noi / debtService : (noi > 0 ? 1.5 : 0),
       coc: cashNeeded ? cf * 12 / cashNeeded : 0,
       cap_rate: value ? noi * 12 / value : 0,
-      breakeven: (gross + other) ? (opex + debtService) / (gross + other) : 1.3,
+      breakeven: (gross + other) ? (opex + debtService) / (gross + other) : null, /* v59 D3: no gross -> no breakeven (was a fake 1.3 = 130%) */
       downside_cf: egi * 0.9 - opex - debtService };
     /* v2.9 score-factor inputs (mirrors app.py): Cash-on-cash is scored
        on ReiSearch's Cash Needed (v2.9: points/fees + entry fee only)
@@ -563,7 +563,7 @@
     out.cash_per_room = roomsN ? cashNeeded / roomsN : null;
     out.dscr = debtService ? Math.round(metrics.dscr * 100) / 100 : null; /* v2.1: N/A with no debt */
     out.coc_pct = cashNeeded ? metrics.coc * 100 : null; out.cap_rate_pct = metrics.cap_rate * 100;
-    out.breakeven_pct = metrics.breakeven * 100;
+    out.breakeven_pct = metrics.breakeven === null ? null : metrics.breakeven * 100; /* v59 D3: null, not 0 (null*100 would read 0%) */
     out.payback_yrs = metrics.coc > 0 ? Math.round(10 / metrics.coc) / 10 : null;
     out.scenarios = scen2; out.rooms = roomsN;
     out.refi_proceeds = refiGross; out.remaining_in_deal = Math.max(0, cashIn - refiNet);
@@ -1024,6 +1024,9 @@
            share of the room count, rounded. */
         if (r.breakeven_pct === null || r.breakeven_pct === undefined) return "";
         var be = Math.round(r.breakeven_pct);
+        /* v59 D3: above 100% the percent is shown but no rooms-filled claim
+           is made — "~5 of 4 rooms filled" is impossible. */
+        if (be > 100) return "Breakeven at " + be + "% occupancy.";
         var roomsN2 = (s.rooms_rows || []).length;
         if (strat === "Co-Living" && roomsN2)
           return "Breakeven at " + be + "% occupancy (~" + Math.round(r.breakeven_pct / 100 * roomsN2) + " of " + roomsN2 + " rooms filled).";
