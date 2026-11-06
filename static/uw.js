@@ -922,6 +922,18 @@
     }
     return out;
   }
+  /* v60: keep the manual-ARV flag in sync with the ARV field — typing a
+     value different from the auto (rec) one takes manual control; clearing
+     the field (or typing the auto value back) hands control to the rec.
+     Mirrors the v3.3 cat_manual pattern. Called from the panel input
+     listener and from uwUseCompArv. */
+  function syncArvManual(panel) {
+    var av = panel.querySelector('[name="arv"]');
+    var fl = panel.querySelector('[name="arv_manual"]');
+    if (!av || !fl) return;
+    var auto = av.getAttribute("data-auto-arv") || "";
+    fl.value = (av.value !== "" && N(av.value) !== N(auto)) ? "1" : "0";
+  }
   function readState(panel) {
     var s = {};
     panel.querySelectorAll("input[name], select[name]").forEach(function (e) {
@@ -1730,6 +1742,9 @@
     var panel = btn.closest(".uw-panel");
     var sp = panel.querySelector('[name="sale_price"]'); if (sp) sp.value = avg;
     var av = panel.querySelector('[name="arv"]'); if (av) av.value = avg;
+    /* v60: picking the comp average is a deliberate choice of a specific
+       number, so the manual flag follows the same rule as typing. */
+    syncArvManual(panel);
     recalc(panel);
     return false;
   };
@@ -1969,6 +1984,7 @@
               manEl.value = keys.join(",");
             }
           }
+          if (t.name === "arv") syncArvManual(panel);
           if (t.classList.contains("r-rentwk")) {
             var row = t.closest(".rrow"), mo = row && row.querySelector(".r-rentmo");
             if (mo) mo.value = Math.round(N(t.value) * 52 / 12 * 100) / 100;

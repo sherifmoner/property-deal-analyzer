@@ -22,7 +22,7 @@ app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 # code with no way to tell (the log lacked the v58.1 first-row-keys
 # line, the pool read 0 in-gate) and the worker died mid-pull; the tag
 # makes the live code visible.
-BUILD_TAG = "v59"
+BUILD_TAG = "v60"
 
 
 @app.after_request
@@ -1679,6 +1679,31 @@ def _unit_rows(lines, presets, qty_default=0):
         elif lab: extra.append({"label": lab, "qty": qty, "unit": unit})
     return [found.get(p, {"label": p, "qty": qty_default, "unit": 0}) for p in presets] + extra
 
+def _resolve_arv(prop, saved_inp, rec_arv):
+    """v60 — ONE ARV precedence (manual-ARV flag).
+    1. prop.arv (property edit form "ARV $", blank = auto) — top, unchanged.
+    2. Saved panel ARV when arv_manual is set — authoritative as typed,
+       INCLUDING blank/0 (a deliberately blank ARV means the cap falls back
+       to price, exactly as the old ARRIVAL fixtures encode).
+    3. Live reconciled ARV from comps.
+    4. Saved panel ARV without the flag (fallback when no comps/rec).
+    Returns (arv_value_or_None, source_label)."""
+    if prop is not None:
+        try:
+            _pa = prop["arv"]
+        except Exception:
+            _pa = None
+        if _pa:
+            return _pa, "prop"
+    inp = saved_inp or {}
+    saved = fnum(inp.get("arv"))
+    if inp.get("arv_manual") in (1, True, "1", "true", 1.0):
+        return (saved or None), "manual"
+    if rec_arv:
+        return rec_arv, "rec"
+    return (saved or None), "saved"
+
+
 def uw_state(strategy, prop, saved_inp, ctx):
     """Canonical form state (scalars + row sets) for one strategy panel.
     saved_inp=None -> fresh defaults with comp prefills (v1.2 behavior)."""
@@ -1689,14 +1714,16 @@ def uw_state(strategy, prop, saved_inp, ctx):
     beds = int(prop["beds"] or 4)
     st = {"strategy": strategy}
     st["purchase_price"] = g("purchase_price", prop["purchase_price"] or prop["list_price"] or "")
-    # v59 D5: ONE ARV — precedence is manual prop.arv > live reconciled ARV >
-    # saved panel input. The old line routed through g() with the live rec as
-    # the DEFAULT, so a stale saved input (e.g. Garland's frozen 406032) won
-    # over the live rec (382403) — the saved value is only the fallback when
-    # no live rec exists (no comps). A panel-typed ARV no longer sticks
-    # across reloads while comps exist; the manual channel is the property
-    # edit form's ARV field (prop.arv).
-    st["arv"] = prop["arv"] or ctx.get("rec_arv") or g("arv", "")
+    # v60: ONE ARV via _resolve_arv — prop.arv > manual saved arv > live rec >
+    # saved input. The manual flag (arv_manual) is set by the panel's ARV input
+    # when the user types a value different from the auto (rec) one; clearing
+    # the field clears the flag and the panel follows the rec again.
+    # st["arv_manual"] / st["arv_auto"] feed the template (hidden flag input
+    # + data-auto-arv) so the JS can keep the flag in sync.
+    _arv, _arv_src = _resolve_arv(prop, inp, ctx.get("rec_arv"))
+    st["arv"] = _arv if _arv else ""
+    st["arv_manual"] = 1 if _arv_src == "manual" else 0
+    st["arv_auto"] = ctx.get("rec_arv") or ""
     st["closing_costs"] = g("closing_costs", 3000)
     # post-reno details
     st["postreno_beds"] = g("postreno_beds", prop["beds"] or "")
@@ -6912,23 +6939,32 @@ def property_page(pid):
                            ON c.id=a.contractor_id WHERE a.property_id=?""", (pid,)).fetchall()
     contractors = d.execute("SELECT * FROM contractors ORDER BY trade, name").fetchall()
     scenarios = d.execute("SELECT * FROM scenarios WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
+    plans = d.execute("SELECT * FROM floorplans WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
+    v = verdict(p, comps, all_boxes(), _bulk_keys)
     # v1.8a score reconciliation: displayed scenario scores are recomputed with
     # the CURRENT engine from the stored inputs, so the scenarios table can
     # never drift from the live rail. The stored `results` are a snapshot of
     # whatever code version saved them (shipped scenarios 1/2 predate the
     # penalty rework and showed 80/63 for identical inputs).
+    # v60: the ARV is resolved with the SAME rule as the panel (_resolve_arv),
+    # so a scenario saved without the manual flag follows the live rec (the
+    # v59 85-vs-84: the panel scored at the rec 382403 while the scenarios
+    # recomputed at their frozen 406032). A scenario saved WITH the flag
+    # keeps its number. Moved below verdict() so v["rec"]["arv"] is available.
     _disp = []
     for _s in scenarios:
         _s = dict(_s)
         try:
+            _sin = json.loads(_s["inputs"] or "{}")
+            _sarv, _ = _resolve_arv(p, _sin, v["rec"]["arv"])
+            _sin = dict(_sin)
+            _sin["arv"] = _sarv if _sarv else ""
             _s["results"] = json.dumps(compute_underwriting(
-                _s["strategy"], json.loads(_s["inputs"] or "{}"), p))
+                _s["strategy"], _sin, p))
         except Exception:
             pass
         _disp.append(_s)
     scenarios = _disp
-    plans = d.execute("SELECT * FROM floorplans WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
-    v = verdict(p, comps, all_boxes(), _bulk_keys)
     sold = [c for c in comps if c["kind"] == "sold" and not c["excluded"]]
     # v48: rents respect `excluded` exactly like sold (the audit's
     # adjacent integrity gap — an excluded rental used to keep

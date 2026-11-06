@@ -219,7 +219,9 @@
 <p class="small muted" style="margin-top:0">Build the capital stack for the purchase, renovation, closing costs, and reserves. Pick a preset to <b>add</b> a funding card — presets stack, and every card is removable. Each card's loan-type dropdown re-applies that type's standard terms. <b>Subject-To</b> adds an existing-loan card (fill in its balance/payment); on rentals, the Existing Mortgage Data below separately adds an entry fee + existing PITI payment when you model the deal that way.</p>
 <div class="rowflex">
 <div><label>Purchase price $</label><input type="number" step="any" name="purchase_price" value="{{ st.purchase_price }}"></div>
-<div><label>ARV $</label><input type="number" step="any" name="arv" value="{{ st.arv }}"></div>
+<div><label>ARV $</label><input type="number" step="any" name="arv" value="{{ st.arv }}" data-auto-arv="{{ st.arv_auto or '' }}">
+<input type="hidden" name="arv_manual" data-stateval value="{{ 1 if st.arv_manual else 0 }}">
+<p class="small muted" style="margin-top:2px">{% if st.arv_manual %}Manual ARV — locked. Clear the field to return to the auto value from comps.{% else %}Auto from comps — type over it to lock your own ARV.{% endif %}</p></div>
 <div><label>Closing costs $ (est. financing costs)</label><input type="number" step="any" name="closing_costs" value="{{ st.closing_costs }}"></div>
 </div>
 <div class="fundgrid"><div class="fundmain">
