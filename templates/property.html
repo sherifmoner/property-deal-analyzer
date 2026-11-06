@@ -148,15 +148,15 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 
 {% if not (steps.comps and steps.scenarios) %}
 <div class="steps">
- <div class="step {{ 'done' if steps.comps else 'next' }}"><b>Step 1 — Pull comps</b><br>{% if steps.comps %}✓ {{ sold|length }} sold + {{ rents|length }} rental comps on file{% else %}Get sold + rental comps and listing photos for this property.{% endif %}<br><a href="{{ url_for('property_page', pid=p.id, tab='comps') }}">Go to Comparables →</a></div>
- <div class="step {{ 'done' if steps.comps }}"><b>Step 2 — Review the ARV</b><br>{% if steps.comps %}✓ Reconciled ARV {{ v.arv|money }} (pin comps to adjust it){% else %}Pin the best comps — the ARV in Comparables is built from them.{% endif %}<br><a href="{{ url_for('property_page', pid=p.id, tab='comps') }}">Review comps →</a></div>
- <div class="step {{ 'done' if steps.scenarios else ('next' if steps.comps else '') }}"><b>Step 3 — Run underwriting</b><br>{% if steps.scenarios %}✓ {{ scenarios|length }} scenario(s) saved{% else %}Score the deal: Co-Living, Long Term, Flip and more.{% endif %}<br><a href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">Go to Underwriting →</a></div>
+ <div class="step {{ 'done' if steps.comps else 'next' }}"><b>Step 1 — Pull comps</b><br>{% if steps.comps %}✓ {{ sold|length }} sold + {{ rents|length }} rental comps on file{% else %}Get sold + rental comps and listing photos for this property.{% endif %}<br><a href="{{ url_for('property_page', pid=p.id, tab='comps', window=window, rmax=rmax) }}">Go to Comparables →</a></div>
+ <div class="step {{ 'done' if steps.comps }}"><b>Step 2 — Review the ARV</b><br>{% if steps.comps %}✓ Reconciled ARV {{ v.arv|money }} (pin comps to adjust it){% else %}Pin the best comps — the ARV in Comparables is built from them.{% endif %}<br><a href="{{ url_for('property_page', pid=p.id, tab='comps', window=window, rmax=rmax) }}">Review comps →</a></div>
+ <div class="step {{ 'done' if steps.scenarios else ('next' if steps.comps else '') }}"><b>Step 3 — Run underwriting</b><br>{% if steps.scenarios %}✓ {{ scenarios|length }} scenario(s) saved{% else %}Score the deal: Co-Living, Long Term, Flip and more.{% endif %}<br><a href="{{ url_for('property_page', pid=p.id, tab='underwriting', window=window, rmax=rmax) }}">Go to Underwriting →</a></div>
 </div>
 {% endif %}
 
 <div class="tabs">
 {% for t,lab in [('overview','Overview'),('comps','Comparables'),('demographics','Demographics'),('underwriting','Underwriting'),('floorplans','Floor Plans'),('contractors','Contractors'),('market','Market Data'),('taxes','Taxes'),('documents','Documents')] %}
-<a href="{{ url_for('property_page', pid=p.id, tab=t) }}" class="{% if tab==t %}on{% endif %}">{{ lab }}</a>{% endfor %}
+<a href="{{ url_for('property_page', pid=p.id, tab=t, window=window, rmax=rmax) }}" class="{% if tab==t %}on{% endif %}">{{ lab }}</a>{% endfor %}
 </div>
 
 {% if tab=='overview' %}
@@ -242,7 +242,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <div><label>ARV $ (blank = auto from comps)</label><input name="arv" value="{{ p.arv if p.arv is not none else '' }}"></div></div>
 <div class="rowflex">
 <div><label>Repair estimate $</label><input name="repairs" value="{{ p.repairs if p.repairs is not none else '' }}"></div></div>
-<div class="maorow" data-mao-row><span>Max Offer (MAO)</span><b>{{ v.mao|money }}</b><a href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">Open underwriting →</a></div>
+<div class="maorow" data-mao-row><span>Max Offer (MAO)</span><b>{{ v.mao|money }}</b><a href="{{ url_for('property_page', pid=p.id, tab='underwriting', window=window, rmax=rmax) }}">Open underwriting →</a></div>
 <p class="small muted" style="margin-top:2px">MAO = 70% of ARV − repairs. Read-only here — the formula lives in Underwriting.</p>
 </div>
 <div data-ds-block="purchase"><h3 data-ds-section="purchase">Purchase Contract</h3>
@@ -531,7 +531,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 
 <div class="viewpane {{ 'on' if cview=='str' }}" data-pane="str">
 <div class="card"><h2>Short Term Rental comps</h2>
-<p class="muted">No free data source for short-term (Airbnb-style) comps exists yet — and we won't fake it. Enter your nightly rate, occupancy and cleaning fee manually in <a href="{{ url_for('property_page', pid=p.id, tab='underwriting') }}">Underwriting → Short Term</a> — the math there is fully wired.</p></div>
+<p class="muted">No free data source for short-term (Airbnb-style) comps exists yet — and we won't fake it. Enter your nightly rate, occupancy and cleaning fee manually in <a href="{{ url_for('property_page', pid=p.id, tab='underwriting', window=window, rmax=rmax) }}">Underwriting → Short Term</a> — the math there is fully wired.</p></div>
 </div>
 
 {% macro ltrstatbar() %}
@@ -917,8 +917,8 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% if demo_scope_fallback %}<div class="notice"><b>City scope not available for {{ p.city }}.</b> No Census place data could be resolved for this city, so this tab is showing <b>ZIP {{ p.zip }}</b> figures — labeled as ZIP scope, never passed off as city data.</div>{% endif %}
 {% if dgeo %}<p class="small muted">Scope shown: <b>{{ dgeo.scope_label or (('ZIP ' ~ p.zip) if dscope=='zip' else (p.city ~ ' (city)')) }}</b>{% if dgeo.geoid %} · Census geography <b>{{ dgeo.geoid }}</b>{% endif %} · {{ demo.source }}</p>{% endif %}
 <div class="scopetabs">
-{% if demo.city %}<a class="btn sm {{ 'blue' if dscope=='city' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='city') }}">{{ p.city }} (city)</a>{% endif %}
-<a class="btn sm {{ 'blue' if dscope=='zip' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='zip') }}">ZIP {{ p.zip }}</a>
+{% if demo.city %}<a class="btn sm {{ 'blue' if dscope=='city' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='city', window=window, rmax=rmax) }}">{{ p.city }} (city)</a>{% endif %}
+<a class="btn sm {{ 'blue' if dscope=='zip' else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='demographics', dscope='zip', window=window, rmax=rmax) }}">ZIP {{ p.zip }}</a>
 {% if dgeo %}<span class="small muted" style="margin-left:8px">{{ dgeo.name }}</span>{% endif %}
 </div>
 {% if dgeo %}
@@ -1095,7 +1095,7 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 <p class="small muted" style="margin-top:2px">Comprehensive market analysis for ZIP code {{ p.zip }}, {{ p.city }}, {{ p.state }} — computed from your stored HomeHarvest sold comps (free data)</p>
 {% if market %}
 <div class="mkt-filters"><span class="small muted">Property type:</span>
-{% for mt in ['All','Single Family','Condo','Townhouse'] %}<a class="btn sm {{ 'blue' if market.mtype==mt else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='market', mtype=mt, mrange=market.mrange) }}">{{ 'All Types' if mt=='All' else mt }}{% if mt=='All' %} ({{ market.type_counts.values()|sum }}){% elif market.type_counts.get(mt) %} ({{ market.type_counts.get(mt) }}){% endif %}</a>{% endfor %}
+{% for mt in ['All','Single Family','Condo','Townhouse'] %}<a class="btn sm {{ 'blue' if market.mtype==mt else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='market', mtype=mt, mrange=market.mrange, window=window, rmax=rmax) }}">{{ 'All Types' if mt=='All' else mt }}{% if mt=='All' %} ({{ market.type_counts.values()|sum }}){% elif market.type_counts.get(mt) %} ({{ market.type_counts.get(mt) }}){% endif %}</a>{% endfor %}
 </div>
 {% if market.untyped %}<p class="small muted" style="margin:4px 0 10px">Note: {{ market.untyped }} stored comp(s) were pulled before property types were recorded and are counted as Single Family — re-pull comps (Comparables tab) to record their real types and sharpen this filter.</p>{% endif %}
 <p class="small muted">Last updated: {{ market.date }} · Source: {{ market.source }} — computed from the comps stored on this property.</p>
@@ -1114,7 +1114,7 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 <div data-mcard="off_market"><span>Off-Market &lt;2 Wks</span><b class="nf">Not found</b></div>
 </div>
 <p class="small muted">Cards marked "Not found" need data the free sources don't store for this property — original listing prices, pending/active listing status, or time-to-pending. Nothing is estimated to fill them.</p>
-<h3>Price Trend <span class="small muted" style="margin-left:10px">Range:</span> {% for mr in ['1Y','3Y','5Y'] %}<a class="btn sm {{ 'blue' if market.mrange==mr else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='market', mtype=market.mtype, mrange=mr) }}">{{ mr }}</a>{% endfor %}</h3>
+<h3>Price Trend <span class="small muted" style="margin-left:10px">Range:</span> {% for mr in ['1Y','3Y','5Y'] %}<a class="btn sm {{ 'blue' if market.mrange==mr else 'sec' }}" href="{{ url_for('property_page', pid=p.id, tab='market', mtype=market.mtype, mrange=mr, window=window, rmax=rmax) }}">{{ mr }}</a>{% endfor %}</h3>
 {% if market.spark %}<svg viewBox="0 0 300 40" preserveAspectRatio="none" class="trendchart" style="width:100%;height:90px"><polyline points="{{ market.spark }}" fill="none" stroke="#ea580c" stroke-width="2"/></svg>
 <p class="small muted">Median Sale Price by month · {{ market.trend[0].month }} → {{ market.trend[-1].month }} · low {{ market.trend_min|money }} · high {{ market.trend_max|money }} (range buttons change the chart + table only; the cards above always use the full filtered set)</p>{% endif %}
 <p class="small muted">Median Listing Price series: Not found — no listing prices are stored in the free data, so only the sale-price series is charted.</p>
