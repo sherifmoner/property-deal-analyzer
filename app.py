@@ -34,6 +34,10 @@ def db():
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys=ON")
         g.db.execute("PRAGMA journal_mode=WAL")
+        # v58: a one-time disk I/O error killed a live pull (2026-11-06,
+        # job 48) — a plain SELECT dying on a transient lock. Give
+        # every connection a 30s busy window instead of failing fast.
+        g.db.execute("PRAGMA busy_timeout=30000")
     return g.db
 
 @app.teardown_appcontext
@@ -627,7 +631,10 @@ def _padsplit_parse(html_text):
     if not html_text: return out
     m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
                   html_text, re.S)
-    if not m: return out
+    if not m:
+        # v58: no SSR payload — the text is reader markdown (the
+        # reader-first fetch). Parse the listing lines instead.
+        return _padsplit_parse_markdown(html_text)
     try:
         data = json.loads(m.group(1))
     except Exception:
@@ -655,20 +662,56 @@ def _padsplit_parse(html_text):
         return out
     return out
 
+def _padsplit_parse_markdown(md_text):
+    """PadSplit search markdown (the jina-reader form) -> the same
+    {"cards": [...], "count": n, "total_pages": 1} shape as
+    _padsplit_parse. One card per 'Room for rent — $N per week — ...'
+    line; the title/count lines ('415 Rooms for Rent ... from $156
+    per week') are NOT listing lines and are never counted — the
+    'Room for rent' (singular) prefix is the discriminator.
+    Availability is unknowable from the reader markdown, so every card
+    counts as available (the benchmark median uses all rents either
+    way). Identical (rent, label) pairs dedupe within the page."""
+    out = {"cards": [], "count": 0, "total_pages": 1}
+    if not md_text: return out
+    seen = set()
+    for line in md_text.splitlines():
+        s = line.strip()
+        if not s.lower().startswith("room for rent"): continue
+        m = re.search(r"\$([\d,]+)\s+per week", s)
+        if not m: continue
+        try:
+            rent = float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if rent <= 0: continue
+        label = s[m.end():].strip(" —-").strip()
+        key = (rent, label)
+        if key in seen: continue
+        seen.add(key)
+        out["cards"].append({"rent": rent, "available": True, "label": label})
+    out["count"] = len(out["cards"])
+    return out
+
 def _padsplit_fetch(url):
     """One PadSplit page fetch (browser UA — the site serves its SSR
-    payload to ordinary agents). Returns the HTML or None."""
+    payload to ordinary agents). v58: the r.jina.ai reader is tried
+    FIRST (PA's proxy 403-blocks padsplit.com directly, but the reader
+    answered HTTP 200 with real rent data, 2026-11-06); the direct
+    fetch stays as fallback. 15s cap per attempt. Returns the
+    HTML/markdown or None."""
     if not url: return None
-    try:
-        r = requests.get(url, headers={"User-Agent":
-                         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"},
-                         timeout=30)
-        r.raise_for_status()
-        return r.text
-    except Exception as e:
-        app.logger.warning(f"comp pull: PadSplit fetch failed for {url}: {e!r}")
-        return None
+    for attempt_url in (f"{JINA_READER_BASE}{url}", url):
+        try:
+            r = requests.get(attempt_url, headers={"User-Agent":
+                             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"},
+                             timeout=15)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            app.logger.warning(f"comp pull: PadSplit fetch failed for {attempt_url}: {e!r}")
+    return None
 
 def _padsplit_pull(prop):
     """Fetch the OFFICIAL PadSplit room rents for the subject (v56):
@@ -2604,6 +2647,44 @@ RAPIDAPI_SRC_REEF = "RapidAPI (ReefAPI)"
 RAPIDAPI_SRC_PZ = "RapidAPI (Zillow)"
 RAPIDAPI_SRC_REDFIN = "RapidAPI (Redfin)"
 RAPIDAPI_SRC_SABRI = "RapidAPI (Realtor16)"
+# v58: Things4u — TWO new free BASIC subscriptions in Sherif's account
+# (no card anywhere), playground-verified 2026-11-06 on Lindley
+# (research/things4u-api-facts-2026-11-06.md): Realtor Search
+# (150 req/mo hard limit) and Realty US (500 req/mo hard limit), both
+# GET properties/search-sold AND properties/search-rent over the same
+# Realtor.com data. Realty US is asked first; Realtor Search is the
+# failover for the same data, not a second source.
+RAPIDAPI_T4U_US_HOST = "realty-us.p.rapidapi.com"
+RAPIDAPI_T4U_RS_HOST = "realtor-search.p.rapidapi.com"
+RAPIDAPI_SRC_T4U_US = "RapidAPI (Realty US)"
+RAPIDAPI_SRC_T4U_RS = "RapidAPI (Realtor Search)"
+
+# v58: 429 skip-fast. A host that answers HTTP 429 is quota-dead for
+# the rest of that calendar month — the settings row records the date
+# of the 429, the frame loops skip the host (one probe/month), and a
+# 429 never burns a retry. Both free quotas reset on the 1st (Sabri
+# and ReefAPI reset Dec 4 in the 2026-11-06 incident because their
+# cycles end then; the monthly date check is the general rule).
+_RAPIDAPI_QUOTA_DEAD_PREFIX = "rapidapi_quota_dead:"
+
+def _rapidapi_quota_dead(host):
+    """True when this host answered HTTP 429 earlier this calendar
+    month (settings row rapidapi_quota_dead:<host> = YYYY-MM-DD)."""
+    try:
+        d = get_setting(_RAPIDAPI_QUOTA_DEAD_PREFIX + host)
+    except Exception:
+        return False
+    return bool(d) and d[:7] == datetime.date.today().strftime("%Y-%m")
+
+def _rapidapi_mark_quota_dead(host):
+    """Record a host's 429 (settings row, today's date). Never raises
+    into the pull — a settings write failing must not mask the
+    source's own failure."""
+    try:
+        set_setting(_RAPIDAPI_QUOTA_DEAD_PREFIX + host,
+                    datetime.date.today().isoformat())
+    except Exception as e:
+        app.logger.warning(f"comp pull: could not record quota-dead for {host}: {e!r}")
 # The Redfin auto-complete endpoint is LIVE-CAPTURED (playground,
 # 2026-11-04): GET /properties/auto-complete with query="City, ST",
 # answering grouped rows ({data: [{name: "Places", rows: [...]},
@@ -2633,44 +2714,64 @@ def _rapidapi_key():
     rendered page (Settings displays it masked)."""
     return os.environ.get("RAPIDAPI_API_KEY") or get_setting("rapidapi_key") or ""
 
-def _rapidapi_get(host, path, params=None):
+def _rapidapi_get(host, path, params=None, timeout=15, retries=2):
     """One RapidAPI GET. Returns (json, None) or (None, err). No key ->
-    (None, None) without any request."""
+    (None, None) without any request. v58: 15s cap (was 30s — a hung
+    provider must never stall the pull) and a bounded retry (x2, short
+    backoff) on ConnectionError/Timeout ONLY — an HTTP error (429 quota
+    included) surfaces immediately so the quota-dead flag can catch it."""
     if not _rapidapi_key(): return None, None
-    try:
-        r = requests.get(f"https://{host}{path}", params=params or {},
-                         headers={"X-RapidAPI-Key": _rapidapi_key(), "X-RapidAPI-Host": host},
-                         timeout=30)
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, e
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(f"https://{host}{path}", params=params or {},
+                             headers={"X-RapidAPI-Key": _rapidapi_key(), "X-RapidAPI-Host": host},
+                             timeout=timeout)
+            r.raise_for_status()
+            return r.json(), None
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            return None, e
+        except Exception as e:
+            return None, e
+    return None, last_err
 
-def _rapidapi_post(host, path, body):
+def _rapidapi_post(host, path, body, timeout=15, retries=2):
     """One RapidAPI POST (the ReefAPI sold search takes a JSON body).
-    Same contract as _rapidapi_get."""
+    Same contract as _rapidapi_get (v58: 15s cap, retry on
+    ConnectionError/Timeout only)."""
     if not _rapidapi_key(): return None, None
-    try:
-        r = requests.post(f"https://{host}{path}", json=body,
-                          headers={"X-RapidAPI-Key": _rapidapi_key(), "X-RapidAPI-Host": host},
-                          timeout=30)
-        r.raise_for_status()
-        return r.json(), None
-    except Exception as e:
-        return None, e
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(f"https://{host}{path}", json=body,
+                              headers={"X-RapidAPI-Key": _rapidapi_key(), "X-RapidAPI-Host": host},
+                              timeout=timeout)
+            r.raise_for_status()
+            return r.json(), None
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            return None, e
+        except Exception as e:
+            return None, e
+    return None, last_err
 
 # v49: the private-zillow wrapper is flaky in production (live PA
 # evidence 2026-11-05: a sold search answered HTTP 503 {"message":
 # "503: Zillow is temporarily limiting requests, please retry in a
 # few seconds"} and the Garland subject lookup answered HTTP 404 from
-# PA minutes after the identical playground call returned 200). Both
-# pzillow calls retry BOUNDED — up to 2 extra attempts with this
-# backoff — and only on transient statuses: 503 on either call, plus
-# 404 on the subject lookup (its by-address resolution flickers; a
-# 404 surviving every attempt is the honest not-on-Zillow answer and
-# degrades exactly as v48 did). Worst added latency is 5+15s on a
-# call that would otherwise have failed outright.
-_PZ_RETRY_DELAYS = (5, 15)
+# PA minutes after the identical playground call returned 200).
+# v58: the retry is GONE — the provider is DOWN (its sold search hangs
+# in its own playground, 2026-11-06), so a retry only burns pull time.
+# The sold search is no longer called at all; the by-address subject
+# lookup gets ONE attempt with an 8s cap, as the LAST subject-fill
+# resort. A 503/404/timeout degrades to the honest not-filled state.
 
 def _err_status(err):
     """The HTTP status an exception carries (via its response), else
@@ -2680,30 +2781,17 @@ def _err_status(err):
     return code if isinstance(code, int) else None
 
 def _pz_get(path, params, retry_404=False):
-    """One private-zillow GET with the bounded v49 retry. Returns
-    (data, err, attempts, last_status) — data/err are _rapidapi_get's
-    pair for the FINAL attempt. The loop is contained: a failure
-    inside an attempt degrades to that attempt's error; it can never
-    raise into the pull (the v40 containment rule)."""
-    data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, path, params)
-    attempts = 1
+    """One private-zillow GET (v58: SINGLE attempt, 8s cap — the
+    v49 bounded retry is retired with the sold search). Returns
+    (data, err, attempts, last_status) — the same contract the subject
+    fill reads, so its call sites are unchanged. A failure degrades to
+    that attempt's error; it can never raise into the pull (the v40
+    containment rule). retry_404 is kept in the signature for the
+    callers' sake and is ignored: a 404 is the honest not-on-Zillow
+    answer, not a retry trigger."""
+    data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, path, params, timeout=8, retries=0)
     last_status = _err_status(err) if err is not None else 200
-    while err is not None and attempts <= len(_PZ_RETRY_DELAYS):
-        code = _err_status(err)
-        if code != 503 and not (retry_404 and code == 404): break
-        try:
-            delay = _PZ_RETRY_DELAYS[attempts - 1]
-            if delay: time.sleep(delay)
-            data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, path, params)
-        except Exception as e:
-            data, err = None, e
-        attempts += 1
-        if err is not None:
-            c2 = _err_status(err)
-            if c2 is not None: last_status = c2
-        else:
-            last_status = 200
-    return data, err, attempts, last_status
+    return data, err, 1, last_status
 
 def _rapi_dig(obj, *keys):
     cur = obj
@@ -3072,6 +3160,13 @@ def _rapi_count_in_gate(rows, prop, radius_mi):
     0-stored pull — see _sold_row_gate)."""
     return sum(1 for r in rows or [] if _sold_row_gate(r, prop, radius_mi)[0])
 
+def _frame_in_gate(df, prop, radius_mi):
+    """In-gate count for an already-built DataFrame (the Cadastral /
+    jina frames, whose adapters don't return outcomes): rows the sold
+    MERGE would accept, per the shared _sold_row_gate."""
+    if df is None or not len(df): return 0
+    return sum(1 for _, r in df.iterrows() if _sold_row_gate(dict(r), prop, radius_mi)[0])
+
 def _sabri_radius(radius_mi):
     """The radius sent to Sabri's coordinate endpoints (v42). forrent
     REQUIRES radius (latitude/longitude/radius all required — the
@@ -3116,13 +3211,130 @@ def _rapi_rows_multi(items, fn):
 # monthly quota behind the SAME account key. Adapter contract:
 # fn(prop, past_days, radius_mi) -> (rows, err, source_label); rows
 # empty means "this source didn't serve" (quota / unreachable / empty /
-# broken response are all just reasons to move on). v41 pool — every
-# member playground-verified from Sherif's account 2026-11-04, in quota
-# order: ReefAPI first (100/mo, coordinates on every row), Redfin
-# second (100/mo, two calls), Sabri LAST (30/mo — precious; one call).
-# v42: the sold side is a sequential UNION WITH TOP-UP over this order
-# (see _rapidapi_sold_frame) — a source is only skipped when the union
-# is already rich, and a failure never blocks the sources behind it.
+# broken response are all just reasons to move on). v58 pool, in order:
+# Things4u Realty US (500/mo) -> Things4u Realtor Search (150/mo,
+# same data — failover) -> ReefAPI (100/mo) -> Sabri (30/mo — precious).
+# Retired v58: Redfin (rows carry no coordinates — nothing storable)
+# and private-zillow sold (provider-side hang). v42: the sold side is
+# a sequential UNION WITH TOP-UP over this order (see
+# _rapidapi_sold_frame) — a source is only skipped when the union is
+# already rich, and a failure never blocks the sources behind it.
+# --- v58 Things4u (Realtor Search / Realty US) ---
+# Two free BASIC subscriptions in Sherif's account (no card), playground-
+# verified 2026-11-06 (research/things4u-api-facts-2026-11-06.md): both
+# serve the same Realtor.com data over GET properties/search-sold AND
+# properties/search-rent. Realty US (500/mo) is asked first; Realtor
+# Search (150/mo) is the failover for the same data. The envelope was
+# NOT captured in the playground (only the rows were), so the
+# normalizer tries the documented Realtor-v3 shapes in order and logs
+# the live top-level keys on first use — a shape mismatch degrades to
+# "didn't serve" and is diagnosable from the PA error log.
+def _things4u_results(data):
+    """The result list out of a Things4u search payload: data.results
+    first (the shape the hunt report implies), then the other
+    documented Realtor-v3 nests, then a top-level list. Anything else
+    is an empty list — never a shape error."""
+    if not isinstance(data, dict): return []
+    for keys in (("data", "results"), ("data", "home_search", "results"),
+                 ("data", "listings"), ("data", "properties")):
+        items = _rapi_dig(data, *keys)
+        if isinstance(items, list): return items
+    if isinstance(data.get("results"), list): return data["results"]
+    return []
+
+def _things4u_item_to_row(item, rent=False):
+    """One Things4u search item -> the standard HomeHarvest columns.
+    The item is FLAT (playground-verified 2026-11-06): address_line,
+    last_sold_price, latitude/longitude, beds/baths/sqft/year_built,
+    zip_code, city, state, primary_photo_url. Specs fall back to a
+    nested description.* object when a flat key is absent. Sold price
+    comes ONLY from last_sold_price; a rent row's price is list_price
+    (sold_price stays None — the rent gate reads list_price)."""
+    desc = item.get("description") if isinstance(item.get("description"), dict) else {}
+    def _pick(*keys):
+        for k in keys:
+            v = item.get(k)
+            if v is not None: return v
+        for k in keys:
+            v = desc.get(k)
+            if v is not None: return v
+        return None
+    photo = _s(_pick("primary_photo_url", "primary_photo"))
+    return dict(street=_s(_pick("address_line", "address")),
+                city=_s(_pick("city")), zip_code=_s(_pick("zip_code", "zip")),
+                sold_price=None if rent else _sabri_num(_pick("last_sold_price", "sold_price")),
+                list_price=_sabri_num(_pick("list_price")),
+                sqft=_sabri_num(_pick("sqft", "livingArea")),
+                beds=_sabri_num(_pick("beds", "bedrooms")),
+                full_baths=_sabri_num(_pick("baths", "bathrooms")),
+                year_built=_sabri_num(_pick("year_built")),
+                lot_sqft=_sabri_num(_pick("lot_sqft", "lotSize")),
+                last_sold_date=_s(_pick("last_sold_date"))[:10] or None,
+                days_on_mls=None,
+                latitude=_sabri_num(_pick("latitude", "lat")),
+                longitude=_sabri_num(_pick("longitude", "lon")),
+                style=_s(_pick("property_type")), property_type=_s(_pick("property_type")),
+                property_url=_s(_pick("property_url")) or None,
+                primary_photo=photo or None, alt_photos=[photo] if photo else [],
+                estimated_value=None, price_per_sqft=None)
+
+def _things4u_search(host, path, prop, rent=False):
+    """One Things4u search (sold or rent), paginated. Location is the
+    Realtor-v3 city form the playground verified ('city:West Chicago,
+    IL'); resultsPerPage=200 (the API's max); the walk stops on a
+    short page, the reported total, or the page cap (3 sold / 2
+    rent). minSoldDate is NOT sent: the hunt captured the parameter
+    name but not its exact format, and a wrong date format would fail
+    the whole call — the client-side horizon filter governs instead,
+    exactly as ReefAPI's adapter does. The first response's top-level
+    keys are logged so a live envelope mismatch is diagnosable."""
+    loc = f"city:{_s(prop.get('city'))}, {_s(prop.get('state'))}"
+    rows = []
+    max_pages = 2 if rent else 3
+    for page in range(1, max_pages + 1):
+        data, err = _rapidapi_get(host, path,
+                                  {"location": loc, "resultsPerPage": 200, "page": page})
+        if err is not None:
+            if page == 1: return [], err
+            break
+        if page == 1:
+            keys = sorted(data.keys()) if isinstance(data, dict) else []
+            app.logger.warning(f"comp pull: Things4u {path} top-level keys: {keys}")
+        items = _things4u_results(data)
+        total = _rapi_dig(data, "data", "total")
+        rows.extend(_rapi_rows(items, lambda it: _things4u_item_to_row(it, rent=rent)))
+        if len(items) < 200: break
+        if isinstance(total, (int, float)) and len(rows) >= total: break
+    return rows, None
+
+def _src_things4u(prop, past_days, radius_mi, host, label, rent=False):
+    """Shared Things4u adapter: search, then the client-side horizon
+    filter on the sold side (the rent side has no date window). A
+    page-1 error is the source's failure; a later page's failure keeps
+    the accumulated rows."""
+    rows, err = _things4u_search(host,
+                                 "/properties/search-rent" if rent else "/properties/search-sold",
+                                 prop, rent=rent)
+    if err is not None: return [], err, label
+    if rent: return rows, None, label
+    return _rapi_in_horizon(rows, past_days), None, label
+
+def _src_things4u_realty_us_sold(prop, past_days, radius_mi=1.0):
+    return _src_things4u(prop, past_days, radius_mi, RAPIDAPI_T4U_US_HOST,
+                         RAPIDAPI_SRC_T4U_US)
+
+def _src_things4u_realtor_search_sold(prop, past_days, radius_mi=1.0):
+    return _src_things4u(prop, past_days, radius_mi, RAPIDAPI_T4U_RS_HOST,
+                         RAPIDAPI_SRC_T4U_RS)
+
+def _src_things4u_realty_us_rent(prop, past_days, radius_mi=1.0):
+    return _src_things4u(prop, past_days, radius_mi, RAPIDAPI_T4U_US_HOST,
+                         RAPIDAPI_SRC_T4U_US, rent=True)
+
+def _src_things4u_realtor_search_rent(prop, past_days, radius_mi=1.0):
+    return _src_things4u(prop, past_days, radius_mi, RAPIDAPI_T4U_RS_HOST,
+                         RAPIDAPI_SRC_T4U_RS, rent=True)
+
 def _src_reefapi_sold(prop, past_days, radius_mi=1.0):
     """ReefAPI sold, queried by ZIP and PAGINATED (v42). The v41 form —
     one page of the 100 newest sales in the whole CITY — held nothing
@@ -3232,7 +3444,10 @@ def _src_sabri_forsold(prop, past_days, radius_mi=1.0):
                   "radius": _sabri_radius(radius_mi), "page": page}
         if use_date_min: params["sold_date-min"] = date_min
         data, err = _rapidapi_get(RAPIDAPI_SABRI_HOST, "/search/forsold/coordinates", params)
-        if err is not None and use_date_min:
+        if err is not None and use_date_min and _err_status(err) != 429:
+            # v58: a 429 is QUOTA, not a parameter problem — retrying
+            # without sold_date-min would burn a second request on a
+            # dead quota. Only non-429 errors get the retry.
             _rapi_note("sabri_forsold",
                        f"sold_date-min rejected ({_rapi_fail_reason(err)})"
                        " — page retried without it")
@@ -3395,12 +3610,12 @@ def _zillow_subject_fill(d, prop, today):
         d.commit()
     fills = {}
     for col in ("beds", "baths", "sqft", "year_built", "lat", "lon"):
-        if not prop[col] and v[col]:
+        if not prop[col] and v[col] and _sane_subject_fill(col, v[col]):
             fills[col] = v[col]
     if v["photos"] and not prop["photos_json"] and not prop["photo_url"]:
         fills["photos_json"] = json.dumps(v["photos"]); fills["photos_date"] = today
         fills["photo_url"] = v["photos"][0]
-    if v["zestimate"] and not prop["est_zillow"]:
+    if v["zestimate"] and not prop["est_zillow"] and _sane_subject_fill("est_zillow", v["zestimate"]):
         fills["est_zillow"] = v["zestimate"]; fills["est_date"] = today
     if not fills:
         app.logger.warning(f"comp pull: private-zillow subject lookup for "
@@ -3413,6 +3628,147 @@ def _zillow_subject_fill(d, prop, today):
                        f"({attempts} call{'s' if attempts > 1 else ''}, RapidAPI (Zillow))")
     return {"photos": len(v["photos"]) if "photos_json" in fills else 0,
             "fields": sorted(fills)}
+
+# ---------------------------------------------------------------- v58 subject-fill sanity + Things4u detail
+def _sane_subject_fill(col, v):
+    """The subject-fill sanity guard (v58): a value is storable only
+    when it is plausible for its field. ReiSearch itself auto-filled
+    108 Ridgeland Ave's sqft as '1' (measured live 2026-11-06) — this
+    guard exists so our app never reproduces that: sqft < 100 is
+    missing, a $0 price is missing, a year outside 1800..next-year is
+    missing. Applied at EVERY fill site (frame rows, pz, ReefAPI
+    Zillow, Things4u detail)."""
+    if v is None: return False
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return False
+    if col == "sqft": return 100 <= n <= 100000
+    if col in ("beds", "baths"): return 0 <= n <= 30
+    if col == "year_built": return 1800 <= n <= datetime.date.today().year + 1
+    if col == "lot_sqft": return 0 < n <= 10000000
+    if col in ("list_price", "est_zillow", "est_realtor", "est_county"): return n > 0
+    if col == "lat": return -90 <= n <= 90
+    if col == "lon": return -180 <= n <= 180
+    return True
+
+def _things4u_detail_values(payload):
+    """One Things4u detail payload -> candidate subject fill values
+    (pure; no I/O). The detail object sits at data (or is the payload
+    itself); fields are the flat Realtor-v3 names the hunt verified
+    (bedrooms / bathrooms / livingArea / yearBuilt / lotSize /
+    zestimate / latitude / longitude / photos). livingArea null is
+    sqft None — never 0, never 1, never invented."""
+    if not isinstance(payload, dict): return {}
+    det = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(det, dict): return {}
+    photos = []
+    for ph in det.get("photos") or []:
+        u = ph.get("href") if isinstance(ph, dict) else (ph if isinstance(ph, str) else None)
+        if u and _s(u).startswith("http") and _s(u) not in photos: photos.append(_s(u))
+    pp = det.get("primary_photo")
+    first = pp.get("href") if isinstance(pp, dict) else (pp if isinstance(pp, str) else None)
+    if first and _s(first).startswith("http") and _s(first) not in photos:
+        photos.insert(0, _s(first))
+    yb = _sabri_num(det.get("yearBuilt"))
+    return {"beds": _sabri_num(det.get("bedrooms")),
+            "baths": _sabri_num(det.get("bathrooms")),
+            "sqft": _sabri_num(det.get("livingArea")),
+            "year_built": int(yb) if yb else None,
+            "lot_sqft": _sabri_num(det.get("lotSize")),
+            "lat": _sabri_num(det.get("latitude")), "lon": _sabri_num(det.get("longitude")),
+            "photos": photos,
+            "list_price": _sabri_num(det.get("list_price")),
+            "zestimate": _sabri_num(det.get("zestimate")),
+            "city": _s(det.get("city")),
+            "zip": _s(det.get("zip_code")) or _s(det.get("zipcode"))}
+
+def _things4u_autocomplete_id(data):
+    """The property id out of a Things4u auto-complete payload: the
+    autocomplete list's first row carrying an 'id', preferring a row
+    whose area_type/type reads 'address'. Recursive fallback: any 'id'
+    anywhere in the payload (the shape was not captured in the
+    playground). None when nothing carries one."""
+    cands = _rapi_dig(data, "data", "autocomplete")
+    if not isinstance(cands, list):
+        cands = data.get("autocomplete") if isinstance(data, dict) else None
+    if isinstance(cands, list):
+        for row in cands:
+            if isinstance(row, dict) and row.get("id") is not None:
+                t = str(row.get("area_type") or row.get("type") or "").lower()
+                if t in ("address", "property", ""): return str(row["id"])
+        for row in cands:
+            if isinstance(row, dict) and row.get("id") is not None:
+                return str(row["id"])
+    def _find(o):
+        if isinstance(o, dict):
+            if o.get("id") is not None: return o["id"]
+            for v in o.values():
+                r = _find(v)
+                if r is not None: return r
+        elif isinstance(o, list):
+            for v in o:
+                r = _find(v)
+                if r is not None: return r
+        return None
+    z = _find(data)
+    return str(z) if z is not None else None
+
+def _things4u_subject_fill(d, prop, today):
+    """The Things4u subject detail fill (v58): auto-complete the
+    subject's address to a property id, then ONE detail call, filling
+    the subject's BLANK specs from the Realtor.com record. Realty US
+    first, Realtor Search second (same data — the second fires only
+    if the first did not serve). Blank-fill ONLY, sanity-guarded per
+    field; the Zestimate-shaped price lands in est_realtor, never
+    list_price. Returns the fill summary or None. The auto-complete /
+    detail envelope was not captured in the playground — the id is
+    searched defensively and the detail object is read through
+    _things4u_detail_values; a shape surprise is an honest None,
+    logged."""
+    if not _rapidapi_key(): return None
+    for host in (RAPIDAPI_T4U_US_HOST, RAPIDAPI_T4U_RS_HOST):
+        data, err = _rapidapi_get(host, "/properties/auto-complete",
+                                  {"query": prop["address"]})
+        if err is not None or data is None: continue
+        pid = _things4u_autocomplete_id(data)
+        if not pid: continue
+        det, derr = _rapidapi_get(host, "/properties/detail", {"property_id": pid})
+        if derr is not None or det is None: continue
+        v = _things4u_detail_values(det)
+        if not v: continue
+        if v["city"] and prop["city"] and v["city"].strip().lower() != prop["city"].strip().lower():
+            app.logger.warning(f"comp pull: Things4u subject detail for {prop['address']}: "
+                               "response city contradicts the subject — no-match")
+            return None
+        if v["zip"] and prop["zip"] and str(v["zip"])[:5] != str(prop["zip"])[:5]:
+            app.logger.warning(f"comp pull: Things4u subject detail for {prop['address']}: "
+                               "response ZIP contradicts the subject — no-match")
+            return None
+        fills = {}
+        for col in ("beds", "baths", "sqft", "year_built", "lot_sqft", "lat", "lon"):
+            if not prop[col] and v.get(col) is not None and _sane_subject_fill(col, v[col]):
+                fills[col] = v[col]
+        if v["photos"] and not prop["photos_json"] and not prop["photo_url"]:
+            fills["photos_json"] = json.dumps(v["photos"]); fills["photos_date"] = today
+            fills["photo_url"] = v["photos"][0]
+        if v["list_price"] and not prop["list_price"] and _sane_subject_fill("list_price", v["list_price"]):
+            fills["list_price"] = v["list_price"]
+        if v["zestimate"] and not prop["est_realtor"] and _sane_subject_fill("est_realtor", v["zestimate"]):
+            fills["est_realtor"] = v["zestimate"]; fills["est_date"] = today
+        if not fills:
+            app.logger.warning(f"comp pull: Things4u subject detail for {prop['address']}: "
+                               "matched, but every field was already filled")
+            return None
+        d.execute(f"UPDATE properties SET {','.join(k + '=?' for k in fills)} WHERE id=?",
+                  (*fills.values(), prop["id"]))
+        app.logger.warning(f"comp pull: Things4u subject detail for {prop['address']}: "
+                           f"filled {', '.join(sorted(fills))}")
+        return {"photos": len(v["photos"]) if "photos_json" in fills else 0,
+                "fields": sorted(fills)}
+    app.logger.warning(f"comp pull: Things4u subject detail for {prop['address']}: "
+                       "no id/detail served")
+    return None
 
 # v56: the two Zillow BACKUP subject paths (capture doc 2026-11-05).
 # Both are zpid-only APIs, which is why the primary fill now persists
@@ -3518,12 +3874,12 @@ def _reef_zillow_subject_fill(d, prop, today):
         d.commit()
     fills = {}
     for col in ("beds", "baths", "sqft", "year_built", "lat", "lon"):
-        if not prop[col] and v[col]:
+        if not prop[col] and v[col] and _sane_subject_fill(col, v[col]):
             fills[col] = v[col]
     if v["photos"] and not prop["photos_json"] and not prop["photo_url"]:
         fills["photos_json"] = json.dumps(v["photos"]); fills["photos_date"] = today
         fills["photo_url"] = v["photos"][0]
-    if v["zestimate"] and not prop["est_zillow"]:
+    if v["zestimate"] and not prop["est_zillow"] and _sane_subject_fill("est_zillow", v["zestimate"]):
         fills["est_zillow"] = v["zestimate"]; fills["est_date"] = today
     if not fills:
         app.logger.warning(f"comp pull: ReefAPI Zillow subject backup for "
@@ -3648,18 +4004,45 @@ def _src_pzillow_sold(prop, past_days, radius_mi=1.0):
     rows = _rapi_rows(items, _pz_sold_item_to_row)
     return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_PZ
 
-_RAPIDAPI_ADAPTERS = {"reefapi_sold": _src_reefapi_sold,
-                      "redfin_sold": _src_redfin_sold,
+_RAPIDAPI_ADAPTERS = {"things4u_realty_us_sold": _src_things4u_realty_us_sold,
+                      "things4u_realtor_search_sold": _src_things4u_realtor_search_sold,
+                      "reefapi_sold": _src_reefapi_sold,
                       "sabri_forsold": _src_sabri_forsold,
-                      "sabri_forrent": _src_sabri_forrent,
-                      "pzillow_sold": _src_pzillow_sold}
-_RAPIDAPI_SOURCE_NAMES = {"reefapi_sold": "ReefAPI Realtor sold",
-                          "redfin_sold": "Redfin.Com Data sold search",
+                      "things4u_realty_us_rent": _src_things4u_realty_us_rent,
+                      "things4u_realtor_search_rent": _src_things4u_realtor_search_rent,
+                      "sabri_forrent": _src_sabri_forrent}
+_RAPIDAPI_SOURCE_NAMES = {"things4u_realty_us_sold": "Things4u Realty US sold search",
+                          "things4u_realtor_search_sold": "Things4u Realtor Search sold search",
+                          "reefapi_sold": "ReefAPI Realtor sold",
                           "sabri_forsold": "Realtor16 (Sabri) sold search",
-                          "sabri_forrent": "Realtor16 (Sabri) rent search",
-                          "pzillow_sold": "private-zillow sold search (Zillow)"}
-RAPIDAPI_SOLD_SOURCES = ("reefapi_sold", "redfin_sold", "sabri_forsold", "pzillow_sold")
-RAPIDAPI_RENT_SOURCES = ("sabri_forrent",)
+                          "things4u_realty_us_rent": "Things4u Realty US rent search",
+                          "things4u_realtor_search_rent": "Things4u Realtor Search rent search",
+                          "sabri_forrent": "Realtor16 (Sabri) rent search"}
+# v58: retired from the pull path, functions kept for the record.
+# redfin_sold — region rows carry no coordinates (live 2026-11-06):
+# nothing storable, so it contributed zero comps on every pull.
+# pzillow_sold — private-zillow's sold search hangs provider-side
+# (503 in its own playground, 2026-11-06): not transient, do not call.
+_RAPIDAPI_SOURCE_HOSTS = {"things4u_realty_us_sold": RAPIDAPI_T4U_US_HOST,
+                          "things4u_realtor_search_sold": RAPIDAPI_T4U_RS_HOST,
+                          "reefapi_sold": RAPIDAPI_REEF_HOST,
+                          "sabri_forsold": RAPIDAPI_SABRI_HOST,
+                          "things4u_realty_us_rent": RAPIDAPI_T4U_US_HOST,
+                          "things4u_realtor_search_rent": RAPIDAPI_T4U_RS_HOST,
+                          "sabri_forrent": RAPIDAPI_SABRI_HOST}
+RAPIDAPI_SOLD_SOURCES = ("things4u_realty_us_sold", "things4u_realtor_search_sold",
+                         "reefapi_sold", "sabri_forsold")
+RAPIDAPI_RENT_SOURCES = ("things4u_realty_us_rent", "things4u_realtor_search_rent",
+                         "sabri_forrent")
+
+def _rapi_quota_skip_outcome(key):
+    """The outcome record for a source SKIPPED on its quota-dead flag
+    (v58): same shape as _rapi_outcome's failure record, so the pool
+    detail and the banner read it identically — no request was made."""
+    name = _RAPIDAPI_SOURCE_NAMES[key]
+    return {"name": name, "label": None, "served": False, "rows": 0,
+            "in_gate": 0, "reason": "quota reached (HTTP 429)",
+            "log": f"{name} — skipped: quota reached earlier this month (HTTP 429)"}
 
 def _rapi_call_source(key, prop, past_days, radius_mi):
     """One pool source, fully contained (the v40 rule): ANY failure —
@@ -3667,11 +4050,16 @@ def _rapi_call_source(key, prop, past_days, radius_mi):
     response shape — is just "didn't serve" with the error attached.
     It must never escape and mask the sources behind it (pre-fix, a
     normalizer AttributeError aborted the whole pull before
-    HomeHarvest even ran — rapidapi-live-shapes-2026-11-04.md §6)."""
+    HomeHarvest even ran — rapidapi-live-shapes-2026-11-04.md §6).
+    v58: a 429 marks the host quota-dead (settings) so the frame
+    loops skip it for the rest of the month."""
     try:
-        return _RAPIDAPI_ADAPTERS[key](prop, past_days, radius_mi)
+        rows, err, label = _RAPIDAPI_ADAPTERS[key](prop, past_days, radius_mi)
     except Exception as e:
-        return [], e, None
+        rows, err, label = [], e, None
+    if err is not None and _err_status(err) == 429:
+        _rapidapi_mark_quota_dead(_RAPIDAPI_SOURCE_HOSTS[key])
+    return rows, err, label
 
 def _rapi_count_in_gate_rent(rows, prop, radius_mi):
     """The rent twin of _rapi_count_in_gate (v43): rows the RENT merge
@@ -3729,6 +4117,12 @@ def _rapidapi_sold_frame(prop, past_days=365, radius_mi=1.0):
         # so the guarantee adds NO Sabri calls in that case (Sabri is
         # 30/mo; the discipline is part of the rule).
         if frames and in_gate_total >= RAPIDAPI_UNION_RICH and ss_found: break
+        # v58: a quota-dead host is skipped without a request (one
+        # probe/month); its outcome record keeps the pool detail and
+        # the banner truthful.
+        if _rapidapi_quota_dead(_RAPIDAPI_SOURCE_HOSTS[key]):
+            outcomes.append(_rapi_quota_skip_outcome(key))
+            continue
         rows, err, label = _rapi_call_source(key, prop, past_days, radius_mi)
         oc = _rapi_outcome(key, rows, err, label, prop, radius_mi,
                            note=_rapi_take_note(key))
@@ -3749,11 +4143,142 @@ def _rapidapi_rent_frame(prop, radius_mi=1.0):
     if not _rapidapi_key(): return None, None, None, []
     outcomes, last_err = [], None
     for key in RAPIDAPI_RENT_SOURCES:
+        # v58: quota-dead skip, same as the sold frame.
+        if _rapidapi_quota_dead(_RAPIDAPI_SOURCE_HOSTS[key]):
+            outcomes.append(_rapi_quota_skip_outcome(key))
+            continue
         rows, err, label = _rapi_call_source(key, prop, 365, radius_mi)
         outcomes.append(_rapi_outcome(key, rows, err, label, prop, radius_mi, rent=True))
         if rows: return _hh_frame(rows), None, label, outcomes
         if err is not None: last_err = err
     return None, last_err, None, outcomes
+
+# ---------------------------------------------------------------- v58 jina-Zillow sold
+# The nationwide no-quota sold layer (proven 2026-11-06): Zillow's
+# sold-results page for the subject's ZIP, read through the r.jina.ai
+# reader (no key, no quota, no expiry). Realtor via the reader is
+# 429-rate-limited and Redfin via the reader is CAPTCHA/405 — both
+# NOT usable; Zillow is the only reader route. The reader returns
+# MARKDOWN: rows are "$450,000 — 4 bds, 3 ba, 2,254 sqft — Closed —
+# 4N649 Petersdorf Rd, West Chicago, IL 60185 — Sold 11/02/26".
+# The page carries no coordinates, so rows are geocoded (Nominatim
+# first — PA-reachable — ArcGIS fallback) and pass the pull's radius
+# gate like every other row; a row that cannot be geocoded is dropped.
+JINA_READER_BASE = "https://r.jina.ai/"
+JINA_ZILLOW_PAGES = 3
+JINA_GEOCODE_MAX = 15  # rows geocoded per pull (Nominatim politeness)
+
+def _jina_fetch(url):
+    """One reader fetch (browser UA). Returns the markdown/HTML text or
+    None. The reader is a best-effort top-up: any failure leaves the
+    union exactly as it was."""
+    if not url: return None
+    try:
+        r = requests.get(f"{JINA_READER_BASE}{url}", headers={"User-Agent":
+                         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"},
+                         timeout=15)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        app.logger.warning(f"comp pull: jina reader fetch failed for {url}: {e!r}")
+        return None
+
+def _geocode_nominatim(addr):
+    """One Nominatim geocode (PA-reachable; the jina-row path).
+    Returns {"lat": .., "lon": ..} or None. The caller sleeps 1s
+    between rows (Nominatim's usage policy)."""
+    if not addr: return None
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/search",
+                         params={"q": addr, "format": "json", "limit": 1},
+                         headers={"User-Agent": "PropertyDealAnalyzer/1.0 (comp pull)"},
+                         timeout=5)
+        r.raise_for_status()
+        rows = r.json()
+        if isinstance(rows, list) and rows:
+            return {"lat": float(rows[0]["lat"]), "lon": float(rows[0]["lon"])}
+    except Exception:
+        return None
+    return None
+
+def _jina_zillow_parse(md):
+    """Zillow sold markdown -> normalized sold rows (the standard
+    HomeHarvest columns, latitude/longitude None until geocoded).
+    One row per markdown line of the "$P — N bds, M ba, S sqft —
+    Closed — <address> — Sold MM/DD/YY" form. Title/count lines never
+    match the form and are ignored. A line that fails any parse step
+    is skipped — never an exception, never an invented row."""
+    rows = []
+    for line in (md or "").splitlines():
+        parts = [p.strip() for p in line.split("—")]
+        if len(parts) < 5: continue
+        try:
+            price = int(parts[0].replace("$", "").replace(",", "").strip())
+        except (ValueError, AttributeError):
+            continue
+        m = re.match(r"(\d+)\s+bds?,\s+(\d+(?:\.\d+)?)\s+ba,\s+([\d,]+)\s+sqft",
+                     parts[1])
+        if not m: continue
+        m2 = re.match(r"^(.+?),\s*([^,]+),\s*([A-Z]{2})\s+(\d{5})$", parts[3])
+        if not m2: continue
+        m3 = re.search(r"Sold\s+(\d{1,2})/(\d{1,2})/(\d{2})", parts[4])
+        if not m3: continue
+        mm, dd, yy = int(m3.group(1)), int(m3.group(2)), int(m3.group(3))
+        rows.append(dict(street=m2.group(1), city=m2.group(2), zip_code=m2.group(4),
+                         sold_price=price, list_price=None,
+                         sqft=int(m.group(3).replace(",", "")),
+                         beds=int(m.group(1)), full_baths=float(m.group(2)),
+                         year_built=None, lot_sqft=None,
+                         last_sold_date=f"20{yy:02d}-{mm:02d}-{dd:02d}",
+                         days_on_mls=None, latitude=None, longitude=None,
+                         style=None, property_type="Single Family",
+                         property_url=None, primary_photo=None, alt_photos=[],
+                         estimated_value=None, price_per_sqft=None))
+    return rows
+
+def _jina_zillow_sold_frame(prop, radius_mi=1.0, past_days=365):
+    """The jina-Zillow sold top-up: (DataFrame, label, err). The
+    subject's ZIP sold page via the reader, pages 1..3 with a
+    same-rows guard (a page that returns only rows already seen stops
+    the walk). Rows are geocoded (Nominatim, 1 req/s, max 15/pull;
+    ArcGIS fallback) and horizon-filtered; the merge's radius gate is
+    the final filter. ([], label, err) when the reader serves nothing
+    — the pull degrades to the union it already has."""
+    label = "Zillow (reader)"
+    city = _s(prop.get("city")); state = _s(prop.get("state"))
+    zipc = str(prop.get("zip") or "")[:5]
+    if not city or not state or not zipc: return [], label, None
+    slug = (re.sub(r"[^a-z0-9]+", "-", city.strip().lower()).strip("-")
+            + "-" + state.strip().lower() + "-" + zipc)
+    base = f"https://www.zillow.com/{slug}/sold/"
+    rows, seen, geocoded = [], set(), 0
+    for page in range(1, JINA_ZILLOW_PAGES + 1):
+        url = base if page == 1 else f"{base}?page={page}"
+        md = _jina_fetch(url)
+        if md is None:
+            if page == 1: return [], label, Exception("jina reader unreachable")
+            break
+        parsed = _jina_zillow_parse(md)
+        new = [r for r in parsed if r["street"] not in seen]
+        if not new: break  # same-rows guard (or an empty page)
+        for r in new:
+            seen.add(r["street"])
+        for r in new:
+            if geocoded >= JINA_GEOCODE_MAX: break
+            addr = f"{r['street']}, {r['city']}, {state} {r['zip_code']}"
+            g = _geocode_nominatim(addr)
+            if g is None:
+                g2 = geocode_arcgis(addr)
+                if g2: g = {"lat": g2.get("lat"), "lon": g2.get("lon")}
+            if g and g.get("lat") is not None and g.get("lon") is not None:
+                r["latitude"], r["longitude"] = float(g["lat"]), float(g["lon"])
+                geocoded += 1
+                rows.append(r)
+            time.sleep(1)  # Nominatim politeness (also paces the ArcGIS fallback)
+        if geocoded >= JINA_GEOCODE_MAX: break
+    if not rows: return [], label, None
+    return _hh_frame(_rapi_in_horizon(rows, past_days)), label, None
 
 # ---------------------------------------------------------------- FL Statewide
 # Cadastral (v48) — OFFICIAL-RECORD sold comps for Florida subjects:
@@ -3887,18 +4412,32 @@ def _fl_cadastral_frame(prop, radius_mi=1.0):
     dlon = (radius_mi or 1.0) / (69.0 * max(math.cos(math.radians(prop["lat"])), 0.2))
     env = (f"{prop['lon'] - dlon},{prop['lat'] - dlat},"
            f"{prop['lon'] + dlon},{prop['lat'] + dlat}")
-    try:
-        r = requests.get(FL_CADASTRAL_URL, params={
-            "where": "SALE_PRC1>0", "geometry": env,
-            "geometryType": "esriGeometryEnvelope", "inSR": 4326, "outSR": 4326,
-            "spatialRel": "esriSpatialRelIntersects", "outFields": _CAD_FIELDS,
-            "returnGeometry": "false", "returnCentroid": "true",
-            "orderByFields": "SALE_YR1 DESC,SALE_MO1 DESC",
-            "resultRecordCount": 2000, "f": "json"}, timeout=90)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        return None, e
+    data, _cad_err = None, None
+    for _attempt in range(3):
+        try:
+            r = requests.get(FL_CADASTRAL_URL, params={
+                "where": "SALE_PRC1>0", "geometry": env,
+                "geometryType": "esriGeometryEnvelope", "inSR": 4326, "outSR": 4326,
+                "spatialRel": "esriSpatialRelIntersects", "outFields": _CAD_FIELDS,
+                "returnGeometry": "false", "returnCentroid": "true",
+                "orderByFields": "SALE_YR1 DESC,SALE_MO1 DESC",
+                "resultRecordCount": 2000, "f": "json"}, timeout=90)
+            r.raise_for_status()
+            data = r.json()
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # v58: frame-level retry x2 (short backoff) on a proxy/
+            # transport failure — the 2026-11-06 pull saw ProxyErrors
+            # on the Cadastral frames alongside the quotas.
+            _cad_err = e
+            if _attempt < 2:
+                time.sleep(1 * (_attempt + 1))
+                continue
+            return None, e
+        except Exception as e:
+            return None, e
+    if data is None:
+        return None, _cad_err
     if isinstance(data, dict) and isinstance(data.get("error"), dict):
         ebody = data["error"]
         return None, Exception(f"Cadastral service error {ebody.get('code')}: "
@@ -3906,6 +4445,30 @@ def _fl_cadastral_frame(prop, radius_mi=1.0):
     feats = data.get("features") if isinstance(data, dict) else None
     rows = _rapi_rows_multi(feats if isinstance(feats, list) else [], _cad_feature_rows)
     return _hh_frame(rows), None
+
+# ---------------------------------------------------------------- v58 pull-time budget
+_PULL_HH_CAP_S = 20      # one HomeHarvest call may never hold the pull longer than this
+_PULL_HH_BUDGET_S = 60   # after this much pull time, HomeHarvest is skipped outright
+
+def _run_capped(fn, cap_s):
+    """Run fn() in a daemon thread; return its result, or None when it
+    exceeds cap_s seconds. A hung call is ABANDONED (the daemon thread
+    dies with the process) — the pull never waits on it. An exception
+    inside fn re-raises to the caller."""
+    box = {}
+    def _target():
+        try: box["v"] = fn()
+        except Exception as e: box["e"] = e
+    t = threading.Thread(target=_target, daemon=True)
+    t.start(); t.join(timeout=cap_s)
+    if t.is_alive(): return None
+    if "e" in box: raise box["e"]
+    return box.get("v")
+
+def _hh_over_budget(started_at, budget_s=_PULL_HH_BUDGET_S):
+    """True once budget_s seconds of pull time have passed — further
+    HomeHarvest calls are skipped (the pull's other frames still run)."""
+    return (time.time() - started_at) > budget_s
 
 def pull_comps(prop, radius_mi=1.0, past_days=365):
     """Multi-frame union pull (v3.4). Frames: a SUBJECT-CENTERED radius frame
@@ -3929,9 +4492,22 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     d = db(); today = datetime.date.today().isoformat()
     warnings = []
     addr_line = prop["address"]
+    _pull_started = time.time()  # v58: the pull-wide HomeHarvest budget clock
     def _scrape(**kw):
-        try: return scrape_property(**kw), None
-        except Exception as e: return None, e
+        # v58: HomeHarvest never answers from PA (proxy block) and its
+        # calls have no timeout of their own — each call is capped at
+        # 20s in a thread, and once 60s of pull time has passed the
+        # calls are skipped outright. A capped/skipped call returns
+        # (None, err) like any other failed frame.
+        if _hh_over_budget(_pull_started):
+            return None, Exception("HomeHarvest skipped — pull time budget reached")
+        try:
+            res = _run_capped(lambda: scrape_property(**kw), _PULL_HH_CAP_S)
+            if res is None:
+                return None, Exception("HomeHarvest call timed out (20s cap)")
+            return res, None
+        except Exception as e:
+            return None, e
     subj = {"sqft": prop["sqft"], "beds": prop["beds"], "baths": prop["baths"], "year_built": prop["year_built"], "lot_sqft": prop["lot_sqft"]}
     # --- RapidAPI sold frames (v3.8; union v42): when a key is
     # configured the pool runs FIRST — on egress-whitelisted hosts it
@@ -3975,6 +4551,23 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             cad_frame, cad_err = None, _cad_boom
         if cad_err is not None:
             app.logger.warning(f"comp pull: FL Cadastral frame failed for {addr_line}: {cad_err!r}")
+    # --- jina-Zillow sold top-up (v58): when the union above is thin
+    # (fewer than RAPIDAPI_UNION_RICH in-gate rows), the reader's ZIP
+    # sold page tops it up — no quota, no key. The frame merges through
+    # the same shared gate as every sold source. ---
+    rapi_in_gate = sum(o["in_gate"] for o in rapi_outcomes)
+    cad_in_gate = _frame_in_gate(cad_frame, prop, radius_mi)
+    jina_frame, jina_label, jina_err = [], "Zillow (reader)", None
+    if rapi_in_gate + cad_in_gate < RAPIDAPI_UNION_RICH:
+        try:
+            jina_frame, jina_label, jina_err = _jina_zillow_sold_frame(prop, radius_mi, past_days)
+        except Exception as _jina_boom:
+            jina_frame, jina_err = [], _jina_boom
+        if jina_err is not None:
+            app.logger.warning(f"comp pull: jina-Zillow sold frame failed for {addr_line}: {jina_err!r}")
+        elif jina_frame is not None and len(jina_frame):
+            app.logger.warning(f"comp pull: jina-Zillow sold frame for {addr_line}: "
+                               f"served {len(jina_frame)} rows")
     # --- sold frames: centered (3-yr horizon) UNION ZIP area (requested window) ---
     sold_frames = []
     frame_sources = {}
@@ -3984,6 +4577,8 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     for _rapi_df, _rapi_lbl in rapi_frames:
         sold_frames.append(_rapi_df); frame_sources[id(_rapi_df)] = _rapi_lbl
         rapi_ids.add(id(_rapi_df))
+    if jina_frame is not None and len(jina_frame):
+        sold_frames.append(jina_frame); frame_sources[id(jina_frame)] = jina_label
     centered, err_c = _scrape(location=addr_line, listing_type="sold",
                               past_days=max(past_days, 1095), radius=radius_mi)
     if centered is not None: sold_frames.append(centered)
@@ -4210,11 +4805,11 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                          ("year_built", "year_built"), ("lot_sqft", "lot_sqft"), ("property_type", "style")):
             if not prop[col]:
                 v = fnum(srow.get(key))
-                if v: fills[col] = int(v) if col == "year_built" else v
+                if v and _sane_subject_fill(col, v): fills[col] = int(v) if col == "year_built" else v
                 elif key == "style" and _s(srow.get("style")): fills[col] = _s(srow.get("style"))
-        if not prop["list_price"] and fnum(srow.get("list_price")):
+        if not prop["list_price"] and fnum(srow.get("list_price")) and _sane_subject_fill("list_price", fnum(srow.get("list_price"))):
             fills["list_price"] = fnum(srow.get("list_price"))
-        if not prop["est_realtor"] and fnum(srow.get("estimated_value")):
+        if not prop["est_realtor"] and fnum(srow.get("estimated_value")) and _sane_subject_fill("est_realtor", fnum(srow.get("estimated_value"))):
             fills["est_realtor"] = fnum(srow.get("estimated_value")); fills["est_date"] = today
         if fills:
             d.execute(f"UPDATE properties SET {','.join(k+'=?' for k in fills)} WHERE id=?",
@@ -4238,6 +4833,19 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             warnings[:] = [w for w in warnings if "could not be auto-filled" not in w]
             warnings.append(label)
         _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
+        if _still_lacks(_prop_now):
+            # v58: Things4u detail FIRST — the Realtor.com record is
+            # the freshest subject source that answers from this host;
+            # private-zillow is the last resort (its provider is down).
+            try:
+                _tf = _things4u_subject_fill(d, _prop_now, today)
+            except Exception as _te:
+                app.logger.warning(f"comp pull: Things4u subject detail raised for "
+                                   f"{addr_line}: {_te!r}")
+                _tf = None
+            if _tf:
+                _note_zfill(_tf, "subject specs filled from Realtor.com via RapidAPI (Things4u)")
+            _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
         if _still_lacks(_prop_now):
             try:
                 _zf = _zillow_subject_fill(d, _prop_now, today)
@@ -4310,7 +4918,12 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     # rental set is thin (<11 stored or <5 exact/near matches), run ONE widened
     # rental scrape (2x radius, min 2 mi; past_days 365). Widening only ADDS
     # real listings — views never pad with mismatches. ---
-    prop2 = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
+    # v58: prop2 is a plain dict (not a sqlite Row) — the Things4u /
+    # jina adapters read prop.get("city"), which a Row does not have,
+    # and the widened frame silently died on it (the v58 gate caught
+    # exactly that: widening reported "scrape failed" with S639
+    # unstored).
+    prop2 = dict(d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone())
     subj2 = {"sqft": prop2["sqft"], "beds": prop2["beds"], "baths": prop2["baths"],
              "year_built": prop2["year_built"], "lot_sqft": prop2["lot_sqft"]}
     def _tier1_count(win_days=None):
@@ -5910,11 +6523,15 @@ def import_houseable_prospects(path=None):
 # ---------------------------------------------------------------- async jobs (v1.2: never silent)
 def _job_conn():
     c = sqlite3.connect(DB_PATH, timeout=30); c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL"); return c
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=30000")  # v58: same transient-lock guard as db()
+    return c
 
 def start_job(pid, kind, fn):
     """Record a job row and run fn in a background thread. fn returns a success message string.
-    Any exception becomes a visible, plain-English job error on the property — never a bare 500."""
+    Any exception becomes a visible, plain-English job error on the property — never a bare 500.
+    v58: one retry after 2s when fn dies with sqlite3.OperationalError (the pull is
+    idempotent — merges are upserts — so a re-run after a transient disk/lock error is safe)."""
     now = datetime.datetime.now().isoformat(timespec="seconds")
     c = _job_conn()
     cur = c.execute("INSERT INTO jobs(property_id,kind,status,started_at) VALUES(?,?,'running',?)", (pid, kind, now))
@@ -5922,7 +6539,11 @@ def start_job(pid, kind, fn):
     def _run():
         try:
             with app.app_context():
-                msg = fn()
+                try:
+                    msg = fn()
+                except sqlite3.OperationalError:
+                    time.sleep(2)
+                    msg = fn()
             c2 = _job_conn()
             c2.execute("UPDATE jobs SET status='done', finished_at=?, message=? WHERE id=?",
                        (datetime.datetime.now().isoformat(timespec="seconds"), msg, jid)); c2.commit(); c2.close()
