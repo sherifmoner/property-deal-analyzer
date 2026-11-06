@@ -22,7 +22,7 @@ app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 # code with no way to tell (the log lacked the v58.1 first-row-keys
 # line, the pool read 0 in-gate) and the worker died mid-pull; the tag
 # makes the live code visible.
-BUILD_TAG = "v60"
+BUILD_TAG = "v61"
 
 
 @app.after_request
@@ -431,10 +431,52 @@ def arv_reconciliation(prop, comps, bulk_keys=None):
                     f"(${round(avg_ppsf,2)}/sqft x {int(prop['sqft'])} sqft = ${round(ppsf_value):,}), "
                     f"over {basis}. Source: HomeHarvest sold data, pulled {datetime.date.today().isoformat()}."}
 
-def verdict(prop, comps, boxes, bulk_keys=None):
-    """Sticky verdict: score + confidence + MAO + buy-box PASS/FAIL."""
+def _panel_saved_inp(d, pid):
+    """v61: the saved UW inputs the Overview verdict resolves its ARV
+    from. Candidates: every autosave draft (newest first by updated_at),
+    then every scenario (newest first by id) — a draft is the live
+    working state, a scenario a snapshot. The first candidate carrying
+    the arv_manual flag wins (an unflagged candidate never expressed an
+    ARV intent, so a flagged one outranks it regardless of source); if
+    none is flagged, the newest candidate overall (its saved ARV is only
+    _resolve_arv's no-rec fallback); if there are none, None."""
+    cands = []
+    try:
+        for r in d.execute("SELECT state FROM uw_drafts WHERE property_id=? ORDER BY updated_at DESC", (pid,)):
+            try:
+                inp = json.loads(r["state"] or "{}")
+            except Exception:
+                continue
+            if isinstance(inp, dict):
+                cands.append(inp)
+    except Exception:
+        pass
+    try:
+        for r in d.execute("SELECT inputs FROM scenarios WHERE property_id=? ORDER BY id DESC", (pid,)):
+            try:
+                inp = json.loads(r["inputs"] or "{}")
+            except Exception:
+                continue
+            if isinstance(inp, dict):
+                cands.append(inp)
+    except Exception:
+        pass
+    for inp in cands:
+        if inp.get("arv_manual") in (1, True, "1", "true", 1.0):
+            return inp
+    return cands[0] if cands else None
+
+
+def verdict(prop, comps, boxes, bulk_keys=None, saved_inp=None):
+    """Sticky verdict: score + confidence + MAO + buy-box PASS/FAIL.
+    v61: the ARV resolves through the SAME _resolve_arv precedence as
+    the underwriting panel (v60) — prop.arv > manual saved ARV (the
+    arv_manual flag) > live rec > saved input — so a panel-typed ARV
+    drives the Overview MAO (and the score spread, which reads the same
+    ARV). With no manual ARV the resolution reduces to the old
+    prop.arv-or-rec behavior. The MAO math itself is unchanged."""
     rec = arv_reconciliation(prop, comps, bulk_keys)
-    arv = prop["arv"] or rec["arv"]
+    arv, _arv_src = _resolve_arv(prop, saved_inp, rec["arv"])
     repairs = prop["repairs"] or 0
     price = prop["purchase_price"] or prop["list_price"]
     mao = round(arv * 0.70 - repairs) if arv else None
@@ -948,7 +990,13 @@ def _norm_funding(f):
         f[k] = fnum(f.get(k), 0) or 0
     if not f.get("payment_type"):
         a_months = _eff_months(f)  # v3.1: inference keys on the EFFECTIVE term (Amort else Loan)
-        f["payment_type"] = "fixed" if fnum(f.get("fixed_payment"), 0) else ("amortized" if a_months else "interest_only")
+        # v61: a stored fixed_payment NEVER selects the type. The old leg
+        # ("fixed" if a fixed_payment is stored) silently re-typed any card
+        # saved without a payment_type — a stale Fixed Payment on an
+        # Amortized card (Glynlea: 22223) hijacked its payment at load.
+        # Fixed applies only when the card's type IS Fixed (stated on the
+        # card; Subject-To / dialog cards set it explicitly).
+        f["payment_type"] = "amortized" if a_months else "interest_only"
     if f.get("fixed_payment") in (None, ""):
         f["fixed_payment"] = ""
     return f
@@ -6940,7 +6988,7 @@ def property_page(pid):
     contractors = d.execute("SELECT * FROM contractors ORDER BY trade, name").fetchall()
     scenarios = d.execute("SELECT * FROM scenarios WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
     plans = d.execute("SELECT * FROM floorplans WHERE property_id=? ORDER BY id DESC", (pid,)).fetchall()
-    v = verdict(p, comps, all_boxes(), _bulk_keys)
+    v = verdict(p, comps, all_boxes(), _bulk_keys, _panel_saved_inp(d, pid))
     # v1.8a score reconciliation: displayed scenario scores are recomputed with
     # the CURRENT engine from the stored inputs, so the scenarios table can
     # never drift from the live rail. The stored `results` are a snapshot of
@@ -7627,10 +7675,17 @@ def comp_action(cid, action):
                 rent_all = [x for x in rent_all
                             if x["distance_mi"] is None or x["distance_mi"] <= _rmax]
             rec = arv_reconciliation(p, allc)
+            # v61: the returned MAO resolves its ARV exactly like the
+            # Overview verdict (a manual panel ARV wins) so a pin click
+            # can never snap the displayed MAO back to the comp figure
+            # while a manual ARV is set. "arv" stays the rec — the
+            # template labels that stat "Reconciled ARV (from these
+            # comps)".
+            _pin_arv, _ = _resolve_arv(p, _panel_saved_inp(db(), pid), rec["arv"])
             return jsonify({"pinned": nc["pinned"], "kind": c["kind"],
                             "sold_stats": pinned_sold_stats(sold_all), "ltr": ltr_stats(rent_all),
                             "arv": rec["arv"], "arv_note": rec["note"],
-                            "mao": round(rec["arv"] * 0.70 - (p["repairs"] or 0)) if rec["arv"] else None})
+                            "mao": round(_pin_arv * 0.70 - (p["repairs"] or 0)) if _pin_arv else None})
         flash(f"{'📌 Pinned' if nc['pinned'] else 'Unpinned'}: {c['address']} — header averages and ARV now use the pinned set.", "ok")
     elif action == "exclude": db().execute("UPDATE comps SET excluded=1-excluded WHERE id=?", (cid,))
     elif action == "adjust":

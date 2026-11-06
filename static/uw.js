@@ -728,7 +728,7 @@
           var ufb = el("div", "f-pt f-pt-fixed" + (d.dataset.ptype === "fixed" ? " on" : ""));
           ufb.dataset.pt = "fixed";
           ufb.appendChild(el("span", "", pt[1]));
-          var ufx = numInput("f-fixed", f.fixed_payment); ufx.placeholder = "$/mo";
+          var ufx = numInput("f-fixed", f.fixed_payment); ufx.placeholder = "$/mo"; ufx.disabled = d.dataset.ptype !== "fixed";
           ufb.appendChild(ufx);
           useg.appendChild(ufb);
         } else {
@@ -798,7 +798,7 @@
         var fb = el("div", "f-pt f-pt-fixed" + (d.dataset.ptype === "fixed" ? " on" : ""));
         fb.dataset.pt = "fixed";
         fb.appendChild(el("span", "", pt[1]));
-        var fx = numInput("f-fixed", f.fixed_payment); fx.placeholder = "$/mo";
+        var fx = numInput("f-fixed", f.fixed_payment); fx.placeholder = "$/mo"; fx.disabled = d.dataset.ptype !== "fixed";
         fb.appendChild(fx);
         seg.appendChild(fb);
       } else {
@@ -812,6 +812,15 @@
     d.appendChild(pay);
     return d;
   }
+  function fixedPaymentOf(d) {
+    /* v61: a stored Fixed Payment applies ONLY when the card's payment
+       type is Fixed. On any other type the box is inert and reads as
+       blank, so a stale value can neither price the card nor round-trip
+       into the autosaved draft. */
+    if ((d.dataset.ptype || "amortized") !== "fixed") return "";
+    var e = d.querySelector(".f-fixed");
+    return (e && e.value !== "") ? N(e.value) : "";
+  }
   function readCard(d) {
     /* v2.8 (A8): variant cards read only the fields they render. */
     if (d.dataset.cardkind === "amount") {
@@ -821,7 +830,6 @@
     if (d.dataset.cardkind === "assump") {
       var utv = d.querySelector(".f-termval").value;
       var utu = d.querySelector(".f-termunit").value;
-      var ufx2 = d.querySelector(".f-fixed");
       return { kind: "assump", type: d.dataset.type, preset: d.dataset.preset || d.dataset.type,
         loan_type: d.dataset.type, position: d.querySelector(".f-pos").value,
         amount: N(d.querySelector(".f-amt").value), rate: N(d.querySelector(".f-rate").value),
@@ -832,7 +840,7 @@
         amort_value: utv === "" ? "" : N(utv), amort_unit: utu,
         points: N(d.querySelector(".f-points").value), fees: N(d.querySelector(".f-fees").value),
         payment_type: d.dataset.ptype || "amortized",
-        fixed_payment: (ufx2 && ufx2.value !== "") ? N(ufx2.value) : "",
+        fixed_payment: fixedPaymentOf(d),
         taxes_mo: 0, insurance_mo: 0 };
     }
     var tv = d.querySelector(".f-termval").value;
@@ -849,7 +857,7 @@
       amort_value: av === "" ? "" : N(av), amort_unit: d.querySelector(".f-amortunit").value,
       points: N(d.querySelector(".f-points").value), fees: N(d.querySelector(".f-fees").value),
       payment_type: d.dataset.ptype || "amortized",
-      fixed_payment: d.querySelector(".f-fixed").value === "" ? "" : N(d.querySelector(".f-fixed").value),
+      fixed_payment: fixedPaymentOf(d),
       taxes_mo: N(d.querySelector(".f-taxes").value), insurance_mo: N(d.querySelector(".f-ins").value) };
   }
   function roomRow(r, idx) {
@@ -1767,7 +1775,11 @@
     cardEl.dataset.ptype = pt;
     cardEl.querySelectorAll(".f-pt").forEach(function (b) { b.classList.toggle("on", b.dataset.pt === pt); });
     /* v2.3: the fixed-amount box lives INSIDE the Fixed segment (ReiSearch) —
-       always visible, no show/hide. */
+       always visible, no show/hide.
+       v61: the box is INERT unless Fixed is the selected type — visible
+       but disabled, and readCard ignores it there (fixedPaymentOf). */
+    var fx = cardEl.querySelector(".f-fixed");
+    if (fx) fx.disabled = pt !== "fixed";
   }
   function subjectToCard(panel) {
     var pl = UW.propLoan || {};
@@ -2033,6 +2045,8 @@
           var cardEl = pt.closest(".fcard");
           cardEl.dataset.ptype = pt.dataset.pt;
           cardEl.querySelectorAll(".f-pt").forEach(function (b) { b.classList.toggle("on", b === pt); });
+          var pfx = cardEl.querySelector(".f-fixed");
+          if (pfx) pfx.disabled = pt.dataset.pt !== "fixed"; /* v61: box inert off Fixed */
           recalc(panel); return;
         }
         var fu = t.closest ? t.closest(".fu") : null;
