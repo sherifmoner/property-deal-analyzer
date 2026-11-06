@@ -2804,7 +2804,7 @@ _HH_FRAME_COLS = ("street", "city", "zip_code", "sold_price", "list_price", "sqf
                   "beds", "full_baths", "year_built", "last_sold_date", "days_on_mls",
                   "latitude", "longitude", "lot_sqft", "style", "property_type",
                   "property_url", "primary_photo", "alt_photos", "estimated_value",
-                  "price_per_sqft")
+                  "price_per_sqft", "property_id")
 
 def _hh_frame(rows):
     """Normalized row dicts -> a DataFrame carrying the standard
@@ -3224,11 +3224,98 @@ def _rapi_rows_multi(items, fn):
 # verified 2026-11-06 (research/things4u-api-facts-2026-11-06.md): both
 # serve the same Realtor.com data over GET properties/search-sold AND
 # properties/search-rent. Realty US (500/mo) is asked first; Realtor
-# Search (150/mo) is the failover for the same data. The envelope was
-# NOT captured in the playground (only the rows were), so the
-# normalizer tries the documented Realtor-v3 shapes in order and logs
-# the live top-level keys on first use — a shape mismatch degrades to
-# "didn't serve" and is diagnosable from the PA error log.
+# Search (150/mo) is the failover for the same data. The envelope and
+# row shape were CAPTURED verbatim in the playground 2026-11-06
+# (research/things4u-api-facts-2026-11-06.md): list at data.results;
+# coords at location.address.coordinate {lat, lon}; specs in
+# description.*; sold price last_sold_price; year built ONLY as
+# "Year Built: NNNN" text inside details[]. The converter reads that
+# shape FIRST and falls back to the flat Realtor-v3 keys v58 used
+# (tolerance for host drift + gate_rapidapi's flat fake), and logs the
+# live top-level keys on first use.
+_YEAR_BUILT_RE = re.compile(r"Year Built:\s*(\d{4})")
+
+
+def _things4u_year_built_from_details(details):
+    """Year built out of a Things4u details[] list (v58.1): each entry
+    is {text: [...], category: "..."} and the year lives ONLY as text
+    ("Year Built: 1940" under "Building and Construction"). Bare
+    strings are searched too. None when absent or malformed — never
+    invented."""
+    texts = []
+    if isinstance(details, list):
+        for d in details:
+            if isinstance(d, dict):
+                t = d.get("text")
+                if isinstance(t, list): texts.extend(str(x) for x in t)
+                elif isinstance(t, str): texts.append(t)
+            elif isinstance(d, str):
+                texts.append(d)
+    elif isinstance(details, dict):
+        for v in details.values():
+            if isinstance(v, str): texts.append(v)
+            elif isinstance(v, list): texts.extend(str(x) for x in v)
+    for s in texts:
+        m = _YEAR_BUILT_RE.search(s or "")
+        if m:
+            try: return int(m.group(1))
+            except ValueError: continue
+    return None
+
+
+def _things4u_fields(item):
+    """The canonical fields out of ONE Things4u search-row item (v58.1,
+    captured shape first, flat fallbacks second). Shared by the sold /
+    rent normalizer and the detail parser so both read the same shape.
+    Pure; never raises on a malformed item (callers skip via _rapi_rows)."""
+    if not isinstance(item, dict): return {}
+    loc = item.get("location") if isinstance(item.get("location"), dict) else {}
+    addr = loc.get("address") if isinstance(loc.get("address"), dict) else {}
+    desc = item.get("description") if isinstance(item.get("description"), dict) else {}
+    coord = addr.get("coordinate") if isinstance(addr.get("coordinate"), dict) else {}
+    if not coord and isinstance(loc.get("coordinate"), dict):
+        coord = loc["coordinate"]
+    def _pick(*keys):
+        for k in keys:
+            v = item.get(k)
+            if v is not None: return v
+        return None
+    def _dpick(*keys):
+        for k in keys:
+            v = desc.get(k)
+            if v is not None: return v
+        return None
+    lat = _sabri_num(coord.get("lat")) if coord.get("lat") is not None else None
+    lon = _sabri_num(coord.get("lon")) if coord.get("lon") is not None else None
+    if lat is None: lat = _sabri_num(_pick("latitude", "lat"))
+    if lon is None: lon = _sabri_num(_pick("longitude", "lon"))
+    photo, alts = _rapi_photos(item)
+    if photo is None:
+        photo = _s(_pick("primary_photo_url", "primary_photo")) or None
+        alts = [photo] if photo else []
+    yb = _things4u_year_built_from_details(item.get("details"))
+    if yb is None:
+        yb = _sabri_num(_pick("year_built"))
+    return dict(street=_s(addr.get("line")) or _s(_pick("address_line", "address")),
+                city=_s(addr.get("city")) or _s(_pick("city")),
+                zip_code=_s(addr.get("postal_code")) or _s(_pick("zip_code", "zip")),
+                state=_s(addr.get("state_code")) or _s(_pick("state")),
+                sold_price=_sabri_num(_pick("last_sold_price", "sold_price")),
+                list_price=_sabri_num(_pick("list_price")),
+                sqft=_sabri_num(_dpick("sqft") if _dpick("sqft") is not None else _pick("sqft", "livingArea")),
+                beds=_sabri_num(_dpick("beds") if _dpick("beds") is not None else _pick("beds", "bedrooms")),
+                full_baths=_sabri_num(_dpick("baths") if _dpick("baths") is not None else _pick("baths", "bathrooms")),
+                year_built=int(yb) if yb else None,
+                lot_sqft=_sabri_num(_dpick("lot_sqft") if _dpick("lot_sqft") is not None else _pick("lot_sqft", "lotSize")),
+                last_sold_date=_s(_pick("last_sold_date"))[:10] or None,
+                days_on_mls=None,
+                latitude=lat, longitude=lon,
+                style=_s(_dpick("type")) or _s(_pick("property_type", "style")),
+                property_type=_s(_dpick("type")) or _s(_pick("property_type", "style")),
+                property_url=_s(_pick("href", "property_url")) or None,
+                primary_photo=photo, alt_photos=alts,
+                property_id=_s(_pick("property_id")) or None,
+                estimated_value=None, price_per_sqft=None)
 def _things4u_results(data):
     """The result list out of a Things4u search payload: data.results
     first (the shape the hunt report implies), then the other
@@ -3243,39 +3330,24 @@ def _things4u_results(data):
     return []
 
 def _things4u_item_to_row(item, rent=False):
-    """One Things4u search item -> the standard HomeHarvest columns.
-    The item is FLAT (playground-verified 2026-11-06): address_line,
-    last_sold_price, latitude/longitude, beds/baths/sqft/year_built,
-    zip_code, city, state, primary_photo_url. Specs fall back to a
-    nested description.* object when a flat key is absent. Sold price
-    comes ONLY from last_sold_price; a rent row's price is list_price
-    (sold_price stays None — the rent gate reads list_price)."""
-    desc = item.get("description") if isinstance(item.get("description"), dict) else {}
-    def _pick(*keys):
-        for k in keys:
-            v = item.get(k)
-            if v is not None: return v
-        for k in keys:
-            v = desc.get(k)
-            if v is not None: return v
-        return None
-    photo = _s(_pick("primary_photo_url", "primary_photo"))
-    return dict(street=_s(_pick("address_line", "address")),
-                city=_s(_pick("city")), zip_code=_s(_pick("zip_code", "zip")),
-                sold_price=None if rent else _sabri_num(_pick("last_sold_price", "sold_price")),
-                list_price=_sabri_num(_pick("list_price")),
-                sqft=_sabri_num(_pick("sqft", "livingArea")),
-                beds=_sabri_num(_pick("beds", "bedrooms")),
-                full_baths=_sabri_num(_pick("baths", "bathrooms")),
-                year_built=_sabri_num(_pick("year_built")),
-                lot_sqft=_sabri_num(_pick("lot_sqft", "lotSize")),
-                last_sold_date=_s(_pick("last_sold_date"))[:10] or None,
-                days_on_mls=None,
-                latitude=_sabri_num(_pick("latitude", "lat")),
-                longitude=_sabri_num(_pick("longitude", "lon")),
-                style=_s(_pick("property_type")), property_type=_s(_pick("property_type")),
-                property_url=_s(_pick("property_url")) or None,
-                primary_photo=photo or None, alt_photos=[photo] if photo else [],
+    """One Things4u search item -> the standard HomeHarvest columns
+    (v58.1: captured shape via _things4u_fields). Sold price comes
+    ONLY from last_sold_price; a rent row's price is list_price
+    (sold_price stays None — the rent gate reads list_price).
+    property_id travels with the row so the subject-detail ladder can
+    call /properties/detail with the subject's own id."""
+    f = _things4u_fields(item)
+    return dict(street=f["street"], city=f["city"], zip_code=f["zip_code"],
+                sold_price=None if rent else f["sold_price"],
+                list_price=f["list_price"],
+                sqft=f["sqft"], beds=f["beds"], full_baths=f["full_baths"],
+                year_built=f["year_built"], lot_sqft=f["lot_sqft"],
+                last_sold_date=f["last_sold_date"], days_on_mls=None,
+                latitude=f["latitude"], longitude=f["longitude"],
+                style=f["style"], property_type=f["property_type"],
+                property_url=f["property_url"],
+                primary_photo=f["primary_photo"], alt_photos=f["alt_photos"],
+                property_id=f["property_id"],
                 estimated_value=None, price_per_sqft=None)
 
 def _things4u_search(host, path, prop, rent=False):
@@ -3300,6 +3372,10 @@ def _things4u_search(host, path, prop, rent=False):
         if page == 1:
             keys = sorted(data.keys()) if isinstance(data, dict) else []
             app.logger.warning(f"comp pull: Things4u {path} top-level keys: {keys}")
+            _items0 = _things4u_results(data)
+            if _items0 and isinstance(_items0[0], dict):
+                app.logger.warning(f"comp pull: Things4u {path} first-row keys: "
+                                   f"{sorted(_items0[0].keys())}")
         items = _things4u_results(data)
         total = _rapi_dig(data, "data", "total")
         rows.extend(_rapi_rows(items, lambda it: _things4u_item_to_row(it, rent=rent)))
@@ -3655,86 +3731,58 @@ def _sane_subject_fill(col, v):
 def _things4u_detail_values(payload):
     """One Things4u detail payload -> candidate subject fill values
     (pure; no I/O). The detail object sits at data (or is the payload
-    itself); fields are the flat Realtor-v3 names the hunt verified
-    (bedrooms / bathrooms / livingArea / yearBuilt / lotSize /
-    zestimate / latitude / longitude / photos). livingArea null is
-    sqft None — never 0, never 1, never invented."""
+    itself) and is read through the SAME field extraction as a search
+    row (v58.1): description.beds/baths/sqft/lot_sqft,
+    location.address.* (line/city/postal_code/coordinate), prices
+    last_sold_price/list_price, primary_photo/photos, details[] Year
+    Built text. The detail payload's exact key list was NOT captured
+    live (the shape capture spent its one detail call on an
+    auto-complete id and got 400) — the caller logs the payload's
+    top-level keys on first use, and an empty/unparseable payload is
+    an honest {} (never a shape error). livingArea null is sqft None
+    — never 0, never 1, never invented."""
     if not isinstance(payload, dict): return {}
     det = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    if not isinstance(det, dict): return {}
-    photos = []
-    for ph in det.get("photos") or []:
-        u = ph.get("href") if isinstance(ph, dict) else (ph if isinstance(ph, str) else None)
-        if u and _s(u).startswith("http") and _s(u) not in photos: photos.append(_s(u))
-    pp = det.get("primary_photo")
-    first = pp.get("href") if isinstance(pp, dict) else (pp if isinstance(pp, str) else None)
-    if first and _s(first).startswith("http") and _s(first) not in photos:
-        photos.insert(0, _s(first))
-    yb = _sabri_num(det.get("yearBuilt"))
-    return {"beds": _sabri_num(det.get("bedrooms")),
-            "baths": _sabri_num(det.get("bathrooms")),
-            "sqft": _sabri_num(det.get("livingArea")),
-            "year_built": int(yb) if yb else None,
-            "lot_sqft": _sabri_num(det.get("lotSize")),
-            "lat": _sabri_num(det.get("latitude")), "lon": _sabri_num(det.get("longitude")),
-            "photos": photos,
-            "list_price": _sabri_num(det.get("list_price")),
-            "zestimate": _sabri_num(det.get("zestimate")),
-            "city": _s(det.get("city")),
-            "zip": _s(det.get("zip_code")) or _s(det.get("zipcode"))}
+    if not isinstance(det, dict) or not det: return {}
+    f = _things4u_fields(det)
+    zest = _sabri_num(det.get("zestimate"))
+    if zest is None and isinstance(det.get("estimate"), (int, float)):
+        zest = _sabri_num(det.get("estimate"))
+    return {"beds": f["beds"], "baths": f["full_baths"], "sqft": f["sqft"],
+            "year_built": f["year_built"], "lot_sqft": f["lot_sqft"],
+            "lat": f["latitude"], "lon": f["longitude"],
+            "photos": list(f["alt_photos"] or []),
+            "list_price": f["list_price"], "zestimate": zest,
+            "city": f["city"], "zip": f["zip_code"]}
 
-def _things4u_autocomplete_id(data):
-    """The property id out of a Things4u auto-complete payload: the
-    autocomplete list's first row carrying an 'id', preferring a row
-    whose area_type/type reads 'address'. Recursive fallback: any 'id'
-    anywhere in the payload (the shape was not captured in the
-    playground). None when nothing carries one."""
-    cands = _rapi_dig(data, "data", "autocomplete")
-    if not isinstance(cands, list):
-        cands = data.get("autocomplete") if isinstance(data, dict) else None
-    if isinstance(cands, list):
-        for row in cands:
-            if isinstance(row, dict) and row.get("id") is not None:
-                t = str(row.get("area_type") or row.get("type") or "").lower()
-                if t in ("address", "property", ""): return str(row["id"])
-        for row in cands:
-            if isinstance(row, dict) and row.get("id") is not None:
-                return str(row["id"])
-    def _find(o):
-        if isinstance(o, dict):
-            if o.get("id") is not None: return o["id"]
-            for v in o.values():
-                r = _find(v)
-                if r is not None: return r
-        elif isinstance(o, list):
-            for v in o:
-                r = _find(v)
-                if r is not None: return r
-        return None
-    z = _find(data)
-    return str(z) if z is not None else None
-
-def _things4u_subject_fill(d, prop, today):
-    """The Things4u subject detail fill (v58): auto-complete the
-    subject's address to a property id, then ONE detail call, filling
-    the subject's BLANK specs from the Realtor.com record. Realty US
-    first, Realtor Search second (same data — the second fires only
-    if the first did not serve). Blank-fill ONLY, sanity-guarded per
+def _things4u_subject_fill(d, prop, today, property_id=None):
+    """The Things4u subject detail fill (v58.1): ONE detail call per
+    host with the subject's NUMERIC property_id, taken from the
+    subject's own search-row in the pull's frames (passed in by the
+    caller — the frame row carries it via the property_id frame
+    column). Auto-complete is NOT used here: it returns areas/streets
+    only, and its ids ("postal_code:…", "street:…") are rejected by
+    /properties/detail with 400 PROPERTY_ID_VALIDATION_ERROR
+    ("propertyId must be a number", captured 2026-11-06). A missing or
+    non-numeric id is an honest None with no request at all — the
+    frame-row fill stands alone. Blank-fill ONLY, sanity-guarded per
     field; the Zestimate-shaped price lands in est_realtor, never
-    list_price. Returns the fill summary or None. The auto-complete /
-    detail envelope was not captured in the playground — the id is
-    searched defensively and the detail object is read through
-    _things4u_detail_values; a shape surprise is an honest None,
-    logged."""
+    list_price. Returns the fill summary or None. Realty US first,
+    Realtor Search second (same data — the second fires only if the
+    first did not serve)."""
     if not _rapidapi_key(): return None
+    pid = str(property_id).strip() if property_id is not None else ""
+    if not pid or not pid.isdigit():
+        app.logger.warning(f"comp pull: Things4u subject detail for {prop['address']}: "
+                           "no numeric property_id from the subject's search row — "
+                           "detail skipped (auto-complete ids are not propertyIds)")
+        return None
     for host in (RAPIDAPI_T4U_US_HOST, RAPIDAPI_T4U_RS_HOST):
-        data, err = _rapidapi_get(host, "/properties/auto-complete",
-                                  {"query": prop["address"]})
-        if err is not None or data is None: continue
-        pid = _things4u_autocomplete_id(data)
-        if not pid: continue
-        det, derr = _rapidapi_get(host, "/properties/detail", {"property_id": pid})
+        det, derr = _rapidapi_get(host, "/properties/detail", {"propertyId": pid})
         if derr is not None or det is None: continue
+        if isinstance(det, dict):
+            app.logger.warning(f"comp pull: Things4u detail payload top-level keys: "
+                               f"{sorted(det.keys())}")
         v = _things4u_detail_values(det)
         if not v: continue
         if v["city"] and prop["city"] and v["city"].strip().lower() != prop["city"].strip().lower():
@@ -4837,8 +4885,16 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             # v58: Things4u detail FIRST — the Realtor.com record is
             # the freshest subject source that answers from this host;
             # private-zillow is the last resort (its provider is down).
+            # v58.1: the detail id comes from the subject's own row in
+            # the pull's frames (property_id column) — never from
+            # auto-complete, whose ids are not propertyIds.
             try:
-                _tf = _things4u_subject_fill(d, _prop_now, today)
+                _spid = None
+                try:
+                    _spid = srow.get("property_id") if srow is not None else None
+                except Exception:
+                    _spid = None
+                _tf = _things4u_subject_fill(d, _prop_now, today, property_id=_spid)
             except Exception as _te:
                 app.logger.warning(f"comp pull: Things4u subject detail raised for "
                                    f"{addr_line}: {_te!r}")
