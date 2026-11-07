@@ -22,7 +22,7 @@ app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 # code with no way to tell (the log lacked the v58.1 first-row-keys
 # line, the pool read 0 in-gate) and the worker died mid-pull; the tag
 # makes the live code visible.
-BUILD_TAG = "v66"
+BUILD_TAG = "v67"
 
 
 @app.after_request
@@ -759,18 +759,75 @@ def _padsplit_parse(html_text):
 def _padsplit_parse_markdown(md_text):
     """PadSplit search markdown (the jina-reader form) -> the same
     {"cards": [...], "count": n, "total_pages": 1} shape as
-    _padsplit_parse. One card per 'Room for rent — $N per week — ...'
-    line; the title/count lines ('415 Rooms for Rent ... from $156
-    per week') are NOT listing lines and are never counted — the
-    'Room for rent' (singular) prefix is the discriminator.
-    Availability is unknowable from the reader markdown, so every card
-    counts as available (the benchmark median uses all rents either
-    way). Identical (rent, label) pairs dedupe within the page."""
+    _padsplit_parse. Three shapes, all read off real captures:
+    Shape A (current, 2026-11-07): a card link line
+    '[[$XXX] From $N /week ### <title> ...' — the 'From $N' is the
+    advertised lowest room price; a preceding $XXX is the
+    struck-through original and is NEVER the rent. ZIP p1 carries 4
+    ($236/$276/$177/$192, median $214 — the same set the direct-HTML
+    parse produced, so the two paths cross-validate exactly); the
+    city page carries 20. Shape B (current, 2026-11-07): a carousel
+    image-link line '[![Image NN](...psproperty/...) <badges> $N per
+    week <title>]' or '... $AAA$BBB <title>]' — two adjacent dollars
+    mean FIRST = current/from price, SECOND = struck-through
+    original (proven by the property-39576 cross-check: city Shape A
+    says '[$173 From $165 /week' for "Fully Renovated • First to Live
+    Here", ZIP p2 Shape B says '$165$173' for the same title). Shape
+    L (legacy, v58, 2026-11-06 capture): 'Room for rent — $N per
+    week — ...' — kept so gate_v58's fixture still parses.
+    NEVER counted: the Title line, the '## There is/are N room(s)
+    starting at $N per week.' summary heading (it DUPLICATES a card's
+    rent), prose lines ('Room rentals ... start at $151 per week',
+    'median 1 bedroom ... $1,647 per month'), map-marker lines
+    ('![Image NNN: $151+]' + bare '$NNN+' — one per card, echoing
+    the same rents), footer referral lines ($250 / $1,000).
+    Availability is unknowable from the reader markdown, so every
+    card counts as available (the benchmark median uses all rents
+    either way). Identical (rent, label) pairs dedupe within the page."""
     out = {"cards": [], "count": 0, "total_pages": 1}
     if not md_text: return out
     seen = set()
+
+    def _add(rent, label):
+        if rent is None or rent <= 0: return
+        key = (rent, label)
+        if key in seen: return
+        seen.add(key)
+        out["cards"].append({"rent": rent, "available": True, "label": label})
+
     for line in md_text.splitlines():
         s = line.strip()
+        # Shape A: card link line — 'From $N /week' is the rent.
+        if s.startswith("["):
+            m = re.search(r"From\s+\$([\d,]+)\s*/week", s)
+            if m:
+                try:
+                    rent = float(m.group(1).replace(",", ""))
+                except ValueError:
+                    rent = None
+                label = ""
+                if "###" in s:
+                    label = s.split("###", 1)[1]
+                    label = label.split("![", 1)[0].split("](", 1)[0].strip()
+                _add(rent, label)
+                continue
+        # Shape B: carousel image-link line — strip the image tokens,
+        # then read the price from the remaining link text.
+        if s.startswith("[![Image"):
+            tail = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", s)
+            m = re.search(r"\$([\d,]+)\s+per week", tail)
+            if not m:
+                # Two adjacent dollars: first = current/from price.
+                m = re.search(r"\$([\d,]+)\$([\d,]+)", tail)
+            if m:
+                try:
+                    rent = float(m.group(1).replace(",", ""))
+                except ValueError:
+                    rent = None
+                label = tail[m.end():].split("](", 1)[0].strip()
+                _add(rent, label)
+                continue
+        # Shape L (legacy v58): 'Room for rent — $N per week — ...'
         if not s.lower().startswith("room for rent"): continue
         m = re.search(r"\$([\d,]+)\s+per week", s)
         if not m: continue
@@ -778,12 +835,8 @@ def _padsplit_parse_markdown(md_text):
             rent = float(m.group(1).replace(",", ""))
         except ValueError:
             continue
-        if rent <= 0: continue
         label = s[m.end():].strip(" —-").strip()
-        key = (rent, label)
-        if key in seen: continue
-        seen.add(key)
-        out["cards"].append({"rent": rent, "available": True, "label": label})
+        _add(rent, label)
     out["count"] = len(out["cards"])
     return out
 
