@@ -22,7 +22,7 @@ app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 # code with no way to tell (the log lacked the v58.1 first-row-keys
 # line, the pool read 0 in-gate) and the worker died mid-pull; the tag
 # makes the live code visible.
-BUILD_TAG = "v65"
+BUILD_TAG = "v65.1"
 
 
 @app.after_request
@@ -2364,6 +2364,15 @@ def _bulk_group_keys(rows):
 # derived fields are recomputed from the MERGED row (ppsf by the
 # merge's own insert formula; match_score from the merged specs) so
 # the stored row never pairs rich facts with a sparse score.
+# v65.1: for beds/baths a numeric 0 counts as blank on BOTH sides of
+# the helper — F1's premise (a payload 0 means missing) applied to
+# values a pre-v65 pull already STORED: the live Ripley rows carry
+# baths=0, and with a None/""-only blank test the helper restored
+# that stored 0 over every incoming blank, so "0ba" survived every
+# re-pull. Stored 0 + incoming blank now writes a clean None (the
+# cleaning counts as a fill landing, so derived fields recompute);
+# an incoming 0 likewise never beats a stored real count. Every
+# other keep-field keeps the None/"" rule.
 _MERGE_KEEP_FIELDS = ("beds", "baths", "sqft", "year_built", "lot_sqft",
                       "ptype", "photo_url", "source_url")
 
@@ -2377,9 +2386,27 @@ def _merge_keep_filled(d, comp_id, vals, subj):
     if row is None: return vals
     def _blank(v):
         return v is None or (isinstance(v, str) and not v.strip())
+    def _blank_bb(v):
+        # v65.1: beds/baths only — a numeric 0 is missing too (F1's
+        # premise applied to stored values, not just payloads).
+        return _blank(v) or (isinstance(v, (int, float))
+                             and not isinstance(v, bool) and v == 0)
     out = dict(vals); filled = False
     for k in _MERGE_KEEP_FIELDS:
-        if k in out and _blank(out[k]) and not _blank(row[k]):
+        if k not in out: continue
+        if k in ("beds", "baths"):
+            if not _blank_bb(out[k]):
+                continue  # a real incoming count wins, as before
+            if not _blank_bb(row[k]):
+                out[k] = row[k]; filled = True  # stored real count kept
+            elif out[k] is not None or (isinstance(row[k], (int, float))
+                                        and not isinstance(row[k], bool)
+                                        and row[k] == 0):
+                # Both sides blank, but a 0 sits on one of them: the
+                # written value is a clean None, and the 0-cleaning
+                # counts as a fill landing (derived fields recompute).
+                out[k] = None; filled = True
+        elif _blank(out[k]) and not _blank(row[k]):
             out[k] = row[k]; filled = True
     if filled:
         if out.get("sqft") and out.get("price") and not out.get("ppsf"):
