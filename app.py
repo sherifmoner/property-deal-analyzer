@@ -22,7 +22,7 @@ app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 # code with no way to tell (the log lacked the v58.1 first-row-keys
 # line, the pool read 0 in-gate) and the worker died mid-pull; the tag
 # makes the live code visible.
-BUILD_TAG = "v64"
+BUILD_TAG = "v65"
 
 
 @app.after_request
@@ -400,6 +400,20 @@ def adjusted_price(comp):
     adj = (comp["adj_condition"] or 0) + (comp["adj_size"] or 0) + (comp["adj_other"] or 0)
     return (comp["price"] or 0) + adj
 
+def _sold_source_phrase(comps):
+    """The honest source phrase for the ARV note (v65 F5): the
+    distinct stored `source` labels of the sold comps the note
+    describes, in first-appearance order. The note hardcoded
+    'HomeHarvest sold data' even over an all-RapidAPI stored set
+    (live on Ripley: every card RapidAPI, the note said HomeHarvest).
+    Empty when no stored sold comp carries a label."""
+    labels = []
+    for c in (comps or []):
+        if _cval(c, "kind") not in (None, "sold"): continue
+        lbl = _s(_cval(c, "source")).strip()
+        if lbl and lbl not in labels: labels.append(lbl)
+    return ", ".join(labels)
+
 def arv_reconciliation(prop, comps, bulk_keys=None):
     """ONE reconciled ARV with the math shown: average of (adjusted avg comp price) and (avg $/sqft x subject sqft).
     v57: the pool is stats-usable sold rows only — a bulk-flagged row or
@@ -412,6 +426,9 @@ def arv_reconciliation(prop, comps, bulk_keys=None):
     pool = [c for c in usable if c["pinned"]] or sorted(usable, key=lambda c: -(c["match_score"] or 0))[:6]
     if not pool:
         return {"arv": None, "pool": pool, "note": "Not found — pull comps first."}
+    _src = _sold_source_phrase(comps)
+    _srcline = (f"Source: {_src} sold data" if _src else
+                "Source: the sold comps stored on this property")
     adj_prices = [adjusted_price(c) for c in pool]
     avg_price = sum(adj_prices) / len(adj_prices)
     basis = f"your {len(pool)} pinned comp(s)" if any(c["pinned"] for c in pool) else f"top {len(pool)} comps by match score (pin comps to choose your own)"
@@ -420,7 +437,7 @@ def arv_reconciliation(prop, comps, bulk_keys=None):
                 "avg_ppsf": None, "ppsf_value": None, "count": len(pool),
                 "note": f"ARV = average of top {len(pool)} sale price(s) (${round(avg_price):,}) "
                         f"— subject sqft missing, so no $/sqft value. Over {basis}. "
-                        f"Source: HomeHarvest sold data, pulled {datetime.date.today().isoformat()}."}
+                        f"{_srcline}, pulled {datetime.date.today().isoformat()}."}
     ppsfs = [(adjusted_price(c) / c["sqft"]) for c in pool if c["sqft"]]
     avg_ppsf = sum(ppsfs) / len(ppsfs) if ppsfs else 0
     ppsf_value = avg_ppsf * prop["sqft"]
@@ -429,7 +446,7 @@ def arv_reconciliation(prop, comps, bulk_keys=None):
             "ppsf_value": round(ppsf_value), "count": len(pool),
             "note": f"ARV = average of adjusted comp average (${round(avg_price):,}) and $/sqft method "
                     f"(${round(avg_ppsf,2)}/sqft x {int(prop['sqft'])} sqft = ${round(ppsf_value):,}), "
-                    f"over {basis}. Source: HomeHarvest sold data, pulled {datetime.date.today().isoformat()}."}
+                    f"over {basis}. {_srcline}, pulled {datetime.date.today().isoformat()}."}
 
 def _panel_saved_inp(d, pid):
     """v61: the saved UW inputs the Overview verdict resolves its ARV
@@ -2333,6 +2350,48 @@ def _bulk_group_keys(rows):
         counts[k] = counts.get(k, 0) + 1
     return {k for k, n in counts.items() if n >= _BULK_MIN_GROUP}
 
+# ---------------------------------------------------------------- v65
+# merge integrity (F2). The merges' duplicate UPDATE writes EVERY
+# incoming field, so a sparser later frame erased stored facts with
+# its blanks: a Cadastral duplicate-touch (beds/baths/photo hard-coded
+# None in that frame) wiped a listing-sourced row's specs and photo,
+# and a sparse re-listing did the same to a rent row. The fields below
+# are stored FACTS about the house, not per-pull observations — for
+# them the update is fill-blanks-only: an incoming non-blank still
+# wins (a richer later frame enriches the row, and rent prices keep
+# their v48 update-in-place path, which does not run through here),
+# but a blank never overwrites a stored value. When a fill lands, the
+# derived fields are recomputed from the MERGED row (ppsf by the
+# merge's own insert formula; match_score from the merged specs) so
+# the stored row never pairs rich facts with a sparse score.
+_MERGE_KEEP_FIELDS = ("beds", "baths", "sqft", "year_built", "lot_sqft",
+                      "ptype", "photo_url", "source_url")
+
+def _merge_keep_filled(d, comp_id, vals, subj):
+    """vals adjusted so its _MERGE_KEEP_FIELDS never blank out the
+    stored row comp_id's values (v65 F2). Returns vals unchanged when
+    the stored row has nothing the incoming frame lacks."""
+    row = d.execute("SELECT beds,baths,sqft,year_built,lot_sqft,ptype,"
+                    "photo_url,source_url FROM comps WHERE id=?",
+                    (comp_id,)).fetchone()
+    if row is None: return vals
+    def _blank(v):
+        return v is None or (isinstance(v, str) and not v.strip())
+    out = dict(vals); filled = False
+    for k in _MERGE_KEEP_FIELDS:
+        if k in out and _blank(out[k]) and not _blank(row[k]):
+            out[k] = row[k]; filled = True
+    if filled:
+        if out.get("sqft") and out.get("price") and not out.get("ppsf"):
+            out["ppsf"] = out["price"] / out["sqft"]
+        if subj is not None and "match_score" in out:
+            out["match_score"] = match_score(subj, {
+                "distance_mi": out.get("distance_mi"), "sqft": out.get("sqft"),
+                "beds": out.get("beds"), "baths": out.get("baths"),
+                "year_built": out.get("year_built"),
+                "lot_sqft": out.get("lot_sqft")})
+    return out
+
 def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touched=None, drops=None):
     """Merge one HomeHarvest sold frame into the comps table. Returns
     (added, updated, usable). v3.4: DISTANCE from the subject governs
@@ -2412,6 +2471,8 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
         addr, price = vals["address"], vals["price"]
         ex = _find_existing_comp(d, prop["id"], "sold", addr, price,
                                  event_date=vals["event_date"])
+        if ex:
+            vals = _merge_keep_filled(d, ex, vals, subj)
         cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
         if ex:
             d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex)); updated += 1
@@ -2471,6 +2532,8 @@ def _merge_rent_frame(d, prop, df, radius_mi, subj, source_override=None, drops=
                                                  "lot_sqft": vals["lot_sqft"]})
         ex = _find_existing_comp(d, prop["id"], "rent", addr, price,
                                  beds=vals["beds"], source_url=vals["source_url"])
+        if ex:
+            vals = _merge_keep_filled(d, ex, vals, subj)
         cols = ",".join(vals.keys()); ph = ",".join("?" * len(vals))
         if ex:
             d.execute(f"UPDATE comps SET {','.join(k+'=?' for k in vals)} WHERE id=?", (*vals.values(), ex)); updated += 1
@@ -3384,6 +3447,45 @@ def _things4u_year_built_from_details(details):
     return None
 
 
+_T4U_ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")
+_T4U_US_DATE_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
+
+def _t4u_canon_date(v):
+    """One Things4u last_sold_date -> the canonical YYYY-MM-DD the
+    comps store carries (v65). The two Things4u APIs wrap the same
+    Realtor.com data, but a raw date form that is not already ISO
+    survives the old [:10] read as a DIFFERENT string for the same
+    sale, and _dates_match then refuses the twin (live: 7189 Campbell
+    Rd stored once per API). ISO dates and ISO datetimes read as
+    their date; a US MM/DD/YYYY form converts; an epoch integer
+    converts (UTC). Anything unrecognized keeps the historical [:10]
+    passthrough — never an invented date, never a crash."""
+    s = _s(v).strip()
+    if not s: return None
+    m = _T4U_ISO_DATE_RE.match(s)
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)),
+                                 int(m.group(3))).isoformat()
+        except ValueError:
+            return s[:10]
+    m = _T4U_US_DATE_RE.match(s[:10])
+    if m:
+        try:
+            return datetime.date(int(m.group(3)), int(m.group(1)),
+                                 int(m.group(2))).isoformat()
+        except ValueError:
+            return s[:10]
+    if s.isdigit() and len(s) >= 9:
+        try:
+            ts = int(s)
+            if ts > 10 ** 12: ts //= 1000
+            return datetime.datetime.fromtimestamp(
+                ts, datetime.timezone.utc).date().isoformat()
+        except (ValueError, OverflowError, OSError):
+            return s[:10]
+    return s[:10] or None
+
 def _things4u_fields(item):
     """The canonical fields out of ONE Things4u search-row item (v58.1,
     captured shape first, flat fallbacks second). Shared by the sold /
@@ -3417,6 +3519,13 @@ def _things4u_fields(item):
     yb = _things4u_year_built_from_details(item.get("details"))
     if yb is None:
         yb = _sabri_num(_pick("year_built"))
+    # v65: a 0 bed/bath count in the payload is the source's "not
+    # recorded", not a fact — stored as-is it rendered literally as
+    # "0ba" on live cards (Ripley). Missing stays missing.
+    beds = _sabri_num(_dpick("beds") if _dpick("beds") is not None else _pick("beds", "bedrooms"))
+    if beds == 0: beds = None
+    full_baths = _sabri_num(_dpick("baths") if _dpick("baths") is not None else _pick("baths", "bathrooms"))
+    if full_baths == 0: full_baths = None
     return dict(street=_s(addr.get("line")) or _s(_pick("address_line", "address")),
                 city=_s(addr.get("city")) or _s(_pick("city")),
                 zip_code=_s(addr.get("postal_code")) or _s(_pick("zip_code", "zip")),
@@ -3424,11 +3533,11 @@ def _things4u_fields(item):
                 sold_price=_sabri_num(_pick("last_sold_price", "sold_price")),
                 list_price=_sabri_num(_pick("list_price")),
                 sqft=_sabri_num(_dpick("sqft") if _dpick("sqft") is not None else _pick("sqft", "livingArea")),
-                beds=_sabri_num(_dpick("beds") if _dpick("beds") is not None else _pick("beds", "bedrooms")),
-                full_baths=_sabri_num(_dpick("baths") if _dpick("baths") is not None else _pick("baths", "bathrooms")),
+                beds=beds,
+                full_baths=full_baths,
                 year_built=int(yb) if yb else None,
                 lot_sqft=_sabri_num(_dpick("lot_sqft") if _dpick("lot_sqft") is not None else _pick("lot_sqft", "lotSize")),
-                last_sold_date=_s(_pick("last_sold_date"))[:10] or None,
+                last_sold_date=_t4u_canon_date(_pick("last_sold_date")),
                 days_on_mls=None,
                 latitude=lat, longitude=lon,
                 style=_s(_dpick("type")) or _s(_pick("property_type", "style")),
@@ -4093,6 +4202,161 @@ def _unofficial_zillow_photos_fill(d, prop, today):
     app.logger.warning(f"comp pull: Unofficial-Zillow images for {prop['address']}: "
                        f"filled {len(photos)} photos (zpid {zpid})")
     return {"photos": len(photos), "fields": ["photo_url", "photos_date", "photos_json"]}
+
+def _jina_zillow_subject_values(md, prop):
+    """One Zillow property page (fetched via the jina reader) ->
+    candidate subject fill values (pure; no I/O). v65, probe-proven
+    on the live capture (fixtures_v65/zillow-ripley-jina.md: 6971 US
+    Highway 52, Ripley OH — Zillow page exists, zpid 81693719, "Off
+    market", facts 3bd/1ba/756sqft/1935, lot 0.48 acres, Zestimate
+    $99,600). Address verification is FAIL-CLOSED: the page's own H1
+    ("# <address>") or "Title:" line must carry the subject's house
+    number and every street-core token of the subject's address —
+    a search/redirect page for a different house returns {} and can
+    never fill this subject. Specs prefer the labeled Facts &
+    features entries (Bedrooms:/Bathrooms:/Total interior livable
+    area:/Year built:/lot Size:), falling back to the header block
+    above the first "## " heading. Photos: only gallery-shaped fp/
+    URLs (-p_e/-p_f) appearing BEFORE the "Comparable homes" section
+    — similar-home cards carry their own fp/ photos further down the
+    page and are never taken, and MLS/logo assets (-zillow_web_*)
+    never match the suffix. On the Ripley page that rule honestly
+    yields no photos: the subject has no gallery there (only a Street
+    View still, which is not a listing photo and is not taken)."""
+    if not md or not isinstance(md, str): return {}
+    lines = md.splitlines()
+    wants = []
+    for cand in (prop.get("address"), prop.get("street")):
+        n, c = _street_key(_s(cand))
+        if n and c: wants.append((n, set(c.split())))
+    if not wants: return {}
+    def _addr_ok(text):
+        t = (text or "").strip()
+        if t.startswith("Title:"): t = t[len("Title:"):].strip()
+        if t.startswith("# "): t = t[2:].strip()
+        n, c = _street_key(t)
+        if not n: return False
+        ctoks = set(c.split())
+        return any(n == wn and wc <= ctoks for wn, wc in wants)
+    h1_idx = None; verified = False; city = zipc = ""
+    for i, ln in enumerate(lines[:80]):
+        t = ln.strip()
+        is_addr_line = t.startswith("# ") or t.startswith("Title:")
+        if is_addr_line and _addr_ok(t):
+            verified = True
+            if t.startswith("# ") and h1_idx is None: h1_idx = i
+            if not city:
+                m = re.search(r",\s*([^,]+),\s*[A-Z]{2}\s+(\d{5})", t)
+                if m: city, zipc = m.group(1).strip(), m.group(2)
+    if not verified: return {}
+    start = h1_idx if h1_idx is not None else 0
+    hdr = []
+    for j, ln in enumerate(lines[start:]):
+        if j > 0 and ln.strip().startswith("## "): break
+        hdr.append(ln)
+    hdr_txt = "\n".join(hdr)
+    facts_txt = ""
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("## Facts & features"):
+            seg = []
+            for ln2 in lines[i + 1:]:
+                if ln2.strip().startswith("## "): break
+                seg.append(ln2)
+            facts_txt = "\n".join(seg)
+            break
+    pre = md.split("## Comparable homes")[0]
+    def _num(rx, txt, cast=float):
+        m = re.search(rx, txt or "")
+        if not m: return None
+        try: return cast(m.group(1).replace(",", ""))
+        except (ValueError, AttributeError): return None
+    beds = _num(r"Bedrooms:\s*(\d+(?:\.\d+)?)", facts_txt)
+    if beds is None: beds = _num(r"(\d+(?:\.\d+)?)\s*beds\b", hdr_txt)
+    baths = _num(r"Bathrooms:\s*(\d+(?:\.\d+)?)", facts_txt)
+    if baths is None: baths = _num(r"(\d+(?:\.\d+)?)\s*baths\b", hdr_txt)
+    sqft = _num(r"Total interior livable area:\s*([\d,]+)\s*sqft", facts_txt)
+    if sqft is None: sqft = _num(r"([\d,]+)\s*sqft", hdr_txt)
+    year = _num(r"Year built:\s*(\d{4})", facts_txt, int)
+    if year is None: year = _num(r"Built in\s*(\d{4})", hdr_txt, int)
+    lot = None
+    acres = _num(r"Size:\s*([\d.]+)\s*Acres", facts_txt)
+    if acres is None: acres = _num(r"([\d.]+)\s*Acres Lot", hdr_txt)
+    if acres: lot = int(round(acres * 43560))
+    zest = _num(r"\$([\d,]+)\s*Zestimate", pre)
+    if zest is None: zest = _num(r"Zestimate®?\**\s*\n\s*\$([\d,]+)", pre)
+    zpid = None
+    for ln in lines[:10]:
+        if "Final URL" in ln or "URL Source" in ln:
+            m = re.search(r"(\d+)_zpid", ln)
+            if m: zpid = m.group(1); break
+    photos = []
+    for u in re.findall(r"https://photos\.zillowstatic\.com/fp/[A-Za-z0-9]+-p_[ef]\.(?:webp|jpg)", pre):
+        if u not in photos: photos.append(u)
+    return {"beds": beds, "baths": baths, "sqft": sqft,
+            "year_built": year, "lot_sqft": lot,
+            "photos": photos[:40], "zestimate": zest,
+            "zpid": zpid, "city": city, "zip": zipc}
+
+def _jina_zillow_subject_fill(d, prop, today):
+    """The jina-reader Zillow subject fill (v65): fetch the subject's
+    own Zillow page through the reader (the same keyless route the
+    sold top-up uses — no RapidAPI key, no quota) and fill from
+    _jina_zillow_subject_values. It is the ladder's last step because
+    it is the only one that can answer for an OFF-market subject: the
+    frame fill needs a listing row, the Things4u detail needs that
+    row's property_id, private-zillow is down, and the zpid backups
+    need a zpid nobody persisted (live Ripley, 2026-11-07 — every
+    earlier step had nothing to work with, the Zillow page had the
+    facts). Same discipline as every subject fill: address-verified
+    payload, city/ZIP cross-check, blank-fill ONLY, _sane_subject_fill
+    per field; the Zestimate lands in est_zillow, never list_price.
+    A sanity-passed page persists its zpid even when every field was
+    already filled, so the zpid-only backups can fire on later pulls.
+    Returns the fill summary or None."""
+    street = _s(prop["street"]) or _s(prop["address"])
+    slug = (f"{street} {_s(prop['city'])} {_s(prop['state'])} "
+            f"{_s(prop['zip'])}").replace(",", "").replace(" ", "-")
+    md = _jina_fetch(f"https://www.zillow.com/homes/{slug}_rb/")
+    if md is None:
+        app.logger.warning(f"comp pull: jina-Zillow subject page unreachable "
+                           f"for {prop['address']}")
+        return None
+    v = _jina_zillow_subject_values(md, dict(prop))
+    if not v:
+        app.logger.warning(f"comp pull: jina-Zillow subject page for "
+                           f"{prop['address']}: no address-verified page (no-match)")
+        return None
+    if v["city"] and prop["city"] and v["city"].strip().lower() != prop["city"].strip().lower():
+        app.logger.warning(f"comp pull: jina-Zillow subject page for "
+                           f"{prop['address']}: response city contradicts the subject — no-match")
+        return None
+    if v["zip"] and prop["zip"] and str(v["zip"])[:5] != str(prop["zip"])[:5]:
+        app.logger.warning(f"comp pull: jina-Zillow subject page for "
+                           f"{prop['address']}: response ZIP contradicts the subject — no-match")
+        return None
+    if v["zpid"] and not prop["zpid"]:
+        d.execute("UPDATE properties SET zpid=? WHERE id=?",
+                  (str(v["zpid"]), prop["id"]))
+        d.commit()
+    fills = {}
+    for col in ("beds", "baths", "sqft", "year_built", "lot_sqft"):
+        if not prop[col] and v.get(col) is not None and _sane_subject_fill(col, v[col]):
+            fills[col] = v[col]
+    if v["photos"] and not prop["photos_json"] and not prop["photo_url"]:
+        fills["photos_json"] = json.dumps(v["photos"]); fills["photos_date"] = today
+        fills["photo_url"] = v["photos"][0]
+    if v["zestimate"] and not prop["est_zillow"] and _sane_subject_fill("est_zillow", v["zestimate"]):
+        fills["est_zillow"] = v["zestimate"]; fills["est_date"] = today
+    if not fills:
+        app.logger.warning(f"comp pull: jina-Zillow subject fill for {prop['address']}: "
+                           "matched, but every field was already filled")
+        return None
+    d.execute(f"UPDATE properties SET {','.join(k + '=?' for k in fills)} WHERE id=?",
+              (*fills.values(), prop["id"]))
+    app.logger.warning(f"comp pull: jina-Zillow subject fill for {prop['address']}: "
+                       f"filled {', '.join(sorted(fills))}")
+    return {"photos": len(v["photos"]) if "photos_json" in fills else 0,
+            "fields": sorted(fills)}
 
 def _pz_sold_item_to_row(item):
     """One private-zillow /search/bymapbounds item -> the standard
@@ -5064,6 +5328,27 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                 if _zf3:
                     _note_zfill(_zf3, "subject photos filled from Zillow via RapidAPI "
                                       "(Unofficial-Zillow backup)")
+    # --- jina-Zillow subject page (v65): the ladder's last step, and
+    # the only one that can answer for an OFF-market subject with no
+    # listing row in any frame (live Ripley, 2026-11-07): the page
+    # needs no key, no property_id and no prior zpid. Fires only
+    # while the subject still lacks specs or photos; a match strips
+    # the could-not-be-filled warning like every other fill. ---
+    try:
+        _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
+        if (not _prop_now["beds"] or not _prop_now["baths"] or not _prop_now["sqft"]
+                or not _prop_now["year_built"]
+                or (not _prop_now["photos_json"] and not _prop_now["photo_url"])):
+            _jf = _jina_zillow_subject_fill(d, _prop_now, today)
+            if _jf:
+                d.commit()
+                photos_found = max(photos_found, _jf["photos"])
+                warnings[:] = [w for w in warnings if "could not be auto-filled" not in w]
+                warnings.append("subject specs filled from Zillow (reader)"
+                                if not _jf["photos"] else
+                                "subject specs/photos filled from Zillow (reader)")
+    except Exception as _je:
+        app.logger.warning(f"comp pull: jina-Zillow subject fill raised for {addr_line}: {_je!r}")
     # --- county parcel record (v3.4): blank-fill APN / assessor value / last
     # sale from the county GIS where a probed endpoint covers the county ---
     try:
