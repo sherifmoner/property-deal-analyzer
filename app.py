@@ -22,7 +22,7 @@ app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 # code with no way to tell (the log lacked the v58.1 first-row-keys
 # line, the pool read 0 in-gate) and the worker died mid-pull; the tag
 # makes the live code visible.
-BUILD_TAG = "v65.1"
+BUILD_TAG = "v65.2"
 
 
 @app.after_request
@@ -2665,6 +2665,75 @@ def _collapse_rent_view(rows):
             out[hit] = d; meta[hit] = (gkey, beds)
     return out
 
+def _collapse_stored_sold_twins(d, pid, subj=None):
+    """Stored-twin collapse for SOLD comps (v65.2): rows ALREADY in
+    the comps table that are the same sale under the dedupe identity
+    (price equal + _norm_addr equal + _dates_match — the
+    _find_existing_comp key) fold into the lowest id. The merge-side
+    key only stops NEW duplicates; a twin stored before the key could
+    see it (live property 10, 2026-11-07: 7189 Campbell Rd $80,000
+    2026-07-03 stored twice, ids 4053/4059, byte-identical except the
+    source label — once per Things4u API) survived every re-pull,
+    because each pull updated the first match and never looked at
+    the second row. The fold uses the existing keep-filled merge
+    semantics (_merge_keep_filled): the folded row's values adjust
+    against the kept row, and the keep-fields + the derived
+    ppsf/match_score the helper recomputes are written back — a
+    blank on the kept row gains the twin's value, nothing filled is
+    ever blanked. The folded row is then flagged excluded=1 — the
+    Seaford posture: reversible, NOTHING is deleted. Pin honesty: a
+    folded row's pin transfers to the kept row when the kept row is
+    unpinned (the auto-pin count reads pinned=1 across all sold
+    rows, so a pin left on an excluded twin would silently block
+    auto-pinning and count a comp that no longer shows); the folded
+    row's own pin is cleared either way. Rows without a price cannot
+    prove the identity (the dedupe key requires price equality) and
+    are never folded. Runs inside pull_comps after every sold merge,
+    before auto-pin. Returns the number of rows folded."""
+    rows = [dict(r) for r in d.execute(
+        "SELECT * FROM comps WHERE property_id=? AND kind='sold' "
+        "AND excluded=0 ORDER BY id", (pid,)).fetchall()]
+    groups = []
+    for r in rows:
+        if r.get("price") is None: continue
+        hit = None
+        for g in groups:
+            rep = g[0]
+            if (float(rep["price"]) == float(r["price"])
+                    and _norm_addr(rep["address"]) == _norm_addr(r["address"])
+                    and any(_dates_match(m["event_date"], r["event_date"]) for m in g)):
+                hit = g; break
+        if hit is None: groups.append([r])
+        else: hit.append(r)
+    folded = 0
+    for g in groups:
+        if len(g) < 2: continue
+        kept = g[0]
+        for twin in g[1:]:
+            vals = {k: twin.get(k) for k in _MERGE_KEEP_FIELDS}
+            vals.update(price=twin.get("price"), ppsf=twin.get("ppsf"),
+                        distance_mi=twin.get("distance_mi"),
+                        match_score=twin.get("match_score"))
+            merged = _merge_keep_filled(d, kept["id"], vals, subj)
+            back = {k: merged[k] for k in _MERGE_KEEP_FIELDS if k in merged}
+            for k in ("ppsf", "match_score"):
+                if k in merged: back[k] = merged[k]
+            if back:
+                d.execute(f"UPDATE comps SET {','.join(k + '=?' for k in back)} WHERE id=?",
+                          (*back.values(), kept["id"]))
+                kept.update(back)
+            if twin["pinned"] and not kept["pinned"]:
+                d.execute("UPDATE comps SET pinned=1 WHERE id=?", (kept["id"],))
+                kept["pinned"] = 1
+            d.execute("UPDATE comps SET excluded=1, pinned=0 WHERE id=?",
+                      (twin["id"],))
+            folded += 1
+    if folded:
+        d.commit()
+        app.logger.warning(f"comp pull: collapsed {folded} stored sold twin(s) "
+                           f"on property {pid} (folded rows excluded, none deleted)")
+    return folded
+
 # ---------------------------------------------------------------- county GIS parcels (v3.4)
 # Subject facts from the county's own parcel record — the assessor carries
 # sales the listing frames never see (110 Garland Ct's own sale is from 2016:
@@ -4339,7 +4408,15 @@ def _jina_zillow_subject_fill(d, prop, today):
     per field; the Zestimate lands in est_zillow, never list_price.
     A sanity-passed page persists its zpid even when every field was
     already filled, so the zpid-only backups can fire on later pulls.
-    Returns the fill summary or None."""
+    Returns (fill summary, None) when a fill lands, else (None,
+    reason) with reason one of "unreachable" (the reader fetch
+    failed), "no_match" (a page came back but is not address-verified
+    for this subject — parser no-match or a city/ZIP contradiction),
+    or "nothing_new" (the page verified, but every field it carries
+    was already filled) — v65.2: the caller surfaces the reason as
+    one honest pull note instead of the generic could-not-fill line
+    alone (the v65 live failure was undiagnosable from the pull
+    output: the fetch had been 403ing for days)."""
     street = _s(prop["street"]) or _s(prop["address"])
     slug = (f"{street} {_s(prop['city'])} {_s(prop['state'])} "
             f"{_s(prop['zip'])}").replace(",", "").replace(" ", "-")
@@ -4347,20 +4424,20 @@ def _jina_zillow_subject_fill(d, prop, today):
     if md is None:
         app.logger.warning(f"comp pull: jina-Zillow subject page unreachable "
                            f"for {prop['address']}")
-        return None
+        return None, "unreachable"
     v = _jina_zillow_subject_values(md, dict(prop))
     if not v:
         app.logger.warning(f"comp pull: jina-Zillow subject page for "
                            f"{prop['address']}: no address-verified page (no-match)")
-        return None
+        return None, "no_match"
     if v["city"] and prop["city"] and v["city"].strip().lower() != prop["city"].strip().lower():
         app.logger.warning(f"comp pull: jina-Zillow subject page for "
                            f"{prop['address']}: response city contradicts the subject — no-match")
-        return None
+        return None, "no_match"
     if v["zip"] and prop["zip"] and str(v["zip"])[:5] != str(prop["zip"])[:5]:
         app.logger.warning(f"comp pull: jina-Zillow subject page for "
                            f"{prop['address']}: response ZIP contradicts the subject — no-match")
-        return None
+        return None, "no_match"
     if v["zpid"] and not prop["zpid"]:
         d.execute("UPDATE properties SET zpid=? WHERE id=?",
                   (str(v["zpid"]), prop["id"]))
@@ -4377,13 +4454,13 @@ def _jina_zillow_subject_fill(d, prop, today):
     if not fills:
         app.logger.warning(f"comp pull: jina-Zillow subject fill for {prop['address']}: "
                            "matched, but every field was already filled")
-        return None
+        return None, "nothing_new"
     d.execute(f"UPDATE properties SET {','.join(k + '=?' for k in fills)} WHERE id=?",
               (*fills.values(), prop["id"]))
     app.logger.warning(f"comp pull: jina-Zillow subject fill for {prop['address']}: "
                        f"filled {', '.join(sorted(fills))}")
     return {"photos": len(v["photos"]) if "photos_json" in fills else 0,
-            "fields": sorted(fills)}
+            "fields": sorted(fills)}, None
 
 def _pz_sold_item_to_row(item):
     """One private-zillow /search/bymapbounds item -> the standard
@@ -4629,15 +4706,19 @@ JINA_ZILLOW_PAGES = 3
 JINA_GEOCODE_MAX = 15  # rows geocoded per pull (Nominatim politeness)
 
 def _jina_fetch(url):
-    """One reader fetch (browser UA). Returns the markdown/HTML text or
-    None. The reader is a best-effort top-up: any failure leaves the
-    union exactly as it was."""
+    """One reader fetch. Returns the markdown/HTML text or None. The
+    reader is a best-effort top-up: any failure leaves the union
+    exactly as it was. v65.2: NO explicit User-Agent is sent — the
+    requests default is used on purpose. Measured live 2026-11-07:
+    r.jina.ai refuses the Chrome browser UA this helper used to send
+    (403 Forbidden, 134-byte body, three times from this machine and
+    the same failure on PA), while the requests default UA, the curl
+    UA and no UA all answer 200 — the browser UA silently killed
+    every in-app reader fetch (the v65 subject fill AND the sold
+    top-up) while every manual curl capture worked."""
     if not url: return None
     try:
-        r = requests.get(f"{JINA_READER_BASE}{url}", headers={"User-Agent":
-                         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"},
-                         timeout=15)
+        r = requests.get(f"{JINA_READER_BASE}{url}", timeout=15)
         r.raise_for_status()
         return r.text
     except Exception as e:
@@ -5366,7 +5447,7 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         if (not _prop_now["beds"] or not _prop_now["baths"] or not _prop_now["sqft"]
                 or not _prop_now["year_built"]
                 or (not _prop_now["photos_json"] and not _prop_now["photo_url"])):
-            _jf = _jina_zillow_subject_fill(d, _prop_now, today)
+            _jf, _jreason = _jina_zillow_subject_fill(d, _prop_now, today)
             if _jf:
                 d.commit()
                 photos_found = max(photos_found, _jf["photos"])
@@ -5374,6 +5455,17 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                 warnings.append("subject specs filled from Zillow (reader)"
                                 if not _jf["photos"] else
                                 "subject specs/photos filled from Zillow (reader)")
+            elif _jreason == "unreachable":
+                # v65.2: name the specific outcome — the generic
+                # could-not-fill line alone hid the reader 403 for days.
+                warnings.append("Zillow (reader) subject page could not be fetched"
+                                " — subject specs were not auto-filled from it")
+            elif _jreason == "no_match":
+                warnings.append("Zillow (reader) page fetched but not address-verified"
+                                " — subject specs were not auto-filled from it")
+            elif _jreason == "nothing_new":
+                warnings.append("Zillow (reader) page verified for this address"
+                                " — nothing new to fill")
     except Exception as _je:
         app.logger.warning(f"comp pull: jina-Zillow subject fill raised for {addr_line}: {_je!r}")
     # --- county parcel record (v3.4): blank-fill APN / assessor value / last
@@ -5494,6 +5586,15 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             warnings.append(f"rental set widened to {wide_r:g} mi / 365 days for matched rentals ({rn} -> {rn2} listings; {rex2} exact + {rnear2} near beds/baths matches)")
         else:
             warnings.append("rental widening scrape failed")
+    # --- v65.2: stored-twin collapse — every sold merge for this
+    # pull is done; fold any ALREADY-STORED duplicates the merge key
+    # can no longer see (the 7189 Campbell twin) before auto-pin
+    # reads the set. Best-effort like every late pull step: a failure
+    # here leaves the stored set exactly as the merges left it. ---
+    try:
+        _collapse_stored_sold_twins(d, prop["id"], subj2)
+    except Exception as _te:
+        app.logger.warning(f"comp pull: stored-twin collapse failed for {addr_line}: {_te!r}")
     # --- Auto-pin (only if user pinned none): top 3 by TIER first (P0-1: Tier 1
     # only when >=3 exist), then match score, then distance. ---
     pinned_now = d.execute("SELECT COUNT(*) c FROM comps WHERE property_id=? AND kind='sold' AND pinned=1",
