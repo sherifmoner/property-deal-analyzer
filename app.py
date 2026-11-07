@@ -22,7 +22,7 @@ app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 # code with no way to tell (the log lacked the v58.1 first-row-keys
 # line, the pool read 0 in-gate) and the worker died mid-pull; the tag
 # makes the live code visible.
-BUILD_TAG = "v65.2"
+BUILD_TAG = "v66"
 
 
 @app.after_request
@@ -788,19 +788,25 @@ def _padsplit_parse_markdown(md_text):
     return out
 
 def _padsplit_fetch(url):
-    """One PadSplit page fetch (browser UA — the site serves its SSR
-    payload to ordinary agents). v58: the r.jina.ai reader is tried
+    """One PadSplit page fetch. v58: the r.jina.ai reader is tried
     FIRST (PA's proxy 403-blocks padsplit.com directly, but the reader
     answered HTTP 200 with real rent data, 2026-11-06); the direct
-    fetch stays as fallback. 15s cap per attempt. Returns the
-    HTML/markdown or None."""
+    fetch stays as fallback. v66: the reader attempt sends NO explicit
+    User-Agent — r.jina.ai 403s the Chrome browser UA (proven live
+    2026-11-07: Chrome UA -> 403/134 bytes, no UA -> 200; the same
+    root cause v65.2 fixed in _jina_fetch). The direct attempt keeps
+    the Chrome UA (the real site, not the reader). 15s cap per
+    attempt. Returns the HTML/markdown or None."""
     if not url: return None
-    for attempt_url in (f"{JINA_READER_BASE}{url}", url):
+    _chrome_ua = {"User-Agent":
+                  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+    for _i, attempt_url in enumerate((f"{JINA_READER_BASE}{url}", url)):
         try:
-            r = requests.get(attempt_url, headers={"User-Agent":
-                             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                             "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"},
-                             timeout=15)
+            # v66: reader attempt (index 0) sends no explicit UA;
+            # direct attempt (index 1) keeps the Chrome UA.
+            _kw = {} if _i == 0 else {"headers": _chrome_ua}
+            r = requests.get(attempt_url, timeout=15, **_kw)
             r.raise_for_status()
             return r.text
         except Exception as e:
