@@ -3824,6 +3824,12 @@ def _things4u_search(host, path, prop, rent=False):
         the source errors only when the city walk's page 1 also
         errors. (When the ZIP walk served rows and only the city
         walk errors, the ZIP rows are kept and no error surfaces.)
+        ONE exception (v68 follow-up): a page-1 HTTP 429 on the ZIP
+        walk short-circuits — the city walk is NOT run and the 429
+        surfaces as the source's error, exactly as a pre-v68 page-1
+        429 did. Asking the same quota-dead host a second time in
+        one adapter call breaks the v58 skip-fast discipline
+        (gate_v68 T11/T12).
       - no ZIP on the property: the city walk exactly as pre-v68.
     minSoldDate is NOT sent: the hunt captured the parameter name
     but not its exact format, and a wrong date format would fail
@@ -3843,6 +3849,20 @@ def _things4u_search(host, path, prop, rent=False):
     zip_loc = f"zip:{zipc}"
     zrows, zerr, ztotal = _things4u_walk(host, path, zip_loc, rent, max_pages)
     if zerr is not None:
+        # v68 follow-up: a 429 is the quota wall, not a location
+        # problem — re-asking the same host (city walk) only burns a
+        # second rejected call. _err_status(zerr) == 429 is the exact
+        # predicate _rapi_call_source uses to mark the host
+        # quota-dead, so returning ([], zerr) here makes the frame
+        # treat it identically to a pre-v68 page-1 429. (The
+        # quota-dead settings flag cannot be the check: it is only
+        # written by _rapi_call_source AFTER the adapter returns, so
+        # it still reads False at this point.) Any OTHER page-1
+        # error falls through to the city walk below, as built.
+        if _err_status(zerr) == 429:
+            app.logger.warning(f"comp pull: Things4u {path} location={zip_loc} walk hit "
+                               f"HTTP 429 — city walk skipped (quota-dead host)")
+            return [], zerr
         app.logger.warning(f"comp pull: Things4u {path} location={zip_loc} walk failed "
                            f"({zerr}); falling back to the city walk")
         rows, err, _total = _things4u_walk(host, path, city_loc, rent, max_pages)
