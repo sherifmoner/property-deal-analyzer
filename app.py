@@ -22,7 +22,7 @@ app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 # code with no way to tell (the log lacked the v58.1 first-row-keys
 # line, the pool read 0 in-gate) and the worker died mid-pull; the tag
 # makes the live code visible.
-BUILD_TAG = "v67"
+BUILD_TAG = "v68"
 
 
 @app.after_request
@@ -3573,14 +3573,16 @@ def _rapi_rows_multi(items, fn):
 # (tolerance for host drift + gate_rapidapi's flat fake), and logs the
 # live top-level keys on first use.
 _YEAR_BUILT_RE = re.compile(r"Year Built:\s*(\d{4})")
+_T4U_SALE_PRICE_RE = re.compile(r"Sale Price:\s*\$?([\d,]+(?:\.\d+)?)")
 
 
-def _things4u_year_built_from_details(details):
-    """Year built out of a Things4u details[] list (v58.1): each entry
-    is {text: [...], category: "..."} and the year lives ONLY as text
-    ("Year Built: 1940" under "Building and Construction"). Bare
-    strings are searched too. None when absent or malformed — never
-    invented."""
+def _things4u_details_texts(details):
+    """The flat text list out of a Things4u details[] payload (v68:
+    extracted from _things4u_year_built_from_details so every details
+    scan reads the SAME collection). Each entry is {text: [...],
+    category: "..."}; bare strings are collected too, and a dict
+    payload's string/list values are flattened. Malformed input
+    yields an empty list — never a crash, never an invention."""
     texts = []
     if isinstance(details, list):
         for d in details:
@@ -3594,10 +3596,35 @@ def _things4u_year_built_from_details(details):
         for v in details.values():
             if isinstance(v, str): texts.append(v)
             elif isinstance(v, list): texts.extend(str(x) for x in v)
-    for s in texts:
+    return texts
+
+
+def _things4u_year_built_from_details(details):
+    """Year built out of a Things4u details[] list (v58.1): each entry
+    is {text: [...], category: "..."} and the year lives ONLY as text
+    ("Year Built: 1940" under "Building and Construction"). Bare
+    strings are searched too. None when absent or malformed — never
+    invented."""
+    for s in _things4u_details_texts(details):
         m = _YEAR_BUILT_RE.search(s or "")
         if m:
             try: return int(m.group(1))
+            except ValueError: continue
+    return None
+
+
+def _things4u_sale_price_from_details(details):
+    """Sale Price out of a Things4u details[] list (v68): on the live
+    feed last_sold_price is NULL on every row examined (410/410,
+    2026-11-07/08) while the real price is printed as details text —
+    "Sale Price: 115000" under the "Agent Only Data" category. The
+    first match wins; a leading $ and thousands commas are tolerated.
+    None when no details text carries a price — the row stays
+    honestly priceless (a no_price drop), never an invented number."""
+    for s in _things4u_details_texts(details):
+        m = _T4U_SALE_PRICE_RE.search(s or "")
+        if m:
+            try: return float(m.group(1).replace(",", ""))
             except ValueError: continue
     return None
 
@@ -3681,11 +3708,18 @@ def _things4u_fields(item):
     if beds == 0: beds = None
     full_baths = _sabri_num(_dpick("baths") if _dpick("baths") is not None else _pick("baths", "bathrooms"))
     if full_baths == 0: full_baths = None
+    # v68: the top-level price pick wins whenever it exists; ONLY a
+    # None falls back to the details[] "Sale Price:" text (the live
+    # feed's last_sold_price is NULL while the price sits in details
+    # — see _things4u_sale_price_from_details).
+    sold_price = _sabri_num(_pick("last_sold_price", "sold_price"))
+    if sold_price is None:
+        sold_price = _things4u_sale_price_from_details(item.get("details"))
     return dict(street=_s(addr.get("line")) or _s(_pick("address_line", "address")),
                 city=_s(addr.get("city")) or _s(_pick("city")),
                 zip_code=_s(addr.get("postal_code")) or _s(_pick("zip_code", "zip")),
                 state=_s(addr.get("state_code")) or _s(_pick("state")),
-                sold_price=_sabri_num(_pick("last_sold_price", "sold_price")),
+                sold_price=sold_price,
                 list_price=_sabri_num(_pick("list_price")),
                 sqft=_sabri_num(_dpick("sqft") if _dpick("sqft") is not None else _pick("sqft", "livingArea")),
                 beds=beds,
@@ -3717,7 +3751,8 @@ def _things4u_results(data):
 def _things4u_item_to_row(item, rent=False):
     """One Things4u search item -> the standard HomeHarvest columns
     (v58.1: captured shape via _things4u_fields). Sold price comes
-    ONLY from last_sold_price; a rent row's price is list_price
+    from _things4u_fields (the top-level last_sold_price, else the
+    v68 details[] Sale Price fallback); a rent row's price is list_price
     (sold_price stays None — the rent gate reads list_price).
     property_id travels with the row so the subject-detail ladder can
     call /properties/detail with the subject's own id."""
@@ -3735,38 +3770,95 @@ def _things4u_item_to_row(item, rent=False):
                 property_id=f["property_id"],
                 estimated_value=None, price_per_sqft=None)
 
-def _things4u_search(host, path, prop, rent=False):
-    """One Things4u search (sold or rent), paginated. Location is the
-    Realtor-v3 city form the playground verified ('city:West Chicago,
-    IL'); resultsPerPage=200 (the API's max); the walk stops on a
-    short page, the reported total, or the page cap (3 sold / 2
-    rent). minSoldDate is NOT sent: the hunt captured the parameter
-    name but not its exact format, and a wrong date format would fail
-    the whole call — the client-side horizon filter governs instead,
-    exactly as ReefAPI's adapter does. The first response's top-level
-    keys are logged so a live envelope mismatch is diagnosable."""
-    loc = f"city:{_s(prop.get('city'))}, {_s(prop.get('state'))}"
+def _things4u_walk(host, path, loc, rent, max_pages):
+    """One paginated Things4u walk over ONE location string (v68
+    helper; this was _things4u_search's loop before the ZIP-first
+    split). Returns (rows, err, total): err is the PAGE-1 error (a
+    later page's error keeps the accumulated rows and stops the
+    walk, exactly as the pre-v68 search behaved); total is the
+    envelope's reported data.total from the last page read (None
+    when the API never reported one). resultsPerPage=200 (the API's
+    max); the walk stops on a short page, the reported total, or
+    the page cap. The first response's top-level keys are logged
+    (with the location) so a live envelope mismatch is diagnosable."""
     rows = []
-    max_pages = 2 if rent else 3
+    total = None
     for page in range(1, max_pages + 1):
         data, err = _rapidapi_get(host, path,
                                   {"location": loc, "resultsPerPage": 200, "page": page})
         if err is not None:
-            if page == 1: return [], err
+            if page == 1: return [], err, None
             break
         if page == 1:
             keys = sorted(data.keys()) if isinstance(data, dict) else []
-            app.logger.warning(f"comp pull: Things4u {path} top-level keys: {keys}")
+            app.logger.warning(f"comp pull: Things4u {path} location={loc} top-level keys: {keys}")
             _items0 = _things4u_results(data)
             if _items0 and isinstance(_items0[0], dict):
-                app.logger.warning(f"comp pull: Things4u {path} first-row keys: "
+                app.logger.warning(f"comp pull: Things4u {path} location={loc} first-row keys: "
                                    f"{sorted(_items0[0].keys())}")
         items = _things4u_results(data)
         total = _rapi_dig(data, "data", "total")
         rows.extend(_rapi_rows(items, lambda it: _things4u_item_to_row(it, rent=rent)))
         if len(items) < 200: break
         if isinstance(total, (int, float)) and len(rows) >= total: break
-    return rows, None
+    app.logger.warning(f"comp pull: Things4u {path} location={loc} -> {len(rows)} rows (total={total})")
+    return rows, None, total
+
+def _things4u_search(host, path, prop, rent=False):
+    """One Things4u search (sold or rent): ZIP-first, then city
+    (v68). Locations are the Realtor-v3 forms the playground
+    verified ('city:West Chicago, IL'; 'zip:63106' verified live
+    2026-11-07/08 for the Leffingwell failure: the city-wide sample
+    starved the pull — St. Louis carries 6,974 sold rows and the
+    first two city pages hold ZERO from ZIP 63106, while the ZIP
+    search answers total=10, all in-ZIP). Order and discipline:
+      - with a ZIP on the property, the 'zip:{zip}' walk runs FIRST
+        (same pagination, same page caps: 3 sold / 2 rent);
+      - the city walk follows ONLY when the ZIP inventory is thin:
+        its reported total is < 200 or unknown, or the ZIP walk
+        returned 0 rows. A ZIP inventory >= 200 is the near set by
+        itself — the city walk is skipped (quota discipline) and
+        the skip is logged;
+      - a page-1 ERROR on the ZIP walk never fails the source: the
+        ZIP walk is treated as empty and the city walk decides —
+        the source errors only when the city walk's page 1 also
+        errors. (When the ZIP walk served rows and only the city
+        walk errors, the ZIP rows are kept and no error surfaces.)
+      - no ZIP on the property: the city walk exactly as pre-v68.
+    minSoldDate is NOT sent: the hunt captured the parameter name
+    but not its exact format, and a wrong date format would fail
+    the whole call — the client-side horizon filter governs
+    instead, exactly as ReefAPI's adapter does."""
+    max_pages = 2 if rent else 3
+    if hasattr(prop, "get"):
+        zipc = _s(prop.get("zip")).strip()
+        city = _s(prop.get("city")); state = _s(prop.get("state"))
+    else:
+        zipc = _s(prop["zip"]).strip()
+        city = _s(prop["city"]); state = _s(prop["state"])
+    city_loc = f"city:{city}, {state}"
+    if not zipc:
+        rows, err, _total = _things4u_walk(host, path, city_loc, rent, max_pages)
+        return rows, err
+    zip_loc = f"zip:{zipc}"
+    zrows, zerr, ztotal = _things4u_walk(host, path, zip_loc, rent, max_pages)
+    if zerr is not None:
+        app.logger.warning(f"comp pull: Things4u {path} location={zip_loc} walk failed "
+                           f"({zerr}); falling back to the city walk")
+        rows, err, _total = _things4u_walk(host, path, city_loc, rent, max_pages)
+        return rows, err
+    if isinstance(ztotal, (int, float)) and ztotal >= 200 and zrows:
+        app.logger.warning(f"comp pull: Things4u {path} location={zip_loc} inventory "
+                           f"{ztotal} >= 200 — city walk skipped (the ZIP pages are the near set)")
+        return zrows, None
+    crows, cerr, _ctotal = _things4u_walk(host, path, city_loc, rent, max_pages)
+    if cerr is not None:
+        if zrows:
+            app.logger.warning(f"comp pull: Things4u {path} location={city_loc} walk failed "
+                               f"({cerr}); keeping the {len(zrows)} ZIP rows")
+            return zrows, None
+        return [], cerr
+    return zrows + crows, None
 
 def _src_things4u(prop, past_days, radius_mi, host, label, rent=False):
     """Shared Things4u adapter: search, then the client-side horizon
