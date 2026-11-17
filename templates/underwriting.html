@@ -525,7 +525,7 @@
 {% set best = namespace(sid=None, score=-1) %}
 {% for s in scenarios %}{% set r = s.results|jload %}{% if r.score and s.strategy in ('Co-Living','Fix & Flip') and r.score > best.score %}{% set best.sid = s.id %}{% set best.score = r.score %}{% endif %}{% endfor %}
 {% for s in scenarios %}{% set r = s.results|jload %}
-<tr {% if s.id==best.sid %}style="background:#ecfdf5"{% endif %}><td>{{ s.strategy }}{% if s.id==best.sid %} <span class="badge cash">BEST EXIT</span>{% endif %}</td><td>{{ s.name }}</td>
+<tr {% if s.id==best.sid %}style="background:#defce9"{% endif %}><td>{{ s.strategy }}{% if s.id==best.sid %} <span class="badge cash">BEST EXIT</span>{% endif %}</td><td>{{ s.name }}</td>
 <td>{% if r.score and s.strategy in ('Co-Living','Fix & Flip') %}<b>{{ r.score }}</b> ({{ r.label }}){% else %}—{% endif %}</td>
 <td class="small">{% if s.strategy=='Fix & Flip' %}Profit {{ r.profit|money }} · ROI {{ r.roi }}% · margin {{ r.margin_pct }}%{% else %}CF {{ r.cashflow_mo|money }}/mo · CoC {{ r.coc_pct }}% · cap {{ r.cap_rate_pct }}% · DSCR {{ r.dscr }}{% endif %}</td>
 <td>{{ r.cash_in|money }}</td>

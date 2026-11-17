@@ -22,7 +22,7 @@ app.secret_key = os.environ.get("PDA_SECRET", "pda-local-dev")
 # code with no way to tell (the log lacked the v58.1 first-row-keys
 # line, the pool read 0 in-gate) and the worker died mid-pull; the tag
 # makes the live code visible.
-BUILD_TAG = "v68"
+BUILD_TAG = "v69"
 
 
 @app.after_request
@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY, property_id INTEGER,
 CREATE TABLE IF NOT EXISTS floorplans(id INTEGER PRIMARY KEY, property_id INTEGER, title TEXT,
  filename TEXT, notes TEXT, created_at TEXT DEFAULT (datetime('now')));
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS provider_usage(provider TEXT, month TEXT, requests INTEGER DEFAULT 0, PRIMARY KEY(provider, month));
 CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, property_id INTEGER, kind TEXT,
  status TEXT DEFAULT 'running', started_at TEXT, finished_at TEXT, message TEXT, detail TEXT,
  created_at TEXT DEFAULT (datetime('now')));
@@ -152,6 +153,12 @@ def init_db():
     # the stored official-PadSplit benchmark pull (Tier A room rents).
     for col in ("zpid", "padsplit_json", "padsplit_date"):
         if col not in cols: d.execute(f"ALTER TABLE properties ADD COLUMN {col} TEXT")
+    # v69: pull-cache freshness — the cache guard in job_comps reads
+    # these to serve a re-pull from stored rows instead of re-burning
+    # provider quota. Stamped at the end of every completed pull_comps.
+    for col, typ in (("last_pull_at", "TEXT"), ("last_pull_radius", "REAL"),
+                     ("last_pull_days", "INTEGER")):
+        if col not in cols: d.execute(f"ALTER TABLE properties ADD COLUMN {col} {typ}")
     ccols = [r[1] for r in d.execute("PRAGMA table_info(comps)")]
     if "ptype" not in ccols: d.execute("ALTER TABLE comps ADD COLUMN ptype TEXT")
     if "lot_sqft" not in ccols: d.execute("ALTER TABLE comps ADD COLUMN lot_sqft REAL")
@@ -415,15 +422,17 @@ def _sold_source_phrase(comps):
     return ", ".join(labels)
 
 def arv_reconciliation(prop, comps, bulk_keys=None):
-    """ONE reconciled ARV with the math shown: average of (adjusted avg comp price) and (avg $/sqft x subject sqft).
-    v57: the pool is stats-usable sold rows only — a bulk-flagged row or
-    a $/sqft outlier can never enter the ARV, even when pinned.
-    v59 D2: when the subject has no sqft on file, ARV is the average
-    sale price of the pool directly (ReiSearch's own ARV is the average
-    of the top-3 sale prices — no sqft needed); the $/sqft leg is
-    skipped, not zeroed, and the note says so."""
+    """ONE reconciled ARV with the math shown: the average sale price of the
+    pinned comps (or the top 3 by match score when none are pinned) — Sherif's
+    house formula (fix pass 2026-11-17, audit H1). The pool is exactly the
+    pinned-or-top-3 DATED, in-window, stats-usable set pinned_sold_stats
+    uses, so the header average and the ARV can never disagree. The $/sqft
+    figure is shown as REFERENCE ONLY (the v57 blend is retired — it let a
+    sqft-implied value move the ARV away from the sale prices). v59 D2
+    kept: when the subject has no sqft on file the $/sqft leg is skipped,
+    not zeroed, and the note says so."""
     usable = _stats_usable_sold(comps, bulk_keys)
-    pool = [c for c in usable if c["pinned"]] or sorted(usable, key=lambda c: -(c["match_score"] or 0))[:6]
+    pool = [c for c in usable if c["pinned"]] or sorted(usable, key=lambda c: -(c["match_score"] or 0))[:3]
     if not pool:
         return {"arv": None, "pool": pool, "note": "Not found — pull comps first."}
     _src = _sold_source_phrase(comps)
@@ -432,21 +441,21 @@ def arv_reconciliation(prop, comps, bulk_keys=None):
     adj_prices = [adjusted_price(c) for c in pool]
     avg_price = sum(adj_prices) / len(adj_prices)
     basis = f"your {len(pool)} pinned comp(s)" if any(c["pinned"] for c in pool) else f"top {len(pool)} comps by match score (pin comps to choose your own)"
-    if not prop["sqft"]:
-        return {"arv": round(avg_price), "pool": pool, "avg_price": round(avg_price),
-                "avg_ppsf": None, "ppsf_value": None, "count": len(pool),
-                "note": f"ARV = average of top {len(pool)} sale price(s) (${round(avg_price):,}) "
-                        f"— subject sqft missing, so no $/sqft value. Over {basis}. "
-                        f"{_srcline}, pulled {datetime.date.today().isoformat()}."}
-    ppsfs = [(adjusted_price(c) / c["sqft"]) for c in pool if c["sqft"]]
-    avg_ppsf = sum(ppsfs) / len(ppsfs) if ppsfs else 0
-    ppsf_value = avg_ppsf * prop["sqft"]
-    arv = round((avg_price + ppsf_value) / 2) if ppsf_value else round(avg_price)
-    return {"arv": arv, "pool": pool, "avg_price": round(avg_price), "avg_ppsf": round(avg_ppsf, 2),
-            "ppsf_value": round(ppsf_value), "count": len(pool),
-            "note": f"ARV = average of adjusted comp average (${round(avg_price):,}) and $/sqft method "
-                    f"(${round(avg_ppsf,2)}/sqft x {int(prop['sqft'])} sqft = ${round(ppsf_value):,}), "
-                    f"over {basis}. {_srcline}, pulled {datetime.date.today().isoformat()}."}
+    arv = round(avg_price)
+    out = {"arv": arv, "pool": pool, "avg_price": round(avg_price),
+           "avg_ppsf": None, "ppsf_value": None, "count": len(pool),
+           "note": f"ARV = average of the {len(pool)} sale price(s) (${round(avg_price):,}) "
+                   f"over {basis}. {_srcline}, pulled {datetime.date.today().isoformat()}."}
+    if prop["sqft"]:
+        ppsfs = [(adjusted_price(c) / c["sqft"]) for c in pool if c["sqft"]]
+        avg_ppsf = sum(ppsfs) / len(ppsfs) if ppsfs else 0
+        ppsf_value = avg_ppsf * prop["sqft"]
+        out.update({"avg_ppsf": round(avg_ppsf, 2), "ppsf_value": round(ppsf_value)})
+        out["note"] += (f" $/sqft reference only: ${round(avg_ppsf,2)}/sqft x "
+                        f"{int(prop['sqft'])} sqft = ${round(ppsf_value):,} (not used in the ARV).")
+    else:
+        out["note"] += " Subject sqft missing, so no $/sqft value."
+    return out
 
 def _panel_saved_inp(d, pid):
     """v61: the saved UW inputs the Overview verdict resolves its ARV
@@ -584,6 +593,29 @@ def _ppsf_of(c):
         except Exception: return None
     return None
 
+# Hard sold-date horizon (fix pass 2026-11-17, audit H2): NO sold comp older
+# than this may enter ARV / averages / cache-fresh / auto-pin math — Sherif's
+# comp-window rule (sold 6-12 months, stretch ~13-14) and NEVER 2023/2024.
+# 425 days ~= 14 months. Partial dates ("YYYY", "YYYY-MM" — the Cadastral
+# layer's month/year-only sales) read at their earliest day, so an ambiguous
+# old date stays OUT of math rather than in. A missing date is never in-window.
+_SOLD_HORIZON_DAYS = 425
+
+def _sold_horizon_cutoff():
+    return (datetime.date.today() - datetime.timedelta(days=_SOLD_HORIZON_DAYS)).isoformat()
+
+def _sold_date_in_window(event_date, cutoff=None):
+    """True when a stored sale date is dated and inside the hard horizon.
+    Partial dates read at their earliest day ('2025' -> '2025-01-01',
+    '2025-10' -> '2025-10-01'); a missing or unparseable date is never
+    in-window (a sale with no date can never prove it is recent)."""
+    if not event_date: return False
+    d = str(event_date).strip()[:10]
+    if len(d) == 4: d = d + "-01-01"
+    elif len(d) == 7: d = d + "-01"
+    if len(d) != 10: return False
+    return d >= (cutoff or _sold_horizon_cutoff())
+
 def _stats_usable_sold(rows, bulk_keys=None):
     """The sold rows any average/median/ARV/trend may use (v57, v57.1, v57.3):
     kind sold, priced, not excluded, not bulk-flagged, not a member of
@@ -607,11 +639,15 @@ def _stats_usable_sold(rows, bulk_keys=None):
     threshold, now applied read-side so pre-fix pools are fixed
     without any DB write) never enter any average/ARV: a $100
     deed-transfer row can no longer poison a top-3. Market Data's own
-    $1,000 pre-filter stays as a redundant no-op."""
+    $1,000 pre-filter stays as a redundant no-op. Fix pass 2026-11-17
+    (H2): the pool is also DATED inside the hard ~425-day horizon — a
+    dateless or 2023/2024 sale can never prove it is recent, so it
+    stays out of the math."""
     if bulk_keys is None:
         bulk_keys = _bulk_group_keys(rows)
     base = [c for c in (rows or [])
             if _cval(c, "kind") == "sold" and _cval(c, "price")
+            and _sold_date_in_window(_cval(c, "event_date"))
             and _cval(c, "price") >= _CAD_NOMINAL_MAX
             and not _cval(c, "excluded") and not _cval(c, "bulk_sale")
             and _bulk_group_key(c) not in bulk_keys]
@@ -715,6 +751,28 @@ def _padsplit_url(city, state, zipc=None, page=1):
     if page and page > 1: qs.append(f"page={page}")
     return u + ("?" + "&".join(qs) if qs else "")
 
+def _padsplit_bath_type(card):
+    """'shared' / 'private' / None from a PadSplit result card's bath-type
+    field when present (card-level bathroomType/bath_type/bathType, or any
+    nested rooms entry). The 2026-11-07 search payload carries no such
+    field — rooms are labeled 'Private/Shared full bathroom' on listing
+    DETAIL pages, not in the search payload — so this returns None
+    (unknown) today and the card still counts; the filter below is
+    dormant until PadSplit ships the field. When it is present and
+    says private, the card's rent is a private-bath rent, not a
+    shared-bath rent."""
+    for key in ("bathroomType", "bath_type", "bathType"):
+        v = _s(card.get(key)).lower()
+        if "private" in v: return "private"
+        if "shared" in v: return "shared"
+    rooms = card.get("rooms")
+    if isinstance(rooms, list):
+        for room in rooms:
+            if isinstance(room, dict):
+                t = _padsplit_bath_type(room)
+                if t: return t
+    return None
+
 def _padsplit_parse(html_text):
     """One PadSplit search page -> {"cards": [...], "count": n,
     "total_pages": n}. Each card: {"rent": weekly dollars (the card's
@@ -748,6 +806,10 @@ def _padsplit_parse(html_text):
             rent = _sabri_num(r.get("roomMinPrice"))
             if rent is None: rent = _sabri_num(r.get("minPriceWithoutDiscount"))
             if rent is None or rent <= 0: continue
+            # Fix pass 2026-11-17 (M10): a card whose known bath type is
+            # private is not a shared-bath rent — it drops out of the
+            # shared-bath median. Absent field (today's payload) counts.
+            if _padsplit_bath_type(r) == "private": continue
             out["cards"].append({"rent": rent,
                                  "available": r.get("status") == 1,
                                  "label": _s(r.get("listingStatus"))})
@@ -907,7 +969,12 @@ def _padsplit_benchmark(prop):
     dict shape — or None when no successful pull is stored (or the
     stored pull is too thin to benchmark). Median of ALL room cards
     the pull captured for the scope (available + waitlist, each card
-    contributing its advertised weekly rent)."""
+    contributing its advertised weekly rent). Fix pass 2026-11-17
+    (H4 + M10): the stored median EXPIRES after 30 days (same window
+    as the pull cache) — a fresh underwriting never prices from a
+    months-old median; the caller falls back to Tier B and labels it
+    as such. A city-wide payload is context only — it is never the
+    property benchmark. The method text carries the pull age."""
     try:
         raw = prop["padsplit_json"]
     except Exception:
@@ -920,25 +987,30 @@ def _padsplit_benchmark(prop):
     rents = [float(x) for x in (ps.get("weekly_rents") or [])
              if isinstance(x, (int, float)) and x > 0]
     if len(rents) < PADSPLIT_MIN_CARDS: return None
-    wk = _median(rents)
-    if ps.get("scope") == "city":
-        scope_txt = (f"the {prop['city']} area (city-wide listings — ZIP "
-                     f"{str(prop['zip'] or '')[:5]} itself listed "
-                     f"{ps.get('zip_n', 0)} room(s))")
-    else:
-        scope_txt = f"ZIP {str(prop['zip'] or '')[:5]}"
+    if ps.get("scope") == "city": return None
     try:
         pdate = prop["padsplit_date"]
     except Exception:
         pdate = None
+    if not pdate:
+        pdate = ps.get("date")
+    try:
+        _age = (datetime.date.today() - datetime.date.fromisoformat(str(pdate)[:10])).days
+    except Exception:
+        return None
+    if _age > 30: return None
+    wk = _median(rents)
+    scope_txt = f"ZIP {str(prop['zip'] or '')[:5]}"
     return {"weekly_per_room": round(wk), "monthly_per_room": round(wk * 52 / 12),
             "n": len(rents),
             "method": (f"Median of the {len(rents)} weekly room rents listed on "
                        f"PadSplit for {scope_txt} — available + waitlist rooms, "
                        f"one advertised rent per listed home. Actual PadSplit "
-                       f"listing data (Tier A), not a whole-house estimate."),
+                       f"listing data (Tier A), not a whole-house estimate. "
+                       f"Pulled {str(pdate)[:10]} ({_age} day{'s' if _age != 1 else ''} ago)."),
             "source": "PadSplit (official listings)",
             "date": pdate or ps.get("date") or "",
+            "age_days": _age,
             "padsplit_n": len(rents), "padsplit_scope": ps.get("scope") or "zip",
             "padsplit_url": ps.get("url") or ""}
 
@@ -958,9 +1030,20 @@ def pinned_sold_stats(sold, bulk_keys=None):
 
 def amortization(principal, annual_rate_pct, amort_years, loan_years=None):
     """Annual interest/principal/balance table."""
+    if principal <= 0: return {"payment": 0, "rows": [], "balloon": 0}
+    # Fix pass 2026-11-17 (underwriting audit A3): a 0-year amortization
+    # term is an interest-only loan, not a ZeroDivisionError (n = 0).
+    # Shape mirrors the interest-only branch: the flat payment, one row
+    # per loan year with no principal paid, balloon = the full principal.
+    if amort_years is None or amort_years <= 0:
+        r = (annual_rate_pct or 0) / 100 / 12
+        pmt = round(principal * r, 2)
+        yrs = int(loan_years or 0)
+        rows = [{"year": yr, "interest": round(pmt * 12, 2), "principal": 0,
+                 "balance": round(float(principal), 2)} for yr in range(1, yrs + 1)]
+        return {"payment": pmt, "rows": rows, "balloon": round(float(principal), 2)}
     loan_years = loan_years or amort_years
     r = (annual_rate_pct or 0) / 100 / 12; n = int(amort_years * 12)
-    if principal <= 0: return {"payment": 0, "rows": [], "balloon": 0}
     pmt = principal * r / (1 - (1 + r) ** -n) if r > 0 else principal / n
     bal, rows = float(principal), []
     for yr in range(1, int(loan_years) + 1):
@@ -1131,7 +1214,18 @@ def _paydown_y1(f):
     if pt == "principal_only":
         return min(amt, amt / months * 12) if months else 0.0
     if pt == "fixed":
-        pay = fnum(f.get("fixed_payment"), 0) or 0
+        # Fix pass 2026-11-17 (underwriting audit A1): the fixed payment
+        # on a Subject-To card is PITI — taxes + insurance are escrow,
+        # not principal. Only the P&I slice enters the split; the escrow
+        # slice was overstating Year-1 paydown by up to $8,316/yr
+        # (Senisa card-only: $23,052 booked vs the $14,736 fixture).
+        # The debt-service path (_row_payment) is untouched: it still
+        # counts the full payment + escrow as the monthly outlay.
+        # RESIDUAL (documented, not invented): with rate 0% and NO escrow
+        # itemized, the whole payment still books as principal — a 0%
+        # card needs its real rate on the card to split correctly.
+        pay = (fnum(f.get("fixed_payment"), 0) or 0) \
+            - ((fnum(f.get("taxes_mo"), 0) or 0) + (fnum(f.get("insurance_mo"), 0) or 0))
     elif not months:
         return 0.0  # v3.1: no effective term -> interest-only pricing -> $0 paydown
     else:
@@ -1502,11 +1596,16 @@ def compute_underwriting(strategy, raw_inp, prop):
            "furnishing": round(furnishing), "conversion": round(conversion),
            "total_project": round(total_project), "holding_cost": round(holding_total),
            "holding_months": round(h_months, 2), "uses": round(uses), "funded": round(funded),
-           "gap": round(gap), "cash_in": round(cash_in), "cash_needed": round(cash_needed),
+           # Fix pass 2026-11-17 (audit M2): the funding gap floors at $0
+           # everywhere it is stored/displayed — an over-funded project
+           # shows a $0 remaining gap, never a negative one. (The status
+           # logic above still reads the RAW gap; only the stored value
+           # is floored. The Fix & Flip path already floored its own.)
+           "gap": round(max(gap, 0)), "cash_in": round(cash_in), "cash_needed": round(cash_needed),
            "financing_costs": round(financing_costs),
            "funding_status": funding_status,
            "uses_override": round(uses_override) if uses_override else None,
-           "snap_uses": round(snap_uses), "snap_gap": round(snap_gap), "snap_status": snap_status,
+           "snap_uses": round(snap_uses), "snap_gap": round(max(snap_gap, 0)), "snap_status": snap_status,
            "debt_service_mo": round(debt_service), "entry_fee": round(entry_fee),
            "cash_contrib": round(cash_equity), "points_fees": round(points_fees),
            "closing_costs": round(closing), "debt_lines": debt_lines,
@@ -1545,10 +1644,12 @@ def compute_underwriting(strategy, raw_inp, prop):
                 "Overrun (rehab +20%, +3 mo)": _flip(sale, rehab * 1.2, holding_mo * (h_months + 3))}
         # Flip Deal Score: ReiSearch shows one for flips; scale = profit margin (50%, target 30%)
         # + ROI (50%, target 50%), labeled as our scale in Details.
+        # Fix pass 2026-11-17 (underwriting audit A5): clamp to [1, 99]
+        # like rentals — ReiSearch's blank flip state reads 1 Weak, not 0.
         def cs(x, t): return max(0.0, min(100.0, (x / t) * 100)) if t else 0.0
         parts = {"Profit margin (50%)": round(0.5 * cs((margin or 0) / 100, 0.30), 1),
                  "ROI on cash (50%)": round(0.5 * cs((roi or 0) / 100, 0.50), 1)}
-        fscore = max(0, min(99, round(sum(parts.values()))))
+        fscore = max(1, min(99, round(sum(parts.values()))))
         out.update({"sale_price": round(sale), "commission_pct": comm_pct, "closing_pct": close_pct,
                     "commission_amt": round(comm_amt), "closing_amt": round(close_amt),
                     "net_proceeds": round(net), "all_in": round(all_in), "profit": round(profit),
@@ -1682,7 +1783,11 @@ def compute_underwriting(strategy, raw_inp, prop):
     cf = noi - debt_service
     value = arv or price
     metrics = {"cf_per_room": (cf / rooms_n) if rooms_n else 0,
-               "dscr": (noi / debt_service) if debt_service else (1.5 if noi > 0 else 0),
+               # Fix pass 2026-11-17 (underwriting audit A6): with no debt
+               # the scenario DSCR is N/A (None), matching the summary —
+               # the old 1.5 placeholder was an invented number. The score
+               # engine still reads dscr_val below (None = no debt = 100).
+               "dscr": (noi / debt_service) if debt_service else None,
                "coc": (cf * 12 / cash_needed) if cash_needed else 0,
                "cap_rate": (noi * 12 / value) if value else 0,
                "breakeven": ((opex + debt_service) / (gross + other)) if (gross + other) else None,
@@ -1712,7 +1817,7 @@ def compute_underwriting(strategy, raw_inp, prop):
         noi_s = e2 - opex
         return {"revenue": round(e2), "expenses": round(opex), "loan": round(debt_service),
                 "net": round(e2 - opex - debt_service),
-                "dscr": round(noi_s / debt_service, 2) if debt_service else (1.5 if noi_s > 0 else 0),
+                "dscr": round(noi_s / debt_service, 2) if debt_service else None,
                 "cap_rate_pct": round(noi_s * 12 / value * 100, 2) if value else 0,
                 "coc_pct": round((e2 - opex - debt_service) * 12 / cash_needed * 100, 1) if cash_needed else None}
     scen = {"Downside (-10%)": _scen(0.9), "Base Case (0%)": _scen(1.0), "Upside (+10%)": _scen(1.1)}
@@ -1804,14 +1909,22 @@ def _unit_rows(lines, presets, qty_default=0):
     return [found.get(p, {"label": p, "qty": qty_default, "unit": 0}) for p in presets] + extra
 
 def _resolve_arv(prop, saved_inp, rec_arv):
-    """v60 — ONE ARV precedence (manual-ARV flag).
-    1. prop.arv (property edit form "ARV $", blank = auto) — top, unchanged.
-    2. Saved panel ARV when arv_manual is set — authoritative as typed,
+    """v60 — ONE ARV precedence (manual-ARV flag). Fix pass 2026-11-17
+    (audit M1, Sherif's Nov 6 decision: the Overview MAO follows a
+    panel-typed ARV): the PANEL-typed ARV wins over the property-level
+    one; the property-level value is the fallback when no panel ARV
+    is typed.
+    1. Saved panel ARV when arv_manual is set — authoritative as typed,
        INCLUDING blank/0 (a deliberately blank ARV means the cap falls back
        to price, exactly as the old ARRIVAL fixtures encode).
+    2. prop.arv (property edit form "ARV $", blank = auto).
     3. Live reconciled ARV from comps.
     4. Saved panel ARV without the flag (fallback when no comps/rec).
     Returns (arv_value_or_None, source_label)."""
+    inp = saved_inp or {}
+    saved = fnum(inp.get("arv"))
+    if inp.get("arv_manual") in (1, True, "1", "true", 1.0):
+        return (saved or None), "manual"
     if prop is not None:
         try:
             _pa = prop["arv"]
@@ -1819,10 +1932,6 @@ def _resolve_arv(prop, saved_inp, rec_arv):
             _pa = None
         if _pa:
             return _pa, "prop"
-    inp = saved_inp or {}
-    saved = fnum(inp.get("arv"))
-    if inp.get("arv_manual") in (1, True, "1", "true", 1.0):
-        return (saved or None), "manual"
     if rec_arv:
         return rec_arv, "rec"
     return (saved or None), "saved"
@@ -1838,8 +1947,9 @@ def uw_state(strategy, prop, saved_inp, ctx):
     beds = int(prop["beds"] or 4)
     st = {"strategy": strategy}
     st["purchase_price"] = g("purchase_price", prop["purchase_price"] or prop["list_price"] or "")
-    # v60: ONE ARV via _resolve_arv — prop.arv > manual saved arv > live rec >
-    # saved input. The manual flag (arv_manual) is set by the panel's ARV input
+    # v60: ONE ARV via _resolve_arv — manual saved arv > prop.arv > live rec >
+    # saved input (fix pass 2026-11-17, M1: Sherif's Nov 6 decision — the
+    # panel-typed ARV drives the MAO, the property-level value is fallback).
     # when the user types a value different from the auto (rec) one; clearing
     # the field clears the flag and the panel follows the rec again.
     # st["arv_manual"] / st["arv_auto"] feed the template (hidden flag input
@@ -1944,13 +2054,21 @@ def uw_state(strategy, prop, saved_inp, ctx):
         st["laundry_amt"] = g("laundry_amt", 0); st["laundry_period"] = g("laundry_period", "wk")
         st["misc_income_mo"] = g("misc_income_mo", 0); st["moving_fee"] = g("moving_fee", 0)
     elif strategy == "Short Term":
-        st["units"] = g("units", 1); st["nightly_rate"] = g("nightly_rate", 120)
+        # Fix pass 2026-11-17 (audit M8): STR revenue is NOT comp-fed —
+        # a fresh panel prefills BLANK, never the hardcoded 120/night.
+        # (Saved/user-entered values are untouched: g() only supplies
+        # the default when nothing is saved.)
+        st["units"] = g("units", 1); st["nightly_rate"] = g("nightly_rate", "")
         st["occupancy_pct"] = g("occupancy_pct", 65); st["avg_stay_nights"] = g("avg_stay_nights", 3)
         st["cleaning_fee"] = g("cleaning_fee", 90); st["platform_pct"] = g("platform_pct", 15)
         st["pet_fees_mo"] = g("pet_fees_mo", 0); st["parking_mo"] = g("parking_mo", 0); st["misc_mo"] = g("misc_mo", 0)
     elif strategy in ("Mid Term", "Long Term"):
+        # Fix pass 2026-11-17 (audit M8): LTR/MTR revenue is NOT
+        # comp-fed — a fresh panel prefills BLANK, never the pinned/
+        # top-3 rental average or the hardcoded 1600. (Saved/user-
+        # entered values are untouched.)
         st["units"] = g("units", 1)
-        st["rent_per_unit"] = g("rent_per_unit", (ctx.get("ltr") or {}).get("avg_rent") or 1600)
+        st["rent_per_unit"] = g("rent_per_unit", "")
         st["pet_mo"] = g("pet_mo", 0); st["parking_mo"] = g("parking_mo", 0)
         st["storage_mo"] = g("storage_mo", 0); st["laundry_mo"] = g("laundry_mo", 0); st["misc_mo"] = g("misc_mo", 0)
     # shared rental fields
@@ -2223,8 +2341,12 @@ def _row_gate(row, prop, radius_mi, price_key, horizon_cutoff=None):
     if not _s(row.get("street")).strip(): return False, "no_street", dist
     if not _nn(row.get(price_key)): return False, "no_price", dist
     if horizon_cutoff:
-        _dt = _s(row.get("last_sold_date"))[:10]
-        if _dt and _dt < horizon_cutoff: return False, "outside_window", dist
+        # Fix pass 2026-11-17 (H2): with a cutoff given, a sale with NO
+        # date fails — it can never prove it is in-window. Partial dates
+        # read at their earliest day via _sold_date_in_window.
+        if not _sold_date_in_window(row.get("last_sold_date"), horizon_cutoff):
+            return False, ("no_sale_date" if not _s(row.get("last_sold_date")).strip()
+                           else "outside_window"), dist
     return True, None, dist
 
 def _sold_row_gate(row, prop, radius_mi, horizon_cutoff=None):
@@ -2241,15 +2363,14 @@ def _sold_row_gate(row, prop, radius_mi, horizon_cutoff=None):
     pull stored 0, and the inflated count (45 >= the "rich"
     threshold) suppressed the Redfin/Sabri top-up whose rows do carry
     sold prices. Returns (ok, reason, dist); reason is one of
-    no_coords / outside_radius / no_street / no_price /
+    no_coords / outside_radius / no_street / no_price / no_sale_date /
     outside_window when not ok, else None.
-    horizon_cutoff (ISO date) is OPTIONAL and neither caller passes
-    one today: the merge stores a set deliberately deeper than any
-    single view window (the views window it), and the pool adapters
-    pre-filter by their own horizon before counting. The rule lives
-    here so any future caller applies the SAME test instead of
-    growing a third variant. Dedupe is NOT part of this test: it is
-    merge-side bookkeeping — a duplicate updates the stored row in
+    horizon_cutoff (ISO date): fix pass 2026-11-17 (H2) — the merge AND
+    the pool counters now ALWAYS pass the hard ~425-day cutoff, so the
+    stored set itself never holds an out-of-window or dateless sale
+    (Sherif's comp-window rule: never 2023/2024). The rule lives here
+    so any future caller applies the SAME test instead of growing a
+    third variant. Dedupe is NOT part of this test: it is merge-side bookkeeping — a duplicate updates the stored row in
     place and counts as accepted (the merge's usable count has always
     included duplicates). One deliberate tightening vs the pre-v43
     merge: a NaN longitude used to slip past its distance check and
@@ -2433,14 +2554,17 @@ def _bulk_group_keys(rows):
 # an incoming 0 likewise never beats a stored real count. Every
 # other keep-field keeps the None/"" rule.
 _MERGE_KEEP_FIELDS = ("beds", "baths", "sqft", "year_built", "lot_sqft",
-                      "ptype", "photo_url", "source_url")
+                      "ptype", "photo_url", "source_url", "event_date")
+# Fix pass 2026-11-17 (M4): event_date joins the keep-fields — a dateless
+# duplicate must never overwrite a dated sale's date with None (a stored
+# sale date is a FACT about the sale, like beds/baths/sqft).
 
 def _merge_keep_filled(d, comp_id, vals, subj):
     """vals adjusted so its _MERGE_KEEP_FIELDS never blank out the
     stored row comp_id's values (v65 F2). Returns vals unchanged when
     the stored row has nothing the incoming frame lacks."""
     row = d.execute("SELECT beds,baths,sqft,year_built,lot_sqft,ptype,"
-                    "photo_url,source_url FROM comps WHERE id=?",
+                    "photo_url,source_url,event_date FROM comps WHERE id=?",
                     (comp_id,)).fetchone()
     if row is None: return vals
     def _blank(v):
@@ -2522,7 +2646,10 @@ def _merge_sold_frame(d, prop, df, radius_mi, subj, source_override=None, touche
     # --- pass 1: build the candidate rows (gate + subject check only) ---
     cands = []
     for _, r in df.iterrows():
-        ok, reason, dist = _sold_row_gate(r, prop, radius_mi)
+        # Fix pass 2026-11-17 (H2): the hard ~425-day cutoff applies at
+        # the merge — every sold path (HomeHarvest, RapidAPI, Cadastral,
+        # widening) stores only dated, in-window sales.
+        ok, reason, dist = _sold_row_gate(r, prop, radius_mi, _sold_horizon_cutoff())
         if not ok:
             if drops is not None: _drop_note(drops, reason, r)
             continue
@@ -2723,6 +2850,54 @@ def _collapse_rent_view(rows):
         if new_rich > old_rich or (new_rich == old_rich and new_ms > old_ms):
             out[hit] = d; meta[hit] = (gkey, beds)
     return out
+
+def _cap_kind_to_50(d, pid, prop, subj, kind, past_days=None):
+    """The v69 50-comp cap (Sherif, 2026-11-14): at most 50 visible
+    comps per kind per property. Rows are ranked by the view's own
+    display key (same-street first, then tier / match group, then
+    match score, then distance — the sold_view / rents_view sorts);
+    the top 50 stay, the rest are excluded=1 (never deleted —
+    un-excluding restores them, and a re-pull never re-includes a
+    row the user excluded by hand: the merge's excluded rows stay
+    excluded). Pinned rows rank FIRST, so they survive unless more
+    than 50 rows are pinned — the visible set NEVER exceeds 50 rows
+    total (fix pass 2026-11-17, M6: the old pinned-union math could
+    keep 50 + pinned). The cap does nothing below 3 sold rows (the
+    3-comp minimum — a thin set is never thinned) and never runs on
+    a set already at or under 50. Sold rows are ranked inside the
+    hard ~425-day window only, and the <3 check runs AFTER the window
+    filter (fix pass 2026-11-17, M6: a dateless row is never ranked
+    as in-window). Rentals have no window. Returns the number
+    excluded."""
+    import datetime as _dt
+    rows = [dict(r) for r in d.execute(
+        "SELECT * FROM comps WHERE property_id=? AND kind=? AND excluded=0",
+        (pid, kind)).fetchall()]
+    if kind == "sold" and past_days is not None:
+        cutoff = (_dt.date.today() - _dt.timedelta(days=min(past_days, _SOLD_HORIZON_DAYS))).isoformat()
+        rows = [r for r in rows if _sold_date_in_window(r.get("event_date"), cutoff)]
+    if kind == "sold" and len(rows) < 3:
+        return 0
+    if len(rows) <= 50:
+        return 0
+    pinned = [r for r in rows if r.get("pinned")]
+    rest = [r for r in rows if not r.get("pinned")]
+    if kind == "sold":
+        key = lambda c: (_same_street(prop, c["address"]), comp_tier(subj, c),
+                         -(c["match_score"] or 0),
+                         c["distance_mi"] if c["distance_mi"] is not None else 9e9)
+    else:
+        key = lambda c: (_same_street(prop, c["address"]), rent_match_group(subj, c),
+                         -(c["match_score"] or 0),
+                         c["distance_mi"] if c["distance_mi"] is not None else 9e9)
+    pinned.sort(key=key); rest.sort(key=key)
+    keep = {r["id"] for r in (pinned + rest)[:50]}
+    excluded = [r for r in rows if r["id"] not in keep]
+    for r in excluded:
+        d.execute("UPDATE comps SET excluded=1 WHERE id=?", (r["id"],))
+    d.commit()
+    return len(excluded)
+
 
 def _collapse_stored_sold_twins(d, pid, subj=None):
     """Stored-twin collapse for SOLD comps (v65.2): rows ALREADY in
@@ -2975,15 +3150,13 @@ def _is_unreachable_err(e):
 RAPIDAPI_REEF_HOST = "realtor-com-property-data-api.p.rapidapi.com"
 RAPIDAPI_REDFIN_HOST = "redfin-com-data.p.rapidapi.com"
 RAPIDAPI_SABRI_HOST = "realtor16.p.rapidapi.com"
-# v48: private-zillow (ONEAPI) — playground-captured 2026-11-05
-# (research/zillow-api-capture-2026-11-05.md): subject detail BY PLAIN
-# STREET ADDRESS (/By Property Address) and sold comps by map bounds
-# (/search/bymapbounds). BASIC plan 250 requests/month HARD cap — the
-# subject lookup fires at most once per pull and only while the subject
-# still lacks specs or photos; the bounds pull is one call per pull.
-RAPIDAPI_PZ_HOST = "private-zillow.p.rapidapi.com"
+# v69: private-zillow (ONEAPI) PRUNED — the provider is down
+# (503/hang in its own playground, 2026-11-06) and the API is delisted;
+# the by-address subject fill, the bounds sold search and the
+# autocomplete-zpid helper are deleted with it. The subject-fill
+# ladder is now Things4u detail -> ReefAPI Zillow backup (stored zpid
+# only) -> Unofficial-Zillow photos -> jina-Zillow subject fill.
 RAPIDAPI_SRC_REEF = "RapidAPI (ReefAPI)"
-RAPIDAPI_SRC_PZ = "RapidAPI (Zillow)"
 RAPIDAPI_SRC_REDFIN = "RapidAPI (Redfin)"
 RAPIDAPI_SRC_SABRI = "RapidAPI (Realtor16)"
 # v58: Things4u — TWO new free BASIC subscriptions in Sherif's account
@@ -2991,11 +3164,12 @@ RAPIDAPI_SRC_SABRI = "RapidAPI (Realtor16)"
 # (research/things4u-api-facts-2026-11-06.md): Realtor Search
 # (150 req/mo hard limit) and Realty US (500 req/mo hard limit), both
 # GET properties/search-sold AND properties/search-rent over the same
-# Realtor.com data. Realty US is asked first; Realtor Search is the
+# Realtor.com data. Realty US was asked first; Realtor Search was the
 # failover for the same data, not a second source.
-RAPIDAPI_T4U_US_HOST = "realty-us.p.rapidapi.com"
+# v69: Realty US is DELISTED ("API not found", 2026-11-14) — its
+# adapters, constants and registry entries are deleted; Realtor
+# Search is now the only Things4u source.
 RAPIDAPI_T4U_RS_HOST = "realtor-search.p.rapidapi.com"
-RAPIDAPI_SRC_T4U_US = "RapidAPI (Realty US)"
 RAPIDAPI_SRC_T4U_RS = "RapidAPI (Realtor Search)"
 
 # v58: 429 skip-fast. A host that answers HTTP 429 is quota-dead for
@@ -3053,13 +3227,265 @@ def _rapidapi_key():
     rendered page (Settings displays it masked)."""
     return os.environ.get("RAPIDAPI_API_KEY") or get_setting("rapidapi_key") or ""
 
+# ---------------------------------------------------------------- v69 provider usage
+# Per-provider monthly counters + hard stops. PROVIDER_LIMITS is the
+# app-side cap: a provider with limit None has NO app cap (the
+# provider-side 429 flag is the only brake). Verified free quotas
+# 2026-11-14: Sabri (realtor16) 30/mo, Redfin.com Data 100/mo,
+# Realtor Search 150/mo (RapidAPI dashboard, Sherif's account);
+# ReefAPI direct 1,000 credits ONE-TIME (cumulative, month='total');
+# apillow 50 properties/mo; RentCast 50 req/mo (the app cap is the
+# ONLY protection — RentCast has no vendor-side cap and overage is
+# billed, so the counter check must run before every RentCast call
+# with no bypass path). HouseData + OpenWebNinja are DELISTED and
+# are not in this table at all. Never claim 3,000 pulls/mo: the
+# honest free stack is ~280 RapidAPI req/mo + apillow 50/mo +
+# ReefAPI's one-time 1,000 credits (+ RentCast 50/mo if the card is
+# ever approved).
+PROVIDER_LIMITS = {"rentcast": 50, "apillow": 50, "reefapi_direct": 1000,
+                   "sabri": 30, "redfin": 100, "realtor_search": 150,
+                   "reefapi_rapidapi": None}
+PROVIDER_DISPLAY = {"rentcast": "RentCast", "apillow": "apillow",
+                    "reefapi_direct": "ReefAPI (direct)",
+                    "sabri": "Realtor16 (Sabri)",
+                    "redfin": "Redfin.com Data",
+                    "realtor_search": "Realtor Search",
+                    "reefapi_rapidapi": "ReefAPI (RapidAPI)"}
+# RapidAPI host -> provider (the pool hosts only; the Zillow backup
+# hosts keep their pre-v69 uncounted behaviour).
+_RAPIDAPI_HOST_PROVIDER = {RAPIDAPI_REEF_HOST: "reefapi_rapidapi",
+                           RAPIDAPI_REDFIN_HOST: "redfin",
+                           RAPIDAPI_SABRI_HOST: "sabri",
+                           RAPIDAPI_T4U_RS_HOST: "realtor_search"}
+
+class _MonthlyCapError(Exception):
+    """Raised (never sent) when a provider's app-side monthly cap is
+    already reached: the transport helper returns (None, this) without
+    making a request, and _rapi_fail_reason classifies it as
+    "quota reached (monthly cap)"."""
+
+
+def _usage_month(provider):
+    """The usage row's month key: ReefAPI direct is cumulative
+    (month='total'), everything else is the current calendar month."""
+    if provider == "reefapi_direct":
+        return "total"
+    return datetime.date.today().strftime("%Y-%m")
+
+
+def _usage_count(provider):
+    """Requests/credits used by a provider in its current period
+    (0 when nothing is recorded)."""
+    if provider not in PROVIDER_LIMITS:
+        return 0
+    try:
+        row = db().execute("SELECT requests FROM provider_usage WHERE provider=? AND month=?",
+                           (provider, _usage_month(provider))).fetchone()
+    except Exception:
+        return 0
+    return int(row["requests"]) if row else 0
+
+
+def _usage_add(provider, n=1):
+    """Record n completed requests/credits for a provider. A provider
+    outside PROVIDER_LIMITS is never recorded (its host is unmapped);
+    a None-limit provider IS recorded (the Settings readout shows the
+    real count next to "no app cap")."""
+    if provider not in PROVIDER_LIMITS or not n:
+        return
+    try:
+        db().execute("""INSERT INTO provider_usage(provider, month, requests) VALUES(?,?,?)
+                        ON CONFLICT(provider, month) DO UPDATE SET requests=requests+excluded.requests""",
+                     (provider, _usage_month(provider), int(n)))
+        db().commit()
+    except Exception as e:
+        app.logger.warning(f"provider usage: could not record {n} for {provider}: {e!r}")
+
+
+def _usage_allowed(provider, n=1):
+    """True when provider may spend n more requests/credits this
+    period. A provider with limit None is always allowed; an unmapped
+    provider is always allowed (no cap applies to it)."""
+    if provider not in PROVIDER_LIMITS:
+        return True
+    lim = PROVIDER_LIMITS[provider]
+    if lim is None:
+        return True
+    return _usage_count(provider) + n <= lim
+
+
+def _reefapi_key():
+    """ReefAPI DIRECT key (api.reefapi.com — a different key/pool from
+    the RapidAPI-hosted ReefAPI adapter): env REEFAPI_KEY first, then
+    the reefapi_key settings store. Sent only as the x-api-key header."""
+    return os.environ.get("REEFAPI_KEY") or get_setting("reefapi_key") or ""
+
+
+def _rentcast_key():
+    """RentCast key: env RENTCAST_API_KEY first, then the rentcast_key
+    settings store. Sent only as the X-Api-Key header. No key exists
+    until the RentCast plan is activated (card decision pending) —
+    with no key the adapter is dormant by design."""
+    return os.environ.get("RENTCAST_API_KEY") or get_setting("rentcast_key") or ""
+
+
+def _apillow_key():
+    """apillow key: env APILLOW_API_KEY first, then the apillow_key
+    settings store. Sent only as the X-API-Key header."""
+    return os.environ.get("APILLOW_API_KEY") or get_setting("apillow_key") or ""
+
+
+def hh_comp_frames_on():
+    """The HomeHarvest comp-frame flag (v69): "1" in the settings
+    store (env HH_COMP_FRAMES=1 also works) forces the HomeHarvest
+    comp frames on every pull; default OFF — they then run only when
+    the API union is thin. The setting is not exposed in the Settings
+    UI (it is a power-user escape hatch); set it in the DB or the
+    environment. The flag affects COMP frames only — for-sale frames
+    and deep subject lookups always run."""
+    return (os.environ.get("HH_COMP_FRAMES") or "").strip() == "1" or get_setting("hh_comp_frames") == "1"
+
+
+def _reefapi_post(action, body, timeout=15):
+    """One ReefAPI DIRECT POST (POST https://api.reefapi.com/realtor/v1/<action>).
+    Returns (data, None) where data is the envelope's data payload, or
+    (None, err). No key -> (None, None) without any request. The
+    envelope is {ok, data, meta, error}: ok:false is an error, never a
+    silent empty. 2 credits per completed call (failed calls are free
+    vendor-side, so this count is conservative): the counter check
+    runs BEFORE the request and the +2 lands only AFTER a successful
+    response (raise_for_status passes — a 429/500 burns zero credits,
+    fix pass 2026-11-17, M5). NOTE: an ok:false envelope on a 200 still
+    counts — the request reached the vendor; only HTTP errors are free."""
+    if not _reefapi_key():
+        return None, None
+    if not _usage_allowed("reefapi_direct", 2):
+        return None, _MonthlyCapError("ReefAPI direct monthly cap reached")
+    try:
+        r = requests.post(f"https://api.reefapi.com/realtor/v1/{action}", json=body,
+                          headers={"x-api-key": _reefapi_key()},
+                          timeout=timeout)
+        r.raise_for_status()
+        _usage_add("reefapi_direct", 2)
+        payload = r.json()
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        return None, e
+    except Exception as e:
+        return None, e
+    if not isinstance(payload, dict):
+        return None, Exception("ReefAPI direct: unexpected non-object response")
+    if not payload.get("ok"):
+        err = payload.get("error") or {}
+        return None, Exception(f"ReefAPI direct: {err.get('message') or err.get('code') or 'request failed'}")
+    return payload.get("data"), None
+
+
+def _rentcast_get(path, params=None, timeout=15):
+    """One RentCast GET (https://api.rentcast.io/v1<path>). Returns
+    (json, None) or (None, err). No key -> (None, None) without any
+    request. The app-side 50/mo cap is the ONLY protection against
+    billed overage: the counter check runs BEFORE the request and the
+    +1 lands only AFTER a successful response (raise_for_status passes
+    — a 429/500 burns zero quota, fix pass 2026-11-17, M5)."""
+    if not _rentcast_key():
+        return None, None
+    if not _usage_allowed("rentcast", 1):
+        return None, _MonthlyCapError("RentCast monthly cap reached")
+    try:
+        r = requests.get(f"https://api.rentcast.io/v1{path}", params=params or {},
+                         headers={"X-Api-Key": _rentcast_key()},
+                         timeout=timeout)
+        r.raise_for_status()
+        _usage_add("rentcast", 1)
+        return r.json(), None
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        return None, e
+    except Exception as e:
+        return None, e
+
+
+def _apillow_run(body, poll_s=30, poll_every_s=5):
+    """One apillow job: POST /v1/properties -> job_id, then poll
+    GET /v1/results/{job_id} until complete/failed (cap ~30s).
+    Returns (results, None) where results is the list of result
+    entries, or (None, err). No key -> (None, None) without any
+    request. Quota is counted PER PROPERTY RETURNED, not per call:
+    the pre-check reserves max_items (free plan: 5/request) and the
+    caller adds the actual returned count after completion (a job
+    returning nothing is free). Poll GETs never consume quota."""
+    if not _apillow_key():
+        return None, None
+    max_items = int(body.get("max_items") or 5)
+    if not _usage_allowed("apillow", max_items):
+        return None, _MonthlyCapError("apillow monthly cap reached")
+    try:
+        r = requests.post("https://api.apillow.co/v1/properties", json=body,
+                          headers={"X-API-Key": _apillow_key(),
+                                   "Content-Type": "application/json"},
+                          timeout=15)
+        r.raise_for_status()
+        started = r.json()
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        return None, e
+    except Exception as e:
+        return None, e
+    job_id = started.get("job_id") if isinstance(started, dict) else None
+    if not job_id:
+        return None, Exception("apillow: no job_id in response")
+    deadline = time.time() + poll_s
+    def _once():
+        """One results GET -> (status, results, err). status is
+        'complete' / 'failed' / any other in-progress value."""
+        try:
+            r = requests.get(f"https://api.apillow.co/v1/results/{job_id}",
+                             headers={"X-API-Key": _apillow_key()},
+                             timeout=15)
+            r.raise_for_status()
+            res = r.json()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            return None, None, e
+        except Exception as e:
+            return None, None, e
+        if not isinstance(res, dict):
+            return None, None, Exception("apillow: unexpected non-object result")
+        if res.get("status") == "complete":
+            results = res.get("results")
+            return "complete", (results if isinstance(results, list) else []), None
+        return res.get("status"), None, None
+    while True:
+        status, results, err = _once()
+        if err is not None: return None, err
+        if status == "complete": return results, None
+        if status == "failed":
+            return None, Exception("apillow: job failed")
+        if time.time() >= deadline:
+            # Fix pass 2026-11-17 (L4): ONE grace poll at the deadline —
+            # the job may have completed just after the last poll; if so
+            # it returns (and the caller counts it) like a normal
+            # completion instead of losing the quota silently.
+            status, results, err = _once()
+            if err is None and status == "complete": return results, None
+            app.logger.warning(f"apillow: job {job_id} did not complete within {poll_s}s — "
+                               f"up to {max_items} properties may be consumed server-side "
+                               f"without a count (uncounted, not zero).")
+            return None, Exception(f"apillow: job did not complete in time (job {job_id})")
+        time.sleep(poll_every_s)
+
 def _rapidapi_get(host, path, params=None, timeout=15, retries=2):
     """One RapidAPI GET. Returns (json, None) or (None, err). No key ->
     (None, None) without any request. v58: 15s cap (was 30s — a hung
     provider must never stall the pull) and a bounded retry (x2, short
     backoff) on ConnectionError/Timeout ONLY — an HTTP error (429 quota
-    included) surfaces immediately so the quota-dead flag can catch it."""
+    included) surfaces immediately so the quota-dead flag can catch it.
+    v69: the provider's app-side monthly cap is enforced BEFORE the
+    request (a denial returns a _MonthlyCapError without calling) and
+    a SUCCESSFUL call counts +1 (raise_for_status passes — a 429/500
+    burns zero quota, fix pass 2026-11-17, M5). A ConnectionError/
+    Timeout never completes, so it never counts."""
     if not _rapidapi_key(): return None, None
+    _prov = _RAPIDAPI_HOST_PROVIDER.get(host)
+    if _prov is not None and not _usage_allowed(_prov, 1):
+        return None, _MonthlyCapError(f"{_prov} monthly cap reached")
     last_err = None
     for attempt in range(retries + 1):
         try:
@@ -3067,6 +3493,7 @@ def _rapidapi_get(host, path, params=None, timeout=15, retries=2):
                              headers={"X-RapidAPI-Key": _rapidapi_key(), "X-RapidAPI-Host": host},
                              timeout=timeout)
             r.raise_for_status()
+            if _prov is not None: _usage_add(_prov, 1)
             return r.json(), None
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             last_err = e
@@ -3081,8 +3508,13 @@ def _rapidapi_get(host, path, params=None, timeout=15, retries=2):
 def _rapidapi_post(host, path, body, timeout=15, retries=2):
     """One RapidAPI POST (the ReefAPI sold search takes a JSON body).
     Same contract as _rapidapi_get (v58: 15s cap, retry on
-    ConnectionError/Timeout only)."""
+    ConnectionError/Timeout only). v69: same monthly-cap enforcement
+    and +1-per-successful-call counting as _rapidapi_get (a 429/500
+    burns zero quota, fix pass 2026-11-17, M5)."""
     if not _rapidapi_key(): return None, None
+    _prov = _RAPIDAPI_HOST_PROVIDER.get(host)
+    if _prov is not None and not _usage_allowed(_prov, 1):
+        return None, _MonthlyCapError(f"{_prov} monthly cap reached")
     last_err = None
     for attempt in range(retries + 1):
         try:
@@ -3090,6 +3522,7 @@ def _rapidapi_post(host, path, body, timeout=15, retries=2):
                               headers={"X-RapidAPI-Key": _rapidapi_key(), "X-RapidAPI-Host": host},
                               timeout=timeout)
             r.raise_for_status()
+            if _prov is not None: _usage_add(_prov, 1)
             return r.json(), None
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             last_err = e
@@ -3101,16 +3534,9 @@ def _rapidapi_post(host, path, body, timeout=15, retries=2):
             return None, e
     return None, last_err
 
-# v49: the private-zillow wrapper is flaky in production (live PA
-# evidence 2026-11-05: a sold search answered HTTP 503 {"message":
-# "503: Zillow is temporarily limiting requests, please retry in a
-# few seconds"} and the Garland subject lookup answered HTTP 404 from
-# PA minutes after the identical playground call returned 200).
-# v58: the retry is GONE — the provider is DOWN (its sold search hangs
-# in its own playground, 2026-11-06), so a retry only burns pull time.
-# The sold search is no longer called at all; the by-address subject
-# lookup gets ONE attempt with an 8s cap, as the LAST subject-fill
-# resort. A 503/404/timeout degrades to the honest not-filled state.
+# v69: the private-zillow wrapper is deleted with the provider
+# (pruned — see the constants above). _err_status stays: the
+# _rapi_fail_reason read shares it.
 
 def _err_status(err):
     """The HTTP status an exception carries (via its response), else
@@ -3118,19 +3544,6 @@ def _err_status(err):
     resp = getattr(err, "response", None)
     code = getattr(resp, "status_code", None)
     return code if isinstance(code, int) else None
-
-def _pz_get(path, params, retry_404=False):
-    """One private-zillow GET (v58: SINGLE attempt, 8s cap — the
-    v49 bounded retry is retired with the sold search). Returns
-    (data, err, attempts, last_status) — the same contract the subject
-    fill reads, so its call sites are unchanged. A failure degrades to
-    that attempt's error; it can never raise into the pull (the v40
-    containment rule). retry_404 is kept in the signature for the
-    callers' sake and is ignored: a 404 is the honest not-on-Zillow
-    answer, not a retry trigger."""
-    data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, path, params, timeout=8, retries=0)
-    last_status = _err_status(err) if err is not None else 200
-    return data, err, 1, last_status
 
 def _rapi_dig(obj, *keys):
     cur = obj
@@ -3189,18 +3602,21 @@ def _reef_item_to_row(item):
                 estimated_value=None, price_per_sqft=None)
 
 def _rapi_horizon_cutoff(past_days):
-    """Client-side sold-date horizon for the pool frames. The pool APIs
-    return recency-sorted AREA lists (ReefAPI's city search spans
-    thousands of sales), so the date bound is applied here, at
-    max(past_days, 1095) — the same 3-year floor the retired v3/list
-    route used server-side, keeping the depth the views window over.
-    Rows whose sold date cannot be read are kept (a dateless row is
-    stored dateless, never re-dated)."""
-    return (datetime.date.today() - datetime.timedelta(days=max(past_days, 1095))).isoformat()
+    """Client-side sold-date horizon for the pool frames. Fix pass
+    2026-11-17 (H2): the bound is min(past_days, _SOLD_HORIZON_DAYS)
+    — the pool NEVER admits a sale older than ~425 days, whatever
+    window the caller asked for (the old max(past_days, 1095) 3-year
+    floor let all of 2024 and late 2023 in, against Sherif's
+    comp-window rule)."""
+    return (datetime.date.today() - datetime.timedelta(days=min(past_days, _SOLD_HORIZON_DAYS))).isoformat()
 
 def _rapi_in_horizon(rows, past_days):
+    """Sold rows inside the hard horizon (fix pass 2026-11-17, H2):
+    dateless rows are DROPPED, not kept — a sale with no date can
+    never prove it is recent. Sold paths only; rent rows never pass
+    through here."""
     cut = _rapi_horizon_cutoff(past_days)
-    return [r for r in rows if not r.get("last_sold_date") or r["last_sold_date"] >= cut]
+    return [r for r in rows if _sold_date_in_window(r.get("last_sold_date"), cut)]
 
 def _redfin_region_id(prop):
     """Resolve the property's city to a Redfin regionId via Nathan's
@@ -3433,6 +3849,7 @@ def _rapi_fail_reason(err):
     """Short human reason class for one source's failure, used in the
     failover note the pull surfaces. Never carries a URL or the key."""
     if err is None: return "no results"
+    if isinstance(err, _MonthlyCapError): return "quota reached (monthly cap)"
     resp = getattr(err, "response", None)
     code = getattr(resp, "status_code", None)
     if code is None and "429" in str(err): code = 429
@@ -3496,15 +3913,18 @@ def _rapi_count_in_gate(rows, prop, radius_mi):
     tested coordinates + distance only, counted rows the merge then
     dropped for having no sold price or no street, and a rich-looking
     count suppressed the top-up sources (the live 45-in-gate /
-    0-stored pull — see _sold_row_gate)."""
-    return sum(1 for r in rows or [] if _sold_row_gate(r, prop, radius_mi)[0])
+    0-stored pull — see _sold_row_gate). Fix pass 2026-11-17 (H2):
+    the counter applies the same hard ~425-day cutoff as the merge,
+    so counter and merge can never diverge on dates either."""
+    return sum(1 for r in rows or [] if _sold_row_gate(r, prop, radius_mi, _sold_horizon_cutoff())[0])
 
 def _frame_in_gate(df, prop, radius_mi):
     """In-gate count for an already-built DataFrame (the Cadastral /
     jina frames, whose adapters don't return outcomes): rows the sold
-    MERGE would accept, per the shared _sold_row_gate."""
+    MERGE would accept, per the shared _sold_row_gate — including the
+    hard ~425-day cutoff (fix pass 2026-11-17, H2)."""
     if df is None or not len(df): return 0
-    return sum(1 for _, r in df.iterrows() if _sold_row_gate(dict(r), prop, radius_mi)[0])
+    return sum(1 for _, r in df.iterrows() if _sold_row_gate(dict(r), prop, radius_mi, _sold_horizon_cutoff())[0])
 
 def _sabri_radius(radius_mi):
     """The radius sent to Sabri's coordinate endpoints (v42). forrent
@@ -3892,17 +4312,9 @@ def _src_things4u(prop, past_days, radius_mi, host, label, rent=False):
     if rent: return rows, None, label
     return _rapi_in_horizon(rows, past_days), None, label
 
-def _src_things4u_realty_us_sold(prop, past_days, radius_mi=1.0):
-    return _src_things4u(prop, past_days, radius_mi, RAPIDAPI_T4U_US_HOST,
-                         RAPIDAPI_SRC_T4U_US)
-
 def _src_things4u_realtor_search_sold(prop, past_days, radius_mi=1.0):
     return _src_things4u(prop, past_days, radius_mi, RAPIDAPI_T4U_RS_HOST,
                          RAPIDAPI_SRC_T4U_RS)
-
-def _src_things4u_realty_us_rent(prop, past_days, radius_mi=1.0):
-    return _src_things4u(prop, past_days, radius_mi, RAPIDAPI_T4U_US_HOST,
-                         RAPIDAPI_SRC_T4U_US, rent=True)
 
 def _src_things4u_realtor_search_rent(prop, past_days, radius_mi=1.0):
     return _src_things4u(prop, past_days, radius_mi, RAPIDAPI_T4U_RS_HOST,
@@ -4070,137 +4482,370 @@ def _src_sabri_forrent(prop, past_days, radius_mi=1.0):
         if _rapi_count_in_gate_rent(rows, prop, radius_mi) >= RAPIDAPI_UNION_RICH: break
     return rows, None, RAPIDAPI_SRC_SABRI
 
-def _pz_subject_values(det):
-    """One private-zillow propertyDetails object -> the candidate
-    subject fill values (pure; no I/O). Shape is the playground
-    capture (2026-11-05): bedrooms / bathrooms / livingArea,
-    resoFacts.yearBuilt, zestimate, latitude/longitude, photos at
-    originalPhotos[].mixedSources.jpeg[].url (several widths — the
-    LARGEST is kept), hiResImageLink / desktopWebHdpImageLink as
-    fallbacks. `price` on an off-market (homeStatus OTHER) property
-    IS the Zestimate — it is read only as the estimate fallback and
-    is NEVER a list price. The address sub-object's city/ZIP feed the
-    sanity match (_pz_subject_match); they are read defensively and
-    may be absent, in which case the match falls back to coords."""
-    if not isinstance(det, dict): return {}
-    photos = []
-    for ph in det.get("originalPhotos") or []:
-        if not isinstance(ph, dict): continue
-        jpegs = _rapi_dig(ph, "mixedSources", "jpeg") or []
-        best, best_w = None, -1
-        for j in jpegs:
-            if not isinstance(j, dict): continue
-            u = j.get("url")
-            if not u: continue
-            try: w = float(j.get("width") or 0)
-            except (TypeError, ValueError): w = 0
-            if w >= best_w: best, best_w = u, w
-        if best and best not in photos: photos.append(best)
-    if not photos:
-        for k in ("hiResImageLink", "desktopWebHdpImageLink"):
-            if _s(det.get(k)):
-                photos = [_s(det.get(k))]; break
-    addr = det.get("address") if isinstance(det.get("address"), dict) else {}
-    rf = det.get("resoFacts") if isinstance(det.get("resoFacts"), dict) else {}
-    yb = _sabri_num(rf.get("yearBuilt"))
-    return {"beds": _sabri_num(det.get("bedrooms")),
-            "baths": _sabri_num(det.get("bathrooms")),
-            "sqft": _sabri_num(det.get("livingArea")),
-            "year_built": int(yb) if yb else None,
-            "lat": _sabri_num(det.get("latitude")), "lon": _sabri_num(det.get("longitude")),
-            "photos": photos,
-            "zestimate": _sabri_num(det.get("zestimate")) or _sabri_num(det.get("price")),
-            "city": _s(addr.get("city")) or _s(det.get("city")),
-            "zip": _s(addr.get("zipcode")) or _s(det.get("zipcode")) or _s(det.get("zip")),
-            "zpid": det.get("zpid")}
+# ---------------------------------------------------------------- v69 direct-API adapters
+# ReefAPI direct (api.reefapi.com), RentCast (api.rentcast.io) and
+# apillow (api.apillow.co) — the direct sources that run AROUND the
+# RapidAPI union in pull_comps. Endpoint shapes verified against the
+# vendors' own docs 2026-11-14 (reefapi.com/docs/realtor.md,
+# apillow.co/docs.html, developers.rentcast.io); anything the docs
+# did NOT pin down is marked UNVERIFIED in the build log and handled
+# defensively here (a shape surprise degrades the source, never the
+# pull). No key -> the adapter returns ([], None, label) without any
+# request; the frames below skip keyless sources entirely (no outcome
+# recorded — same as _rapidapi_sold_frame's no-key early return).
 
-def _pz_subject_match(prop, det):
-    """Sanity gate for the Zillow subject fill (v48): a detail payload
-    whose city or ZIP (when it carries them) contradicts the subject
-    is NO match and fills nothing — an address lookup that resolved
-    to a different property must never write its specs/photos here.
-    When both sides carry coordinates, the payload must sit within a
-    mile of the subject (a same-name street across town fails). With
-    neither signal present the by-address endpoint's own resolution
-    stands."""
-    v = _pz_subject_values(det)
-    if v["city"] and prop["city"] and v["city"].strip().lower() != prop["city"].strip().lower():
-        return False
-    if v["zip"] and prop["zip"] and str(v["zip"])[:5] != str(prop["zip"])[:5]:
-        return False
-    if v["lat"] is not None and v["lon"] is not None and prop["lat"] is not None and prop["lon"] is not None:
-        dist = haversine_mi(prop["lat"], prop["lon"], v["lat"], v["lon"])
-        if dist is not None and dist > 1.0: return False
-    return True
+def _direct_outcome(name, rows, err, label, prop, radius_mi, rent=False):
+    """The outcome record for one CALLED direct source — the same shape
+    as _rapi_outcome (the pool detail log and the banner read both
+    identically), keyed by display name instead of a registry key."""
+    if rows:
+        in_gate = (_rapi_count_in_gate_rent(rows, prop, radius_mi) if rent
+                   else _rapi_count_in_gate(rows, prop, radius_mi))
+        return {"name": name, "label": label, "served": True,
+                "rows": len(rows), "in_gate": in_gate, "reason": None,
+                "log": f"{name} — served {len(rows)} rows, {in_gate} in-gate"}
+    reason = _rapi_fail_reason(err)
+    return {"name": name, "label": None, "served": False, "rows": 0,
+            "in_gate": 0, "reason": reason,
+            "log": f"{name} — {_rapi_fail_detail(err)}"}
 
-def _zillow_subject_fill(d, prop, today):
-    """The private-zillow subject lookup (v48, item A): ONE
-    /By Property Address call filling the subject's BLANK specs and
-    photos from Zillow's own record — the HomeHarvest subject path
-    cannot answer on egress-restricted hosts (its listing frames die
-    at the proxy), which left PA subjects with no specs and no photos.
-    Quota discipline (250/mo hard cap): the caller fires this only
-    while the subject still lacks specs or photos, and this function
-    makes one logical call — the v49 bounded retry inside _pz_get may
-    repeat the HTTP request on a transient 503/404 (the wrapper's
-    by-address resolution flickers; a 404 surviving every attempt is
-    genuinely not-on-Zillow and degrades as before). Blank-fill ONLY (never overwrites
-    user/saved data); zestimate lands ONLY in est_zillow, never
-    list_price. Returns {"photos": n, "fields": [...]} when it filled
-    something, else None (no key / error / 404 = address not on
-    Zillow / sanity no-match / nothing blank to fill) — every one of
-    those degrades silently to the pre-v48 honest state, logged."""
-    if not _rapidapi_key(): return None
-    data, err, attempts, last_status = _pz_get("/By Property Address",
-                                               {"address": prop["address"]},
-                                               retry_404=True)
-    if err is not None:
-        msg = (f"comp pull: private-zillow subject lookup failed for "
-               f"{prop['address']}: {_rapi_fail_reason(err)}")
-        if attempts > 1:
-            msg += f" (after {attempts} attempts, last status {last_status})"
-        app.logger.warning(msg)
+
+def _reefapi_direct_item_to_row(item, rent=False):
+    """One ReefAPI DIRECT search/sold card -> the standard HomeHarvest
+    columns. The direct card shape (docs 2026-11-14) uses _usd price
+    fields: last_sold_price_usd / last_sold_date on sold rows,
+    list_price_usd everywhere (for for_rent rows that IS the monthly
+    rent), realestimate_usd as the estimate. Sold price comes ONLY
+    from last_sold_price_usd — in a non-disclosure state it is null
+    and the row keeps sold_price=None, so the merge drops it (the
+    gate rejects no_price); a sold home's list price is never
+    substituted."""
+    return dict(street=_s(item.get("address_line")), city=_s(item.get("city")),
+                zip_code=_s(item.get("postal_code")),
+                sold_price=None if rent else item.get("last_sold_price_usd"),
+                list_price=item.get("list_price_usd"),
+                sqft=item.get("sqft"), beds=item.get("beds"),
+                full_baths=item.get("baths"),
+                year_built=item.get("year_built"), lot_sqft=item.get("lot_sqft"),
+                last_sold_date=None if rent else (_s(item.get("last_sold_date"))[:10] or None),
+                days_on_mls=None,
+                latitude=item.get("latitude"), longitude=item.get("longitude"),
+                style=None, property_type=_s(item.get("property_type")),
+                property_url=_s(item.get("url")),
+                primary_photo=_s(item.get("primary_photo_url")) or None,
+                alt_photos=[_s(item.get("primary_photo_url"))] if _s(item.get("primary_photo_url")) else [],
+                estimated_value=item.get("realestimate_usd"), price_per_sqft=None)
+
+
+def _src_reefapi_direct_sold(prop, past_days, radius_mi=1.0):
+    """ReefAPI direct sold (v69): POST /realtor/v1/sold, ZIP-first
+    location, sold_date sort, sold_date_min at the horizon cutoff
+    (the server net and the client filter agree). One call, 2 credits.
+    NOT the /comps action: comps needs a Realtor property_id the app
+    does not have without an extra search call, and the sold action
+    returns the same fields with a date window for half the credits.
+    The RapidAPI-hosted ReefAPI adapter (_src_reefapi_sold) stays in
+    the union — same vendor engine, different quota (one-time credits
+    vs RapidAPI quota)."""
+    zipc = _s(prop.get("zip") if hasattr(prop, "get") else prop["zip"]).strip()
+    loc = zipc or f"{prop['city']}, {prop['state']}"
+    body = {"location": loc, "sort": "sold_date", "limit": 100,
+            "sold_date_min": _rapi_horizon_cutoff(past_days)}
+    data, err = _reefapi_post("sold", body)
+    if err is not None: return [], err, "ReefAPI direct (sold)"
+    if data is None: return [], None, "ReefAPI direct (sold)"
+    items = data.get("results") if isinstance(data, dict) else None
+    items = items if isinstance(items, list) else []
+    rows = _rapi_rows(items, _reefapi_direct_item_to_row)
+    return _rapi_in_horizon(rows, past_days), None, "ReefAPI direct (sold)"
+
+
+def _src_reefapi_direct_rent(prop, past_days, radius_mi=1.0):
+    """ReefAPI direct rent (v69): POST /realtor/v1/search with
+    status=for_rent, ZIP-first location, one call, 2 credits.
+    list_price_usd on a for_rent row IS the monthly rent (docs)."""
+    zipc = _s(prop.get("zip") if hasattr(prop, "get") else prop["zip"]).strip()
+    loc = zipc or f"{prop['city']}, {prop['state']}"
+    body = {"location": loc, "status": "for_rent", "sort": "newest", "limit": 100}
+    data, err = _reefapi_post("search", body)
+    if err is not None: return [], err, "ReefAPI direct (rent)"
+    if data is None: return [], None, "ReefAPI direct (rent)"
+    items = data.get("results") if isinstance(data, dict) else None
+    items = items if isinstance(items, list) else []
+    return _rapi_rows(items, lambda it: _reefapi_direct_item_to_row(it, rent=True)), None, "ReefAPI direct (rent)"
+
+
+def _reefapi_direct_sold_frame(prop, past_days, radius_mi):
+    """The ReefAPI direct sold frame (v69): one contained call, the
+    same (frames, outcomes) shape as _rapidapi_sold_frame. No key ->
+    ([], []) without any request. An exception is containment, never
+    a pull abort."""
+    if not _reefapi_key():
+        return [], []
+    try:
+        rows, err, label = _src_reefapi_direct_sold(prop, past_days, radius_mi)
+    except Exception as e:
+        rows, err, label = [], e, None
+    oc = _direct_outcome("ReefAPI direct sold search", rows, err, label, prop, radius_mi)
+    if rows:
+        return [(_hh_frame(rows), label)], [oc]
+    return [], [oc]
+
+
+def _reefapi_direct_rent_frame(prop, radius_mi):
+    """The ReefAPI direct rent frame (v69): (df, err, label, outcomes)
+    — the _rapidapi_rent_frame contract. No key -> (None, None, None,
+    []) without any request."""
+    if not _reefapi_key():
+        return None, None, None, []
+    try:
+        rows, err, label = _src_reefapi_direct_rent(prop, 365, radius_mi)
+    except Exception as e:
+        rows, err, label = [], e, None
+    oc = _direct_outcome("ReefAPI direct rent search", rows, err, label, prop, radius_mi, rent=True)
+    if rows:
+        return _hh_frame(rows), None, label, [oc]
+    return None, err, None, [oc]
+
+
+# --- RentCast (AVM value + rent, v69) ---
+_RENTCAST_SHAPE_LOGGED = {"sold": False, "rent": False}
+
+
+def _rentcast_addr_parts(addr):
+    """A RentCast comparable's address string -> (street, city, zip).
+    The AVM comparable carries a flat "Street, City, ST ZIP" string;
+    a dict-shaped address is read structurally first. Unparseable
+    input keeps the whole string as the street (the gate still needs
+    a street, and the merge's distance comes from the coordinates)."""
+    if isinstance(addr, dict):
+        return (_s(addr.get("address") or addr.get("street") or addr.get("line")),
+                _s(addr.get("city")), _s(addr.get("zip") or addr.get("zipcode") or addr.get("postal_code")))
+    s = _s(addr)
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) >= 3:
+        tail = parts[-1].split()
+        return (parts[0], parts[-2] if len(parts) > 2 else "", tail[-1] if tail else "")
+    if len(parts) == 2:
+        return (parts[0], parts[1], "")
+    return (s, "", "")
+
+
+def _rentcast_comp_to_row(c, prop, rent=False):
+    """One RentCast AVM comparable -> the standard HomeHarvest columns,
+    or None when the comparable cannot be a comp. UNVERIFIED (no live
+    call yet): the AVM comparable shape is read defensively and its
+    keys are logged once on first use. SOLD rows are accepted ONLY
+    with a real price AND a real sale date — the AVM comparables are
+    listing-based, and a dateless row must never pose as a sale (the
+    plan's standing rule: never substitute a list price for a sold
+    price). If the first live call shows the comparables carry no
+    date, this adapter serves nothing and the build log's fallback
+    (the /v1/properties?saleDateRange=… endpoint) is the next step.
+    Rent rows take price as the monthly rent (no date needed)."""
+    if not isinstance(c, dict):
         return None
-    det = data.get("propertyDetails") if isinstance(data, dict) else None
-    if not isinstance(det, dict) or not det:
-        app.logger.warning(f"comp pull: private-zillow subject lookup for "
-                           f"{prop['address']}: no propertyDetails in response")
+    key = "rent" if rent else "sold"
+    if not _RENTCAST_SHAPE_LOGGED[key]:
+        _RENTCAST_SHAPE_LOGGED[key] = True
+        app.logger.warning(f"rentcast: first AVM comparable keys ({key}): {sorted(c.keys())}")
+    price = _sabri_num(c.get("price"))
+    if price is None:
         return None
-    if not _pz_subject_match(prop, det):
-        app.logger.warning(f"comp pull: private-zillow subject lookup for "
-                           f"{prop['address']}: response city/ZIP/coords contradict "
-                           f"the subject — treated as no-match, nothing filled")
-        return None
-    v = _pz_subject_values(det)
-    if v.get("zpid") and not prop["zpid"]:
-        # v56: persist the zpid the by-address payload carried. The
-        # zpid-only backup APIs (ReefAPI Zillow detail, Unofficial
-        # images) can only answer with it — v48 extracted it in
-        # _pz_subject_values and then discarded it, so no backup path
-        # could ever fire for a subject the primary path had touched.
-        d.execute("UPDATE properties SET zpid=? WHERE id=?",
-                  (str(v["zpid"]), prop["id"]))
-        d.commit()
-    fills = {}
-    for col in ("beds", "baths", "sqft", "year_built", "lat", "lon"):
-        if not prop[col] and v[col] and _sane_subject_fill(col, v[col]):
-            fills[col] = v[col]
-    if v["photos"] and not prop["photos_json"] and not prop["photo_url"]:
-        fills["photos_json"] = json.dumps(v["photos"]); fills["photos_date"] = today
-        fills["photo_url"] = v["photos"][0]
-    if v["zestimate"] and not prop["est_zillow"] and _sane_subject_fill("est_zillow", v["zestimate"]):
-        fills["est_zillow"] = v["zestimate"]; fills["est_date"] = today
-    if not fills:
-        app.logger.warning(f"comp pull: private-zillow subject lookup for "
-                           f"{prop['address']}: matched, but every field was already filled")
-        return None
-    d.execute(f"UPDATE properties SET {','.join(k + '=?' for k in fills)} WHERE id=?",
-              (*fills.values(), prop["id"]))
-    app.logger.warning(f"comp pull: private-zillow subject lookup for {prop['address']}: "
-                       f"filled {', '.join(sorted(fills))} "
-                       f"({attempts} call{'s' if attempts > 1 else ''}, RapidAPI (Zillow))")
-    return {"photos": len(v["photos"]) if "photos_json" in fills else 0,
-            "fields": sorted(fills)}
+    street, city, zipc = _rentcast_addr_parts(c.get("address"))
+    lat, lon = _sabri_num(c.get("latitude")), _sabri_num(c.get("longitude"))
+    sold_date = None
+    if not rent:
+        for dk in ("lastSaleDate", "soldDate", "saleDate", "date", "last_sold_date"):
+            v = c.get(dk)
+            if v:
+                sold_date = _s(v)[:10] or None
+                break
+        if not sold_date:
+            return None
+    return dict(street=street, city=city, zip_code=zipc,
+                sold_price=None if rent else price, list_price=price,
+                sqft=_sabri_num(c.get("squareFootage") or c.get("sqft")),
+                beds=_sabri_num(c.get("bedrooms") or c.get("beds")),
+                full_baths=_sabri_num(c.get("bathrooms") or c.get("baths")),
+                year_built=_sabri_num(c.get("yearBuilt") or c.get("year_built")),
+                lot_sqft=_sabri_num(c.get("lotSize") or c.get("lot_sqft")),
+                last_sold_date=sold_date, days_on_mls=None,
+                latitude=lat, longitude=lon,
+                style=None, property_type=_s(c.get("propertyType") or c.get("property_type")),
+                property_url="", primary_photo=None, alt_photos=[],
+                estimated_value=None, price_per_sqft=None)
+
+
+def _rentcast_addr(prop):
+    """The subject's full address for the AVM endpoints."""
+    return (f"{prop['address']}, {prop['city']}, {prop['state']} {prop['zip']}"
+            if hasattr(prop, "get") else
+            f"{prop['address']}, {prop['city']}, {prop['state']} {prop['zip']}")
+
+
+def _src_rentcast_avm_sold(prop, past_days, radius_mi=1.0):
+    """RentCast AVM value (v69): GET /v1/avm/value?address=…&compCount=12
+    &maxRadius=…&daysOld=…. One call, 1 of 50/mo. Gated upstream (the
+    frame only calls while the union is thin). Comparables are mapped
+    through _rentcast_comp_to_row — dateless comparables are dropped,
+    so a dateless AVM answer serves nothing rather than fake sales."""
+    params = {"address": _rentcast_addr(prop), "compCount": 12,
+              "maxRadius": radius_mi, "daysOld": past_days}
+    data, err = _rentcast_get("/avm/value", params)
+    if err is not None: return [], err, "RentCast AVM (sold)"
+    if data is None: return [], None, "RentCast AVM (sold)"
+    comps = data.get("comparables") if isinstance(data, dict) else None
+    comps = comps if isinstance(comps, list) else []
+    rows = [r for r in (_rentcast_comp_to_row(c, prop) for c in comps) if r is not None]
+    return _rapi_in_horizon(rows, past_days), None, "RentCast AVM (sold)"
+
+
+def _src_rentcast_avm_rent(prop, past_days, radius_mi=1.0):
+    """RentCast AVM rent (v69): GET /v1/avm/rent/long-term, same
+    params as the value AVM. One call, 1 of 50/mo. Comparables' price
+    is the monthly rent."""
+    params = {"address": _rentcast_addr(prop), "compCount": 12,
+              "maxRadius": radius_mi, "daysOld": past_days}
+    data, err = _rentcast_get("/avm/rent/long-term", params)
+    if err is not None: return [], err, "RentCast AVM (rent)"
+    if data is None: return [], None, "RentCast AVM (rent)"
+    comps = data.get("comparables") if isinstance(data, dict) else None
+    comps = comps if isinstance(comps, list) else []
+    rows = [r for r in (_rentcast_comp_to_row(c, prop, rent=True) for c in comps) if r is not None]
+    return rows, None, "RentCast AVM (rent)"
+
+
+# --- apillow (Zillow, v69) ---
+# Request body confirmed against apillow.co/docs.html (2026-11-14):
+# POST /v1/properties, X-API-Key header, JSON {search | addresses[] |
+# zipcodes[] | zpids[] | urls[], type: all|sale|rent|sold|fsbo,
+# property_type, price_min/max, max_items, webhook_url}. Async: the
+# POST returns a job_id instantly; poll GET /v1/results/{job_id}
+# until status is complete/failed (typically 3-10s). Free plan: max 5
+# properties per request. Quota is per PROPERTY RETURNED, not per
+# call (a job returning nothing is free). The subject lookup's
+# embedded comps[] array is NOT used for sold rows: its entries carry
+# a price but no sale date and no last_sold_price, so their price
+# semantics are unverified — the ZIP sold search (type "sold") is the
+# comp source, because each property there carries last_sold_price +
+# last_sold_date. Rent rows take price as the monthly rent.
+
+def _apillow_zip(prop):
+    """The subject's ZIP as an int for the zipcodes[] body (the docs
+    list int[]; a non-numeric ZIP falls back to the raw string)."""
+    z = _s(prop.get("zip") if hasattr(prop, "get") else prop["zip"]).strip()[:5]
+    try:
+        return int(z)
+    except (TypeError, ValueError):
+        return z
+
+
+def _apillow_item_to_row(p, rent=False):
+    """One apillow property object -> the standard HomeHarvest columns.
+    Sold price comes ONLY from last_sold_price; list price is the
+    listing price (rent rows: the monthly rent)."""
+    imgs = p.get("image_urls") or []
+    imgs = [u for u in imgs if isinstance(u, str) and u.startswith("http")]
+    return dict(street=_s(p.get("street_address")), city=_s(p.get("city")),
+                zip_code=_s(p.get("zipcode")),
+                sold_price=None if rent else _sabri_num(p.get("last_sold_price")),
+                list_price=_sabri_num(p.get("price")),
+                sqft=_sabri_num(p.get("living_area")),
+                beds=_sabri_num(p.get("bedrooms")),
+                full_baths=_sabri_num(p.get("bathrooms")),
+                year_built=_sabri_num(p.get("year_built")),
+                lot_sqft=_sabri_num(p.get("lot_size")),
+                last_sold_date=None if rent else (_s(p.get("last_sold_date"))[:10] or None),
+                days_on_mls=_sabri_num(p.get("days_on_zillow")),
+                latitude=_sabri_num(p.get("latitude")), longitude=_sabri_num(p.get("longitude")),
+                style=None, property_type=_s(p.get("property_type")),
+                property_url=_s(p.get("url")),
+                primary_photo=(imgs[0] if imgs else None), alt_photos=imgs,
+                estimated_value=_sabri_num(p.get("zestimate")), price_per_sqft=None)
+
+
+def _apillow_properties(body):
+    """One apillow job -> (property dicts, err). Counts quota AFTER
+    completion by properties actually returned (0 when the job
+    returns nothing — free per the vendor)."""
+    results, err = _apillow_run(body)
+    if err is not None: return [], err
+    if results is None: return [], None
+    props = [r.get("property") for r in results
+             if isinstance(r, dict) and r.get("success") and isinstance(r.get("property"), dict)]
+    _usage_add("apillow", len(props))
+    return props, None
+
+
+def _src_apillow_sold(prop, past_days, radius_mi=1.0):
+    """apillow sold (v69): ZIP search, type "sold", max 5 properties
+    (the free plan's per-request cap). One job, ~1-5 properties of
+    quota. Gated upstream (the frame only calls while the union is
+    thin)."""
+    props, err = _apillow_properties({"zipcodes": [_apillow_zip(prop)],
+                                     "type": "sold", "max_items": 5})
+    if err is not None: return [], err, "apillow (sold)"
+    rows = _rapi_rows(props, _apillow_item_to_row)
+    return _rapi_in_horizon(rows, past_days), None, "apillow (sold)"
+
+
+def _src_apillow_rent(prop, past_days, radius_mi=1.0):
+    """apillow rent (v69): ZIP search, type "rent", max 5 properties.
+    One job, ~1-5 properties of quota."""
+    props, err = _apillow_properties({"zipcodes": [_apillow_zip(prop)],
+                                     "type": "rent", "max_items": 5})
+    if err is not None: return [], err, "apillow (rent)"
+    return _rapi_rows(props, lambda p: _apillow_item_to_row(p, rent=True)), None, "apillow (rent)"
+
+
+def _gated_direct_sold_frame(prop, past_days, radius_mi, in_gate_total):
+    """The gated direct sold sources (v69): RentCast then apillow,
+    each fired ONLY while the running in-gate total is still thin
+    (< RAPIDAPI_UNION_RICH) and a key is saved — their quotas are
+    scarce (RentCast 50/mo, apillow 50 properties/mo). A source that
+    does not fire (no key, or the union already rich) records NO
+    outcome — same as the RapidAPI frame's rich-stop. Returns
+    (frames, outcomes)."""
+    frames, outcomes = [], []
+    for name, fn, keyfn in (("RentCast AVM sold search", _src_rentcast_avm_sold, _rentcast_key),
+                            ("apillow sold search", _src_apillow_sold, _apillow_key)):
+        if in_gate_total >= RAPIDAPI_UNION_RICH:
+            break
+        if not keyfn():
+            continue
+        try:
+            rows, err, label = fn(prop, past_days, radius_mi)
+        except Exception as e:
+            rows, err, label = [], e, None
+        oc = _direct_outcome(name, rows, err, label, prop, radius_mi)
+        outcomes.append(oc)
+        if rows:
+            frames.append((_hh_frame(rows), label))
+            in_gate_total += oc["in_gate"]
+    return frames, outcomes
+
+
+def _gated_direct_rent_frame(prop, radius_mi):
+    """The gated direct rent sources (v69): RentCast then apillow,
+    first-serve (the rent frame's contract — the first source that
+    serves rows wins). Keyless sources are skipped silently. Returns
+    (df, err, label, outcomes)."""
+    outcomes, last_err = [], None
+    for name, fn, keyfn in (("RentCast AVM rent search", _src_rentcast_avm_rent, _rentcast_key),
+                            ("apillow rent search", _src_apillow_rent, _apillow_key)):
+        if not keyfn():
+            continue
+        try:
+            rows, err, label = fn(prop, 365, radius_mi)
+        except Exception as e:
+            rows, err, label = [], e, None
+        outcomes.append(_direct_outcome(name, rows, err, label, prop, radius_mi, rent=True))
+        if rows:
+            return _hh_frame(rows), None, label, outcomes
+        if err is not None:
+            last_err = err
+    return None, last_err, None, outcomes
 
 # ---------------------------------------------------------------- v58 subject-fill sanity + Things4u detail
 def _sane_subject_fill(col, v):
@@ -4264,9 +4909,8 @@ def _things4u_subject_fill(d, prop, today, property_id=None):
     non-numeric id is an honest None with no request at all — the
     frame-row fill stands alone. Blank-fill ONLY, sanity-guarded per
     field; the Zestimate-shaped price lands in est_realtor, never
-    list_price. Returns the fill summary or None. Realty US first,
-    Realtor Search second (same data — the second fires only if the
-    first did not serve)."""
+    list_price. Returns the fill summary or None. Realtor Search only
+    (v69 — Realty US delisted)."""
     if not _rapidapi_key(): return None
     pid = str(property_id).strip() if property_id is not None else ""
     if not pid or not pid.isdigit():
@@ -4274,7 +4918,7 @@ def _things4u_subject_fill(d, prop, today, property_id=None):
                            "no numeric property_id from the subject's search row — "
                            "detail skipped (auto-complete ids are not propertyIds)")
         return None
-    for host in (RAPIDAPI_T4U_US_HOST, RAPIDAPI_T4U_RS_HOST):
+    for host in (RAPIDAPI_T4U_RS_HOST,):
         det, derr = _rapidapi_get(host, "/properties/detail", {"propertyId": pid})
         if derr is not None or det is None: continue
         if isinstance(det, dict):
@@ -4324,31 +4968,6 @@ def _things4u_subject_fill(d, prop, today, property_id=None):
 RAPIDAPI_REEF_ZILLOW_HOST = "zillow-real-estate-data-api.p.rapidapi.com"
 RAPIDAPI_UNOFF_ZILLOW_HOST = "unofficial-zillow-api2.p.rapidapi.com"
 
-def _pz_autocomplete_zpid(prop):
-    """ONE private-zillow /autocomplete attempt resolving the
-    subject's zpid from its full address (v56). The response shape
-    was not captured in the playground (the by-address endpoint made
-    it unnecessary there), so the zpid is searched recursively —
-    any nesting that carries one answers; no zpid anywhere is an
-    honest None and no further backup fires."""
-    data, err = _rapidapi_get(RAPIDAPI_PZ_HOST, "/autocomplete",
-                              {"query": prop["address"]})
-    if err is not None or data is None: return None
-    def _find(o):
-        if isinstance(o, dict):
-            z = o.get("zpid")
-            if z not in (None, ""): return z
-            for v in o.values():
-                r = _find(v)
-                if r is not None: return r
-        elif isinstance(o, list):
-            for v in o:
-                r = _find(v)
-                if r is not None: return r
-        return None
-    z = _find(data)
-    return str(z) if z is not None else None
-
 def _reef_zillow_values(det):
     """One ReefAPI Zillow /property_detail `data` object -> candidate
     subject fill values (pure; no I/O). Captured shape (2026-11-05):
@@ -4375,18 +4994,21 @@ def _reef_zillow_subject_fill(d, prop, today):
     """The ReefAPI Zillow subject backup (v56): POST /property_detail
     by zpid — the STORED zpid when the subject has one, else ONE pz
     /autocomplete attempt. Fires only when the primary by-address
-    fill returned nothing. Sanity posture mirrors _pz_subject_match
-    (a contradicting city/ZIP, or coordinates over a mile away, is a
-    no-match and fills nothing — and does not persist the zpid).
+    fill returned nothing. Sanity posture mirrors the deleted
+    private-zillow match (a contradicting city/ZIP, or coordinates
+    over a mile away, is a no-match and fills nothing — and does not
+    persist the zpid). v69: the zpid comes ONLY from the stored
+    column now — the private-zillow autocomplete path that used to
+    resolve one is deleted with the provider.
     A sanity-passed payload persists its zpid even when every field
     was already filled, so the images fallback below can trust it.
     Blank-fill ONLY; the Zestimate-shaped price lands in est_zillow,
     never list_price. Returns the fill summary or None."""
     if not _rapidapi_key(): return None
-    zpid = prop["zpid"] or _pz_autocomplete_zpid(prop)
+    zpid = prop["zpid"]
     if not zpid:
         app.logger.warning(f"comp pull: ReefAPI Zillow subject backup for "
-                           f"{prop['address']}: no zpid resolvable — backup cannot fire")
+                           f"{prop['address']}: no stored zpid — backup cannot fire")
         return None
     data, err = _rapidapi_post(RAPIDAPI_REEF_ZILLOW_HOST, "/property_detail",
                                {"zpid": str(zpid)})
@@ -4633,115 +5255,31 @@ def _jina_zillow_subject_fill(d, prop, today):
     return {"photos": len(v["photos"]) if "photos_json" in fills else 0,
             "fields": sorted(fills)}, None
 
-def _pz_sold_item_to_row(item):
-    """One private-zillow /search/bymapbounds item -> the standard
-    HomeHarvest columns (playground-captured 2026-11-05): the sold
-    price is price.value, the date lastSoldDate as EPOCH MILLISECONDS,
-    and the row's listing URL is Zillow's own homedetails page built
-    from its zpid (the zpid is data; the URL form is Zillow's). The
-    address arrives as a sub-object (streetAddress/city/state/zipcode)
-    or as one "street, city, ST ZIP" string — both are read. A row
-    without a usable price keeps sold_price=None and the shared gate
-    drops it as no_price, like every source."""
-    addr = item.get("address")
-    street = city = zipc = ""
-    if isinstance(addr, dict):
-        street = _s(addr.get("streetAddress")); city = _s(addr.get("city"))
-        zipc = _s(addr.get("zipcode"))
-    elif isinstance(addr, str):
-        parts = [p.strip() for p in addr.split(",")]
-        street = parts[0] if parts else ""
-        if len(parts) >= 2: city = parts[1]
-        if len(parts) >= 3:
-            tail = parts[2].split()
-            if tail: zipc = tail[-1]
-    price = item.get("price")
-    if isinstance(price, dict): price = price.get("value")
-    ms = item.get("lastSoldDate")
-    date_iso = None
-    if isinstance(ms, (int, float)) and ms > 0:
-        try:
-            date_iso = datetime.datetime.fromtimestamp(
-                ms / 1000, tz=datetime.timezone.utc).date().isoformat()
-        except (OverflowError, OSError, ValueError):
-            date_iso = None
-    elif isinstance(ms, str) and ms[:4].isdigit():
-        date_iso = ms[:10]
-    thumb = item.get("thumb") or []
-    photo = None
-    if isinstance(thumb, list) and thumb and isinstance(thumb[0], dict):
-        photo = _s(thumb[0].get("url")) or None
-    zpid = item.get("zpid")
-    return dict(street=street, city=city, zip_code=zipc,
-                sold_price=_sabri_num(price), list_price=None,
-                sqft=_sabri_num(item.get("sqft") or item.get("livingArea")),
-                beds=_sabri_num(item.get("beds") or item.get("bedrooms")),
-                full_baths=_sabri_num(item.get("baths") or item.get("bathrooms")),
-                year_built=None, lot_sqft=None, last_sold_date=date_iso,
-                days_on_mls=None,
-                latitude=item.get("latitude"), longitude=item.get("longitude"),
-                style=None, property_type=None,
-                property_url=(f"https://www.zillow.com/homedetails/{zpid}_zpid/"
-                              if zpid else ""),
-                primary_photo=photo, alt_photos=[photo] if photo else [],
-                estimated_value=None, price_per_sqft=None)
 
-def _src_pzillow_sold(prop, past_days, radius_mi=1.0):
-    """private-zillow sold comps by map bounds (v48): ONE call with a
-    bounds box derived from the subject coords and the pull radius
-    (degrees ~ radius/69 of latitude, longitude scaled by cos(lat)),
-    listingStatus=Sold. Top-up source — it joins the union AFTER
-    Sabri and is skipped whenever the union is already rich (the
-    250/mo hard cap is spent only when the pull still needs rows)."""
-    if prop["lat"] is None or prop["lon"] is None:
-        return [], None, RAPIDAPI_SRC_PZ
-    dlat = (radius_mi or 1.0) / 69.0
-    coslat = max(math.cos(math.radians(prop["lat"])), 0.2)
-    dlon = (radius_mi or 1.0) / (69.0 * coslat)
-    params = {"west": round(prop["lon"] - dlon, 6), "east": round(prop["lon"] + dlon, 6),
-              "south": round(prop["lat"] - dlat, 6), "north": round(prop["lat"] + dlat, 6),
-              "listingStatus": "Sold"}
-    data, err, attempts, last_status = _pz_get("/search/bymapbounds", params)
-    if attempts > 1:
-        _rapi_note("pzillow_sold",
-                   f"{'served' if err is None else 'failed'} after {attempts} attempts "
-                   f"(last status {last_status})")
-    if err is not None: return [], err, RAPIDAPI_SRC_PZ
-    items = data.get("searchResults") if isinstance(data, dict) else None
-    items = items if isinstance(items, list) else []
-    rows = _rapi_rows(items, _pz_sold_item_to_row)
-    return _rapi_in_horizon(rows, past_days), None, RAPIDAPI_SRC_PZ
-
-_RAPIDAPI_ADAPTERS = {"things4u_realty_us_sold": _src_things4u_realty_us_sold,
-                      "things4u_realtor_search_sold": _src_things4u_realtor_search_sold,
+_RAPIDAPI_ADAPTERS = {"things4u_realtor_search_sold": _src_things4u_realtor_search_sold,
                       "reefapi_sold": _src_reefapi_sold,
                       "sabri_forsold": _src_sabri_forsold,
-                      "things4u_realty_us_rent": _src_things4u_realty_us_rent,
                       "things4u_realtor_search_rent": _src_things4u_realtor_search_rent,
                       "sabri_forrent": _src_sabri_forrent}
-_RAPIDAPI_SOURCE_NAMES = {"things4u_realty_us_sold": "Things4u Realty US sold search",
-                          "things4u_realtor_search_sold": "Things4u Realtor Search sold search",
+_RAPIDAPI_SOURCE_NAMES = {"things4u_realtor_search_sold": "Things4u Realtor Search sold search",
                           "reefapi_sold": "ReefAPI Realtor sold",
                           "sabri_forsold": "Realtor16 (Sabri) sold search",
-                          "things4u_realty_us_rent": "Things4u Realty US rent search",
                           "things4u_realtor_search_rent": "Things4u Realtor Search rent search",
                           "sabri_forrent": "Realtor16 (Sabri) rent search"}
 # v58: retired from the pull path, functions kept for the record.
 # redfin_sold — region rows carry no coordinates (live 2026-11-06):
 # nothing storable, so it contributed zero comps on every pull.
-# pzillow_sold — private-zillow's sold search hangs provider-side
-# (503 in its own playground, 2026-11-06): not transient, do not call.
-_RAPIDAPI_SOURCE_HOSTS = {"things4u_realty_us_sold": RAPIDAPI_T4U_US_HOST,
-                          "things4u_realtor_search_sold": RAPIDAPI_T4U_RS_HOST,
+# v69: it stays retired — re-activation needs one live call with a
+# RapidAPI key proving the search rows now carry coordinates (see the
+# build log). pzillow_sold is DELETED, not retired (provider down,
+# API delisted); Realty US is DELETED too (delisted 2026-11-14).
+_RAPIDAPI_SOURCE_HOSTS = {"things4u_realtor_search_sold": RAPIDAPI_T4U_RS_HOST,
                           "reefapi_sold": RAPIDAPI_REEF_HOST,
                           "sabri_forsold": RAPIDAPI_SABRI_HOST,
-                          "things4u_realty_us_rent": RAPIDAPI_T4U_US_HOST,
                           "things4u_realtor_search_rent": RAPIDAPI_T4U_RS_HOST,
                           "sabri_forrent": RAPIDAPI_SABRI_HOST}
-RAPIDAPI_SOLD_SOURCES = ("things4u_realty_us_sold", "things4u_realtor_search_sold",
-                         "reefapi_sold", "sabri_forsold")
-RAPIDAPI_RENT_SOURCES = ("things4u_realty_us_rent", "things4u_realtor_search_rent",
-                         "sabri_forrent")
+RAPIDAPI_SOLD_SOURCES = ("things4u_realtor_search_sold", "reefapi_sold", "sabri_forsold")
+RAPIDAPI_RENT_SOURCES = ("things4u_realtor_search_rent", "sabri_forrent")
 
 def _rapi_quota_skip_outcome(key):
     """The outcome record for a source SKIPPED on its quota-dead flag
@@ -5183,21 +5721,25 @@ def _hh_over_budget(started_at, budget_s=_PULL_HH_BUDGET_S):
     return (time.time() - started_at) > budget_s
 
 def pull_comps(prop, radius_mi=1.0, past_days=365):
-    """Multi-frame union pull (v3.4). Frames: a SUBJECT-CENTERED radius frame
-    (the scraper's comps mode — address + radius) at a 3-year horizon, unioned
-    with the ZIP-area frame at the requested window; distance from the
-    subject's own geocode governs inclusion (no ZIP-equality gate). The
-    centered frame is what finds same-street sales a capped whole-ZIP frame
-    crowds out — probed 2026-11-04: 4248 Lindley St's street has 5 sales in
-    3 years (incl. all 3 of Sherif's fixture sales); the old 365-day ZIP pull
-    surfaced 1. The distance gate is also the mis-resolution safety net: the
-    old raw-address lookup mode mis-resolved cities, but any wrong-area row
-    lands miles away and is discarded here.
+    """Multi-frame union pull (v69). Chain order (sold): ReefAPI
+    direct -> RapidAPI union -> gated direct (RentCast, apillow) while
+    thin -> FL Cadastral -> jina-Zillow top-up -> HomeHarvest comp
+    frames (behind the hh_comp_frames flag, default OFF — they run
+    when the flag is on OR the API union is thin). Rentals mirror the
+    order, first-serve. The subject-centered + ZIP-area HomeHarvest
+    frames are what find same-street sales a capped whole-ZIP frame
+    crowds out — probed 2026-11-04: 4248 Lindley St's street has 5
+    sales in 3 years (incl. all 3 of Sherif's fixture sales); the old
+    365-day ZIP pull surfaced 1. The distance gate is also the
+    mis-resolution safety net: the old raw-address lookup mode
+    mis-resolved cities, but any wrong-area row lands miles away and
+    is discarded here.
     Also pulls rental comps, the subject's own listing photos, fills blank
     subject facts from its EXACT listing row only, blank-fills county parcel
     facts (APN / assessor value / last sale) where a probed GIS endpoint
     covers the county, and auto-pins the top 3 sold comps (ReiSearch
-    default) when the user has not pinned any yet. Returns counts per kind.
+    default) when the user has not pinned any yet. The visible set is
+    capped at 50 sold + 50 rent (pinned always kept). Returns counts per kind.
     Raises on total sold-frame failure so the job layer can surface the
     reason — partial failures are reported in 'warnings'."""
     from homeharvest import scrape_property
@@ -5252,6 +5794,33 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             # sources behind the last error — the v39 PA incident).
             app.logger.warning(f"comp pull: RapidAPI sold pool detail for {addr_line}: "
                                + "; ".join(o["log"] for o in rapi_outcomes))
+    # --- ReefAPI direct sold frame (v69): the one-time-credit source
+    # runs FIRST in the chain — its credits never expire, so it is the
+    # cheapest in-gate row available. A keyless host skips it silently
+    # (no outcome recorded — same as the RapidAPI no-key early return). ---
+    reef_frames, reef_outcomes = [], []
+    try:
+        reef_frames, reef_outcomes = _reefapi_direct_sold_frame(prop, past_days, radius_mi)
+    except Exception as _reef_boom:
+        app.logger.warning(f"comp pull: ReefAPI direct sold frame raised for {addr_line}: {_reef_boom!r}")
+    if reef_outcomes:
+        app.logger.warning(f"comp pull: ReefAPI direct sold pool detail for {addr_line}: "
+                           + "; ".join(o["log"] for o in reef_outcomes))
+    # --- Gated direct sold sources (v69): RentCast + apillow fire ONLY
+    # while the running in-gate total is still thin — their quotas are
+    # scarce (RentCast 50/mo, apillow 50 properties/mo). The running
+    # total is ReefAPI direct + the RapidAPI union; the Cadastral
+    # frame runs next and is itself free, so it never needed the gate. ---
+    _gate_total = (sum(o["in_gate"] for o in reef_outcomes)
+                   + sum(o["in_gate"] for o in rapi_outcomes))
+    gated_frames, gated_outcomes = [], []
+    try:
+        gated_frames, gated_outcomes = _gated_direct_sold_frame(prop, past_days, radius_mi, _gate_total)
+    except Exception as _gated_boom:
+        app.logger.warning(f"comp pull: gated direct sold frame raised for {addr_line}: {_gated_boom!r}")
+    if gated_outcomes:
+        app.logger.warning(f"comp pull: gated direct sold pool detail for {addr_line}: "
+                           + "; ".join(o["log"] for o in gated_outcomes))
     # --- FL Statewide Cadastral sold frame (v48): official records,
     # FL subjects only, keyless. Merged FIRST — it is the trust floor:
     # richer listing frames (RapidAPI, then HomeHarvest) update its
@@ -5270,7 +5839,9 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     # (fewer than RAPIDAPI_UNION_RICH in-gate rows), the reader's ZIP
     # sold page tops it up — no quota, no key. The frame merges through
     # the same shared gate as every sold source. ---
-    rapi_in_gate = sum(o["in_gate"] for o in rapi_outcomes)
+    rapi_in_gate = (sum(o["in_gate"] for o in reef_outcomes)
+                    + sum(o["in_gate"] for o in rapi_outcomes)
+                    + sum(o["in_gate"] for o in gated_outcomes))
     cad_in_gate = _frame_in_gate(cad_frame, prop, radius_mi)
     jina_frame, jina_label, jina_err = [], "Zillow (reader)", None
     if rapi_in_gate + cad_in_gate < RAPIDAPI_UNION_RICH:
@@ -5289,16 +5860,26 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     rapi_ids = set()
     if cad_frame is not None:
         sold_frames.append(cad_frame); frame_sources[id(cad_frame)] = CADASTRAL_SRC
-    for _rapi_df, _rapi_lbl in rapi_frames:
-        sold_frames.append(_rapi_df); frame_sources[id(_rapi_df)] = _rapi_lbl
-        rapi_ids.add(id(_rapi_df))
+    for _r_df, _r_lbl in reef_frames + gated_frames + rapi_frames:
+        sold_frames.append(_r_df); frame_sources[id(_r_df)] = _r_lbl
+        rapi_ids.add(id(_r_df))
     if jina_frame is not None and len(jina_frame):
         sold_frames.append(jina_frame); frame_sources[id(jina_frame)] = jina_label
-    centered, err_c = _scrape(location=addr_line, listing_type="sold",
-                              past_days=max(past_days, 1095), radius=radius_mi)
-    if centered is not None: sold_frames.append(centered)
-    area, err_a = _scrape(location=prop["zip"], listing_type="sold", past_days=past_days)
-    if area is not None: sold_frames.append(area)
+    # v69: the HomeHarvest comp frames run only when the flag is
+    # on OR the API union is thin (fewer than RAPIDAPI_UNION_RICH
+    # in-gate rows) — with no keys at all the union is 0, so the
+    # no-key behavior is unchanged; with a rich union the frames are
+    # skipped and their requests never happen. For-sale frames + deep
+    # subject lookups below stay unconditional (subject fill).
+    _hh_frames_on = hh_comp_frames_on() or rapi_in_gate + cad_in_gate < RAPIDAPI_UNION_RICH
+    centered = area = None
+    err_c = err_a = None
+    if _hh_frames_on:
+        centered, err_c = _scrape(location=addr_line, listing_type="sold",
+                                  past_days=max(past_days, 1095), radius=radius_mi)
+        if centered is not None: sold_frames.append(centered)
+        area, err_a = _scrape(location=prop["zip"], listing_type="sold", past_days=past_days)
+        if area is not None: sold_frames.append(area)
     if not sold_frames:
         # v3.6: total sold-frame failure fails HUMAN. Raw exception text
         # (URLs, proxy internals) goes to the server log only — never the
@@ -5308,15 +5889,19 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                            f"centered={err_c!r} area={err_a!r}")
         if _is_unreachable_err(err_c) or _is_unreachable_err(err_a):
             raise SourceUnreachableError(SOURCE_UNREACHABLE_MSG)
+        if not _hh_frames_on:
+            raise RuntimeError("no sold comps came back from the API sources "
+                               "and the HomeHarvest frames are off — nothing was "
+                               "added or changed; please try again")
         raise RuntimeError("the listing source returned an error before any comps "
                            "came back — nothing was added or changed; please try again")
     if err_c is not None:
         app.logger.warning(f"comp pull: centered sold frame failed for {addr_line}: {err_c!r}")
-        if not rapi_frames and cad_frame is None:
+        if not rapi_frames and not reef_frames and not gated_frames and cad_frame is None:
             warnings.append("centered sold frame failed — results came from the ZIP-area frame")
     if err_a is not None:
         app.logger.warning(f"comp pull: ZIP sold frame failed for {addr_line}: {err_a!r}")
-        if not rapi_frames and cad_frame is None:
+        if not rapi_frames and not reef_frames and not gated_frames and cad_frame is None:
             warnings.append("ZIP-area sold frame failed — results came from the address-centered frame")
     added = updated = n_sold = 0
     sold_touched = []
@@ -5348,7 +5933,7 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                 _parts.append(f"{_rsn}={_slot[0]}" + (f" ({_ex})" if _ex else ""))
         _dup = rapi_drops.get("duplicate")
         app.logger.warning(
-            f"comp pull: RapidAPI sold merge detail for {addr_line}: "
+            f"comp pull: API sold merge detail (RapidAPI + direct) for {addr_line}: "
             f"served {rapi_served} rows -> {rapi_added} stored new"
             + (f" + {rapi_updated} duplicate updates" if rapi_updated else "")
             + (f" ({'; '.join(_dup[1])})" if _dup and _dup[1] else "")
@@ -5360,7 +5945,8 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     for _cid, _clbl in sold_touched: _last_lbl[_cid] = _clbl
     if CADASTRAL_SRC in _last_lbl.values():
         warnings.append("sold comps include results from " + CADASTRAL_SRC)
-    if rapi_outcomes:
+    _pool_outcomes = reef_outcomes + rapi_outcomes + gated_outcomes
+    if _pool_outcomes:
         # v42 TRUTHFUL BANNER. The v41 line named the serving source
         # even when the merge stored ZERO of its rows (the live pull's
         # banner claimed ReefAPI results next to a 0-comp count).
@@ -5376,17 +5962,26 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         _stored_by = {}
         for _clbl in _last_label.values():
             _stored_by[_clbl] = _stored_by.get(_clbl, 0) + 1
-        _stored_labels = [lbl for _f, lbl in rapi_frames if _stored_by.get(lbl)]
-        _served_labels = [o["label"] for o in rapi_outcomes if o["served"]]
-        _failed = [o for o in rapi_outcomes if not o["served"]]
+        _stored_labels = [lbl for _f, lbl in reef_frames + gated_frames + rapi_frames
+                        if _stored_by.get(lbl)]
+        _served_labels = [o["label"] for o in _pool_outcomes if o["served"]]
+        _failed = [o for o in _pool_outcomes if not o["served"]]
         if _failed and _served_labels:
-            warnings.append("RapidAPI failover: "
+            # v69: the failover line names the pool that actually ran —
+            # "RapidAPI failover" only when every failure is a RapidAPI
+            # source; "API failover" when a direct source failed too.
+            _failover = ("RapidAPI failover: " if all(o["name"].startswith("ReefAPI Realtor")
+                                                      or o["name"].startswith("Things4u")
+                                                      or o["name"].startswith("Realtor16")
+                                                      for o in _failed)
+                         else "API failover: ")
+            warnings.append(_failover
                             + "; ".join(f"{o['name']} — {o['reason']}" for o in _failed)
                             + "; sold comps served by " + ", ".join(_served_labels))
         if _stored_labels:
             warnings.append("sold comps include results from " + ", ".join(_stored_labels))
         elif _served_labels:
-            _msg = (f"RapidAPI answered but no results within {radius_mi:g} mi / "
+            _msg = (f"The API sources answered but no results within {radius_mi:g} mi / "
                     "the date window could be stored")
             # v43: when one merge filter ate most of the served rows,
             # the banner says which — in plain words, from the drop
@@ -5404,7 +5999,37 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             warnings.append(_msg)
     # --- rentals: centered UNION ZIP (LTR / Co-Living / Affordable views read this set) ---
     n_rent = 0; rent_frames = []; rent_sources = {}
-    if _rapidapi_key():
+    # --- ReefAPI direct rent (v69) runs first; then the gated direct
+    # rent sources (RentCast, apillow) only when nothing has served
+    # yet — the RapidAPI rent frame below is the first-serve fallback
+    # only when the direct rent frames served nothing. ---
+    _direct_rent_served = False
+    try:
+        _drdf, _drerr, _drlbl, _drout = _reefapi_direct_rent_frame(prop, radius_mi)
+    except Exception as _drboom:
+        _drdf, _drerr, _drlbl, _drout = None, _drboom, None, []
+        app.logger.warning(f"rent pull: ReefAPI direct rent frame raised for {addr_line}: {_drboom!r}")
+    if _drdf is not None:
+        rent_frames.append(_drdf); rent_sources[id(_drdf)] = _drlbl; _direct_rent_served = True
+    elif _drerr is not None:
+        app.logger.warning(f"rent pull: ReefAPI direct rent frame failed for {addr_line}: {_drerr!r}")
+    if _drout:
+        app.logger.warning(f"rent pull: ReefAPI direct rent pool detail for {addr_line}: "
+                           + "; ".join(o["log"] for o in _drout))
+    if not _direct_rent_served:
+        try:
+            _grdf, _grerr, _grlbl, _grout = _gated_direct_rent_frame(prop, radius_mi)
+        except Exception as _grboom:
+            _grdf, _grerr, _grlbl, _grout = None, _grboom, None, []
+            app.logger.warning(f"rent pull: gated direct rent frame raised for {addr_line}: {_grboom!r}")
+        if _grdf is not None:
+            rent_frames.append(_grdf); rent_sources[id(_grdf)] = _grlbl; _direct_rent_served = True
+        elif _grerr is not None:
+            app.logger.warning(f"rent pull: gated direct rent frame failed for {addr_line}: {_grerr!r}")
+        if _grout:
+            app.logger.warning(f"rent pull: gated direct rent pool detail for {addr_line}: "
+                               + "; ".join(o["log"] for o in _grout))
+    if _rapidapi_key() and not _direct_rent_served:
         try:
             _rdf, _rerr, _rsrc, _rout = _rapidapi_rent_frame(prop, radius_mi)
         except Exception as _rboom:
@@ -5419,10 +6044,12 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             # v42: rent pool detail on EVERY pull (see the sold side).
             app.logger.warning(f"rent pull: RapidAPI rent pool detail for {addr_line}: "
                                + "; ".join(o["log"] for o in _rout))
-    rc, _ = _scrape(location=addr_line, listing_type="for_rent", past_days=90, radius=radius_mi)
-    if rc is not None: rent_frames.append(rc)
-    ra, err_r = _scrape(location=prop["zip"], listing_type="for_rent", past_days=90)
-    if ra is not None: rent_frames.append(ra)
+    err_r = None
+    if _hh_frames_on:
+        rc, _ = _scrape(location=addr_line, listing_type="for_rent", past_days=90, radius=radius_mi)
+        if rc is not None: rent_frames.append(rc)
+        ra, err_r = _scrape(location=prop["zip"], listing_type="for_rent", past_days=90)
+        if ra is not None: rent_frames.append(ra)
     if not rent_frames:
         warnings.append("rental comps couldn't be pulled this time")
         app.logger.warning(f"rent pull failed: {err_r}")
@@ -5451,7 +6078,7 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                 _rparts.append(f"{_rsn}={_slot[0]}" + (f" ({_ex})" if _ex else ""))
         _rdup = rent_rapi_drops.get("duplicate")
         app.logger.warning(
-            f"rent pull: RapidAPI rent merge detail for {addr_line}: "
+            f"rent pull: API rent merge detail (RapidAPI + direct) for {addr_line}: "
             f"served {rent_rapi_served} rows -> {rent_rapi_added} stored new"
             + (f" + {rent_rapi_updated} duplicate updates" if rent_rapi_updated else "")
             + (f" ({'; '.join(_rdup[1])})" if _rdup and _rdup[1] else "")
@@ -5550,8 +6177,8 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
         if _still_lacks(_prop_now):
             # v58: Things4u detail FIRST — the Realtor.com record is
-            # the freshest subject source that answers from this host;
-            # private-zillow is the last resort (its provider is down).
+            # the freshest subject source that answers from this host
+            # (v69: private-zillow is deleted with its provider).
             # v58.1: the detail id comes from the subject's own row in
             # the pull's frames (property_id column) — never from
             # auto-complete, whose ids are not propertyIds.
@@ -5570,18 +6197,10 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                 _note_zfill(_tf, "subject specs filled from Realtor.com via RapidAPI (Things4u)")
             _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
         if _still_lacks(_prop_now):
-            try:
-                _zf = _zillow_subject_fill(d, _prop_now, today)
-            except Exception as _ze:
-                app.logger.warning(f"comp pull: private-zillow subject fill raised for "
-                                   f"{addr_line}: {_ze!r}")
-                _zf = None
-            if _zf:
-                _note_zfill(_zf, "subject specs/photos filled from Zillow via RapidAPI")
-            # v56 backups: the by-address path is ONE wrapper; when it
-            # cannot answer from this host, the zpid-only ReefAPI
-            # Zillow detail is the second route, and the Unofficial
-            # images endpoint (trusted stored zpid only) the third.
+            # v56 backups (v69: private-zillow is deleted with its
+            # provider — the ladder starts here): the zpid-only ReefAPI
+            # Zillow detail is the first route, and the Unofficial
+            # images endpoint (trusted stored zpid only) the second.
             # Each step re-reads the subject and fires only while the
             # lack it can cure persists.
             _prop_now = d.execute("SELECT * FROM properties WHERE id=?", (prop["id"],)).fetchone()
@@ -5660,19 +6279,32 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         app.logger.warning(f"comp pull: PadSplit pull raised for {addr_line}: {_pse!r}")
         _ps = None
     if _ps:
-        d.execute("UPDATE properties SET padsplit_json=?, padsplit_date=? WHERE id=?",
-                  (json.dumps(_ps), today, prop["id"])); d.commit()
+        # Fix pass 2026-11-17 (M10): a city-wide payload is context only
+        # — it is NOT stored as the property benchmark (only a ZIP-scope
+        # pull stores). The warning still names the city median, labelled
+        # as city-wide.
+        if _ps["scope"] == "zip":
+            d.execute("UPDATE properties SET padsplit_json=?, padsplit_date=? WHERE id=?",
+                      (json.dumps(_ps), today, prop["id"])); d.commit()
         _ps_med = _median([float(x) for x in _ps["weekly_rents"]]) or 0
         _ps_scope = (f"ZIP {str(prop['zip'] or '')[:5]}" if _ps["scope"] == "zip"
                      else f"{prop['city']} city-wide (ZIP itself listed {_ps['zip_n']})")
         warnings.append(f"PadSplit (official listings): {_ps['n']} rooms listed in "
-                        f"{_ps_scope} — median ${_ps_med:,.0f}/wk per room")
+                        f"{_ps_scope} — median ${_ps_med:,.0f}/wk per room"
+                        + (" — city-wide context only, not stored as the ZIP benchmark"
+                           if _ps["scope"] != "zip" else ""))
     # --- P0-1/P0-2 widening (Sherif 2026-11-02): the match-first views need a
     # real matched set. If the stored sold set holds <10 Tier-1 matches, run ONE
-    # widened sold scrape (2x radius, min 2 mi; 730 days) and merge it; if the
+    # widened sold scrape (2x radius, min 2 mi; 425 days) and merge it; if the
     # rental set is thin (<11 stored or <5 exact/near matches), run ONE widened
     # rental scrape (2x radius, min 2 mi; past_days 365). Widening only ADDS
-    # real listings — views never pad with mismatches. ---
+    # real listings — views never pad with mismatches.
+    # Fix pass 2026-11-17 (M9): widening re-runs ONLY the free/unmetered
+    # paths (HomeHarvest scrape + FL Cadastral). The paid/direct sources
+    # (ReefAPI direct, RapidAPI union, gated direct) are NEVER re-run at
+    # 2x radius — one pull must never double-spend the scarcest quotas
+    # (Sabri 30/mo, ReefAPI 1,000 credits one-time) for the same thin
+    # set. The widening horizon is 425 days (the hard sold horizon, H2). ---
     # v58: prop2 is a plain dict (not a sqlite Row) — the Things4u /
     # jina adapters read prop.get("city"), which a Row does not have,
     # and the widened frame silently died on it (the v58 gate caught
@@ -5684,9 +6316,13 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     def _tier1_count(win_days=None):
         rows = d.execute("SELECT beds,baths,sqft,event_date FROM comps WHERE property_id=? AND kind='sold' AND excluded=0",
                          (prop["id"],)).fetchall()
-        if win_days:
-            cutoff = (datetime.date.today() - datetime.timedelta(days=win_days)).isoformat()
-            rows = [r for r in rows if not r["event_date"] or r["event_date"] >= cutoff]
+        # Fix pass 2026-11-17 (H2/H5): Tier-1 depth counts DATED sales
+        # inside the hard ~425-day horizon only (win_days capped at
+        # 425; no window = the 425-day horizon itself) — a dateless or
+        # 2023/2024 row never counts as a Tier-1 match.
+        win = min(win_days, _SOLD_HORIZON_DAYS) if win_days else _SOLD_HORIZON_DAYS
+        cutoff = (datetime.date.today() - datetime.timedelta(days=win)).isoformat()
+        rows = [r for r in rows if _sold_date_in_window(r["event_date"], cutoff)]
         return sum(1 for r in rows if comp_tier(subj2, dict(r)) == 1)
     t1 = _tier1_count()
     # v3.4: the widening must also serve the VIEW — the sold view shows a
@@ -5697,8 +6333,8 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
     if t1 < 10 or t1w < 10:
         wide_r = max(radius_mi * 2, 2.0)
         got = False
-        for kw in (dict(location=prop2["address"], listing_type="sold", past_days=730, radius=wide_r),
-                   dict(location=prop["zip"], listing_type="sold", past_days=730)):
+        for kw in (dict(location=prop2["address"], listing_type="sold", past_days=425, radius=wide_r),
+                   dict(location=prop["zip"], listing_type="sold", past_days=425)):
             wide, _e = _scrape(**kw)
             if wide is None: continue
             a3, u3, _ = _merge_sold_frame(d, prop2, wide, wide_r, subj2)
@@ -5706,10 +6342,11 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         # v56: on egress-restricted hosts the HomeHarvest widening above
         # can never answer (PA blocks realtor.com), which left the
         # widening a no-op exactly where it was needed. The widening
-        # now ALSO re-runs the two frames that CAN answer there — the
-        # FL Cadastral frame (self-guards to FL subjects) and the
-        # RapidAPI sold union — at the widened radius / 730 days,
-        # merged through the same shared gate as every sold frame.
+        # now ALSO re-runs the frame that CAN answer there — the
+        # FL Cadastral frame (self-guards to FL subjects) — at the
+        # widened radius / 425 days, merged through the same shared
+        # gate as every sold frame. (M9: the paid/direct sources are
+        # NOT re-run here — see the header comment above.)
         try:
             cad_wide, _cadw_err = _fl_cadastral_frame(prop2, wide_r)
         except Exception as _cadw_boom:
@@ -5719,20 +6356,15 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
             a3, u3, _ = _merge_sold_frame(d, prop2, cad_wide, wide_r, subj2,
                                           source_override=CADASTRAL_SRC)
             added += a3; updated += u3; got = True
-        if _rapidapi_key():
-            try:
-                rapi_wide, _rwide_err, _rwide_oc = _rapidapi_sold_frame(prop2, 730, wide_r)
-            except Exception as _rwide_boom:
-                rapi_wide = []
-                app.logger.warning(f"comp pull: widened RapidAPI sold frame raised for {addr_line}: {_rwide_boom!r}")
-            for _wdf, _wlbl in rapi_wide:
-                a3, u3, _ = _merge_sold_frame(d, prop2, _wdf, wide_r, subj2,
-                                              source_override=_wlbl)
-                added += a3; updated += u3; got = True
+        # Fix pass 2026-11-17 (M9): the paid/direct sold sources
+        # (ReefAPI direct, RapidAPI union, gated direct) are NOT
+        # re-run at the widened radius — widening is free/unmetered
+        # paths only, so one pull never double-spends the scarcest
+        # quotas for the same thin set.
         if got:
             d.commit()
             t1b = _tier1_count(); t1wb = _tier1_count(past_days)
-            warnings.append(f"sold set widened to {wide_r:g} mi / 730 days to find Tier-1 matches ({t1} -> {t1b} found; {t1w} -> {t1wb} within {past_days} days)")
+            warnings.append(f"sold set widened to {wide_r:g} mi / 425 days to find Tier-1 matches ({t1} -> {t1b} found; {t1w} -> {t1wb} within {past_days} days)")
         else:
             warnings.append("sold widening scrape failed")
     def _rent_match_counts():
@@ -5766,9 +6398,32 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         _collapse_stored_sold_twins(d, prop["id"], subj2)
     except Exception as _te:
         app.logger.warning(f"comp pull: stored-twin collapse failed for {addr_line}: {_te!r}")
+    # --- v69: 50-comp cap — after twin collapse, before auto-pin, so
+    # the auto-pinned set is drawn from the capped visible set. Sold
+    # ranked in-window, rentals ranked whole-set; pinned always kept.
+    try:
+        _cap_sold = _cap_kind_to_50(d, prop["id"], prop2, subj2, "sold", past_days)
+        if _cap_sold:
+            app.logger.warning(f"comp pull: 50-comp cap excluded {_cap_sold} sold rows for {addr_line}")
+    except Exception as _cap_e:
+        app.logger.warning(f"comp pull: 50-comp sold cap failed for {addr_line}: {_cap_e!r}")
+    try:
+        _cap_rent = _cap_kind_to_50(d, prop["id"], prop2, subj2, "rent")
+        if _cap_rent:
+            app.logger.warning(f"comp pull: 50-comp cap excluded {_cap_rent} rental rows for {addr_line}")
+    except Exception as _cap_e:
+        app.logger.warning(f"comp pull: 50-comp rent cap failed for {addr_line}: {_cap_e!r}")
     # --- Auto-pin (only if user pinned none): top 3 by TIER first (P0-1: Tier 1
     # only when >=3 exist), then match score, then distance. ---
-    pinned_now = d.execute("SELECT COUNT(*) c FROM comps WHERE property_id=? AND kind='sold' AND pinned=1",
+    # Fix pass 2026-11-17 (H3): the count reads pinned=1 across EXCLUDED
+    # rows too — a pin sitting on an excluded twin suppressed re-pinning
+    # forever; excluded pins no longer count. The candidate set is
+    # DATED, in-window sales only (a dateless row never auto-pins), and
+    # Tier-1 matches pin AHEAD of a same-street Tier-3 row with no
+    # beds/baths (the old same-street-first sort pinned exactly that
+    # row ahead of off-street Tier-1 matches; same-street still orders
+    # WITHIN a tier).
+    pinned_now = d.execute("SELECT COUNT(*) c FROM comps WHERE property_id=? AND kind='sold' AND pinned=1 AND excluded=0",
                            (prop["id"],)).fetchone()["c"]
     if not pinned_now:
         rows = [dict(r) for r in d.execute(
@@ -5782,11 +6437,8 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
         # the stored pool, same rule as the stats path.
         _bk = _bulk_group_keys(rows)
         rows = [c for c in rows if _bulk_group_key(c) not in _bk]
-        # v56: same-street first here too — the auto-pinned set is what
-        # the ARV is built from, so a same-street comp (even a Tier-3
-        # county row with no beds/baths) pins ahead of off-street
-        # Tier-1 matches; tier/score/distance order inside the bucket.
-        rows.sort(key=lambda c: (_same_street(prop2, c["address"]), comp_tier(subj2, c),
+        rows = [c for c in rows if _sold_date_in_window(_cval(c, "event_date"))]
+        rows.sort(key=lambda c: (comp_tier(subj2, c), _same_street(prop2, c["address"]),
                                  -(c["match_score"] or 0),
                                  c["distance_mi"] if c["distance_mi"] is not None else 9e9))
         for t in rows[:3]: d.execute("UPDATE comps SET pinned=1 WHERE id=?", (t["id"],))
@@ -5795,6 +6447,15 @@ def pull_comps(prop, radius_mi=1.0, past_days=365):
                            (prop["id"],)).fetchone()["c"]
     total_rent = d.execute("SELECT COUNT(*) c FROM comps WHERE property_id=? AND kind='rent'",
                            (prop["id"],)).fetchone()["c"]
+    # v69: stamp the completed pull (never on a raised failure — the
+    # stamp sits after every merge, so a failed pull leaves the old
+    # stamp and the cache guard never trusts a partial pull).
+    try:
+        d.execute("UPDATE properties SET last_pull_at=?, last_pull_radius=?, last_pull_days=? WHERE id=?",
+                  (today, radius_mi, past_days, prop["id"]))
+        d.commit()
+    except Exception as _stamp_e:
+        app.logger.warning(f"comp pull: pull stamp failed for {addr_line}: {_stamp_e!r}")
     return {"added": added, "updated": updated, "sold": total_sold, "rentals": total_rent,
             "sold_new": n_sold, "photos": photos_found, "warnings": warnings, "date": today}
 
@@ -7376,9 +8037,55 @@ def latest_job(pid, kind=None):
             pass
     return row
 
-def job_comps(pid, radius, past_days):
+def _stored_pull_fresh(d, pid, radius, past_days):
+    """The v69 pull-cache test (Sherif, 2026-11-14): a stored pull is
+    fresh when it ran within 30 days, at the SAME radius and window,
+    and the stored set is sufficient — >= 3 Tier-1 sold comps inside
+    the window AND >= 5 matched rentals (exact + near beds/baths).
+    A fresh set is served from storage with zero requests; anything
+    else pulls live. The stamp is written by pull_comps on every
+    completed pull, never on a raised failure, so the guard can never
+    trust a partial pull. Any read error (incl. a pre-v69 DB without
+    the stamp columns) is not-fresh — the pull runs live."""
+    import datetime as _dt
+    try:
+        prow = d.execute("SELECT * FROM properties WHERE id=?", (pid,)).fetchone()
+        if prow is None: return False
+        lp = prow["last_pull_at"]
+        if not lp: return False
+        if _dt.date.fromisoformat(lp) < _dt.date.today() - _dt.timedelta(days=30):
+            return False
+        if prow["last_pull_radius"] is None or float(prow["last_pull_radius"]) != float(radius):
+            return False
+        if prow["last_pull_days"] is None or int(prow["last_pull_days"]) != int(past_days):
+            return False
+        subj = {"sqft": prow["sqft"], "beds": prow["beds"], "baths": prow["baths"],
+                "year_built": prow["year_built"], "lot_sqft": prow["lot_sqft"]}
+        # Fix pass 2026-11-17 (H2/H5): the fresh test counts DATED Tier-1
+        # sales inside the hard ~425-day horizon only (past_days capped
+        # at 425) — a dateless row never counts as in-window. Rentals
+        # count only non-excluded rows.
+        cutoff = (_dt.date.today() - _dt.timedelta(days=min(past_days, _SOLD_HORIZON_DAYS))).isoformat()
+        sold = d.execute("SELECT beds,baths,sqft,event_date FROM comps "
+                         "WHERE property_id=? AND kind='sold' AND excluded=0",
+                         (pid,)).fetchall()
+        sold = [r for r in sold if _sold_date_in_window(r["event_date"], cutoff)]
+        t1 = sum(1 for r in sold if comp_tier(subj, dict(r)) == 1)
+        if t1 < 3: return False
+        rents = d.execute("SELECT beds,baths FROM comps WHERE property_id=? AND kind='rent' AND excluded=0",
+                          (pid,)).fetchall()
+        matched = sum(1 for r in rents if rent_match_group(subj, dict(r)) in (0, 1))
+        return matched >= 5
+    except Exception:
+        return False
+
+
+def job_comps(pid, radius, past_days, force=False):
     def fn():
         p = get_prop(pid)
+        if not force and _stored_pull_fresh(db(), pid, radius, past_days):
+            return (f"served from stored pull — no requests used "
+                    f"({p['address']}: the stored set from the last pull is still fresh)")
         res = pull_comps(p, radius_mi=radius, past_days=past_days)
         msg = f"✓ {res['sold']} sold comps + {res['rentals']} rental comps found (radius {radius:g} mi)"
         if res["photos"]: msg += f" · {res['photos']} listing photos found for this property"
@@ -7543,6 +8250,15 @@ def property_page(pid):
             if f in request.form:
                 v = request.form.get(f)
                 v = clean_num(v) if f in NUMERIC_PROP_FIELDS else (v if v != "" else None)
+                # Fix pass 2026-11-17 (L2): a negative property number
+                # (ARV, repairs, price, sqft, beds/baths...) is rejected
+                # outright — the whole save is refused, nothing stored.
+                if f in NUMERIC_PROP_FIELDS and isinstance(v, (int, float)) and v < 0:
+                    _msg = f"{f} cannot be negative — the save was rejected; nothing was stored."
+                    if request.form.get("ajax") == "1":
+                        return jsonify(ok=False, error=_msg)
+                    flash(_msg, "error")
+                    return redirect(url_for("property_page", pid=pid, tab=request.args.get("tab", "overview")))
                 sets.append(f"{f}=?"); args.append(v)
         if sets:
             args.append(pid); d.execute(f"UPDATE properties SET {','.join(sets)} WHERE id=?", args); d.commit()
@@ -7894,6 +8610,11 @@ def property_page(pid):
     # the Sold view applies the date window — the difference is dated sales
     # older than the window. Both bases are labeled on the page.
     sold_older_n = len([c for c in sold if c["event_date"] and c["event_date"] < cutoff])
+    # L3 (integration 2026-11-17): comps without coordinates never
+    # reach the map (the COMPS array is built from lat/lon only) —
+    # count them here so the Count-check paragraph can name them
+    # instead of dropping them silently.
+    sold_nocoords_n = len([c for c in sold if c["lat"] is None or c["lon"] is None])
     ltr = ltr_stats(rents_view)
     coli = coliving_stats(rents_view, p)
     med_rent = ltr["median_rent"] if ltr else None
@@ -7959,6 +8680,7 @@ def property_page(pid):
                            bulk_group_ids=bulk_group_ids,
                            stat_excluded_ids=stat_excluded_ids,
                            sold_stats=sold_stats, set_stats=set_stats, sold_older_n=sold_older_n,
+                           sold_nocoords_n=sold_nocoords_n,
                            ltr=ltr, coli=coli, med_rent=med_rent, afford_view=afford_view,
                            breakdowns=breakdowns, room_est=room_est,
                            strategies=strategies, uw_fresh=uw_fresh, uw_saved=uw_saved, uw_current=uw_current,
@@ -8010,9 +8732,11 @@ def do_pull_comps(pid):
     radius = fnum(request.form.get("radius_custom"), None) or fnum(request.form.get("radius"), 1.0) or 1.0
     days = int(fnum(request.form.get("window_days"), 365) or 365)
     days = days if days in (30, 90, 180, 365, 730, 1095, 36500) else 365
-    job_comps(pid, radius, days)
+    force = request.form.get("force") == "1"
+    job_comps(pid, radius, days, force=force)
     flash(f"Pulling comps — sold (last {days} days) + rentals + listing photos within {radius:g} mi. "
-          "This usually takes about a minute; the results will appear here automatically.", "info")
+          + ("Forced re-pull — the stored set was bypassed. " if force else "")
+          + "This usually takes about a minute; the results will appear here automatically.", "info")
     return redirect(url_for("property_page", pid=pid, tab="comps", view="sold"))
 
 # ------------------------------------------------- comp weights (item L) + add comp (item M)
@@ -8156,6 +8880,29 @@ def _insert_comp(prop, vals):
     d.commit()
     return cur.lastrowid
 
+def _manual_comp_gate(prop, kind_choice, price, event_date, distance_mi):
+    """Fix pass 2026-11-17 (M3): a manually/lookup-added comp must prove
+    it belongs in pin/average/ARV math BEFORE it is stored. Sold rows
+    need a real price (>0), a dated sale inside the hard ~425-day
+    horizon (never 2023/2024), and a distance inside the widened
+    radius; active listings need a real price and the radius only
+    (a listing has no sale date to judge). Returns an error string
+    when the row must not enter, else None. A row with no coordinates
+    (geocode failed) has no distance to judge, so the radius check is
+    skipped for it — its card still carries the no-coordinates note."""
+    if not price or price <= 0:
+        return "it needs a sale/list price above $0"
+    if distance_mi is not None:
+        max_r = max(float(prop["last_pull_radius"] or 1.0), 2.0)
+        if distance_mi > max_r:
+            return f"it is {distance_mi:.1f} mi from the subject (outside the {max_r:g} mi widened radius)"
+    if kind_choice == "sold":
+        if not event_date:
+            return "a sold comp needs a sale date"
+        if not _sold_date_in_window(event_date):
+            return f"its sale date is outside the {_SOLD_HORIZON_DAYS}-day comp window (never 2023/2024)"
+    return None
+
 @app.route("/property/<int:pid>/comps/add-lookup", methods=["POST"])
 def add_comp_lookup(pid):
     prop = get_prop(pid)
@@ -8184,6 +8931,12 @@ def add_comp_lookup(pid):
                 ptype=_norm_ptype(_s(r.get("style")) or _s(r.get("property_type"))),
                 source="HomeHarvest (Realtor.com) — added by address lookup",
                 source_url=_s(r.get("property_url")), photo_url=_s(r.get("primary_photo")))
+    # Fix pass 2026-11-17 (M3): the looked-up row must pass the same
+    # gates as a manual add — reject it with a clear message, do not store it.
+    _gate_err = _manual_comp_gate(prop, kind_choice, price, vals["event_date"], vals["distance_mi"])
+    if _gate_err:
+        flash(f"Comp not added — {_gate_err}.", "error")
+        return redirect(url_for("property_page", pid=pid, tab="comps", view="sold", addmanual=1, addr=addr))
     new_cid = _insert_comp(prop, vals)
     flash(f"✓ Comp added from HomeHarvest: {vals['address']}, {vals['city']} — "
           f"{'sold' if kind_choice == 'sold' else 'active listing'} {('$' + format(int(price), ',')) if price else ''}.", "info")
@@ -8215,6 +8968,13 @@ def add_comp_manual(pid):
                 lot_sqft=fnum(request.form.get("lot_sqft"), None),
                 ptype=None, source="Manual entry (added by user)",
                 source_url=(request.form.get("source_url") or "").strip() or None, photo_url=None)
+    # Fix pass 2026-11-17 (M3): validate price / sale date / radius
+    # BEFORE the row enters pin/average/ARV math — reject invalid rows
+    # with a clear message, do not store them.
+    _gate_err = _manual_comp_gate(prop, kind_choice, price, vals["event_date"], vals["distance_mi"])
+    if _gate_err:
+        flash(f"Comp not added — {_gate_err}.", "error")
+        return redirect(url_for("property_page", pid=pid, tab="comps", view="sold", addmanual=1))
     new_cid = _insert_comp(prop, vals)
     flash(f"✓ Comp added manually: {addr}, {city} — it counts in pin/average math like a pulled comp.", "info")
     return redirect(url_for("property_page", pid=pid, tab="comps", view="sold", highlight=new_cid))
@@ -8367,15 +9127,24 @@ def amortize(pid):
     rate = fnum(request.form.get("rate"), 0) or 0
     yrs = fnum(request.form.get("amort_years"), 0) or 0
     term = fnum(request.form.get("loan_years"), 0) or 0
-    if principal <= 0 or rate <= 0 or yrs <= 0 or term <= 0:
+    # Fix pass 2026-11-17 (underwriting audit A4): the standalone
+    # calculator accepts 0% and interest-only loans (rate 0, or an
+    # amortization term of 0 — the UW sidebar table prices both fine,
+    # and amortization() now guards a 0-year term as interest-only).
+    # Only a missing principal still refuses (all-four-blank is
+    # subsumed by principal <= 0 — the calculator still uses only
+    # numbers the user typed, no invented 30-year default).
+    if principal <= 0:
         # v2.0 (Sherif clarification): compute ONLY from numbers the user typed.
         # The old `or 30` defaults invented a 30-year term on blank fields.
-        flash("Enter the loan amount, rate, amortization and loan term — the calculator uses only the numbers you type.", "warn")
+        flash("Enter the loan amount — the calculator uses only the numbers you type (rate 0% and a 0-year amortization term are allowed: interest-only).", "warn")
         return redirect(url_for("property_page", pid=pid, tab="underwriting"))
     res = amortization(principal, rate, yrs, term)
     if request.form.get("add_to_stack"):
         sc = db().execute("SELECT * FROM scenarios WHERE property_id=? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
-        flash(f"Amortization: payment ${res['payment']:,}/mo, balloon after year {int(term)}: ${res['balloon']:,}. "
+        _byr = int(term or yrs)
+        _bnote = f"balloon after year {_byr}: ${res['balloon']:,}" if _byr else f"balloon (interest-only, no term set): ${res['balloon']:,}"
+        flash(f"Amortization: payment ${res['payment']:,}/mo, {_bnote}. "
               "Add it as a funding-stack line in your next underwriting run (type: Loan).")
     return render_template("amortization.html", p=p, res=res, principal=principal, rate=rate, yrs=yrs, term=term)
 
@@ -8540,16 +9309,18 @@ def floorplan_delete(fid):
 def settings_page():
     if request.method == "POST":
         if "census_key" in request.form:
-            for k in ("census_key", "rentcast_key", "apillow_key"):
-                set_setting(k, request.form.get(k, ""))
-            # RapidAPI key (v3.8): the field renders MASKED (blank password
-            # input — the saved key is never sent to the page), so a
-            # non-empty submit is a NEW key, a blank submit keeps the saved
-            # one, and only the explicit clear checkbox removes it.
-            if request.form.get("rapidapi_key_clear"):
-                set_setting("rapidapi_key", "")
-            elif (request.form.get("rapidapi_key") or "").strip():
-                set_setting("rapidapi_key", request.form.get("rapidapi_key").strip())
+            set_setting("census_key", request.form.get("census_key", ""))
+            # Masked keys (v69): each field renders as a blank password
+            # input — the saved key is never sent to the page — so a
+            # non-empty submit is a NEW key, a blank submit keeps the
+            # saved one, and only the explicit clear checkbox removes
+            # it. (Before v69 rentcast/apillow saved as PLAIN inputs,
+            # so a blank submit silently WIPED a saved key.)
+            for k in ("rentcast_key", "apillow_key", "reefapi_key", "rapidapi_key"):
+                if request.form.get(k + "_clear"):
+                    set_setting(k, "")
+                elif (request.form.get(k) or "").strip():
+                    set_setting(k, request.form.get(k).strip())
             flash("API keys saved (stored server-side in local DB only).")
         elif "bb_name" in request.form:
             db().execute("""INSERT INTO buy_boxes(name,cities,max_price,min_beds,min_sqft,strategies,min_arv_spread_pct)
@@ -8560,10 +9331,15 @@ def settings_page():
             db().commit(); flash("Buy box added.")
         return redirect(url_for("settings_page"))
     return render_template("settings.html", boxes=all_boxes(),
-                           census_key=get_setting("census_key"), rentcast_key=get_setting("rentcast_key"),
-                           apillow_key=get_setting("apillow_key"),
+                           census_key=get_setting("census_key"),
+                           rentcast_key_set=bool(_rentcast_key()),
+                           apillow_key_set=bool(_apillow_key()),
+                           reefapi_key_set=bool(_reefapi_key()),
                            rapidapi_key_set=bool(_rapidapi_key()),
-                           rapidapi_env_set=bool(os.environ.get("RAPIDAPI_API_KEY")))
+                           rapidapi_env_set=bool(os.environ.get("RAPIDAPI_API_KEY")),
+                           usage={k: _usage_count(k) for k in PROVIDER_LIMITS},
+                           limits=PROVIDER_LIMITS,
+                           provider_display=PROVIDER_DISPLAY)
 
 @app.route("/buybox/<int:bid>/toggle", methods=["POST"])
 def bb_toggle(bid):

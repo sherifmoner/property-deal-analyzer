@@ -16,12 +16,21 @@
 <p><button class="btn">Add buy box</button></p></form></div>
 <div><div class="card"><h2>API keys <span class="small muted">(optional, free tiers — stored server-side only)</span></h2>
 <form method="post"><label>US Census API key (keyless works too; key raises limits)</label><input name="census_key" value="{{ census_key }}">
-<label>RentCast API key (free 50/mo — backup estimates only)</label><input name="rentcast_key" value="{{ rentcast_key }}">
-<label>apillow API key (free 50/mo — backup)</label><input name="apillow_key" value="{{ apillow_key }}">
-<label>RapidAPI key (free — one key covers the whole comp pool: ReefAPI 100/mo, Redfin 100/mo, Realtor16 30/mo top-up; the sources union automatically on a pull; unlocks comp pulls on hosts that can't reach the listing sites)</label>
+<label>ReefAPI API key (free — 1,000 one-time credits, ~250 pulls; direct sold + rent search, runs first in the chain)</label>
+<input type="password" name="reefapi_key" value="" autocomplete="off" placeholder="{{ '•••••••••• — a key is saved; paste a new one to replace it' if reefapi_key_set else 'Paste your ReefAPI key' }}">
+<label style="font-weight:normal"><input type="checkbox" name="reefapi_key_clear" value="1" style="width:auto"> Clear the saved ReefAPI key</label>
+<label>RentCast API key (free 50/mo — AVM value + rent; gated: fires only while the pull is thin)</label>
+<input type="password" name="rentcast_key" value="" autocomplete="off" placeholder="{{ '•••••••••• — a key is saved; paste a new one to replace it' if rentcast_key_set else 'Paste your RentCast key' }}">
+<label style="font-weight:normal"><input type="checkbox" name="rentcast_key_clear" value="1" style="width:auto"> Clear the saved RentCast key</label>
+<label>apillow API key (free 50 properties/mo — Zillow sold + rent; gated: fires only while the pull is thin)</label>
+<input type="password" name="apillow_key" value="" autocomplete="off" placeholder="{{ '•••••••••• — a key is saved; paste a new one to replace it' if apillow_key_set else 'Paste your apillow key' }}">
+<label style="font-weight:normal"><input type="checkbox" name="apillow_key_clear" value="1" style="width:auto"> Clear the saved apillow key</label>
+<label>RapidAPI key (free — one key covers the RapidAPI comp pool: Realtor Search 150/mo, Redfin.com Data 100/mo, Realtor16 (Sabri) 30/mo, ReefAPI-RapidAPI; the sources union automatically on a pull; unlocks comp pulls on hosts that can't reach the listing sites)</label>
 <input type="password" name="rapidapi_key" value="" autocomplete="off" placeholder="{{ '•••••••••• — a key is saved; paste a new one to replace it' if rapidapi_key_set else 'Paste your RapidAPI key' }}">
 <label style="font-weight:normal"><input type="checkbox" name="rapidapi_key_clear" value="1" style="width:auto"> Clear the saved RapidAPI key</label>
 {% if rapidapi_env_set %}<p class="small muted">RAPIDAPI_API_KEY is set in this server's environment and overrides the saved key.</p>{% endif %}
+<p class="small muted">Usage — monthly counters reset on the 1st (ReefAPI direct counts its 1,000 one-time credits, never reset; ReefAPI-RapidAPI has no vendor cap listed):</p>
+<ul class="small muted">{% for k, lim in limits.items() %}<li>{{ provider_display[k] }} — {{ usage[k] }}{% if lim is none %} (no vendor cap){% else %} / {{ lim }}{% endif %}</li>{% endfor %}</ul>
 <p><button class="btn">Save keys</button></p></form></div>
 <div class="card"><h2>Export / Import <span class="small muted">(the migration path to the hosted + PC versions)</span></h2>
 <p><a class="btn sec" href="{{ url_for('export_json') }}">Export full JSON</a> <a class="btn sec" href="{{ url_for('export_csv') }}">Export CSV</a></p>

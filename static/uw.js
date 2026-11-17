@@ -67,7 +67,13 @@
     if (pt === "interest_only") return 0;
     if (pt === "principal_only") return months ? Math.min(amt, amt / months * 12) : 0;
     if (pt === "amortized" && !months) return 0; /* v3.1: no effective term -> interest-only pricing -> $0 paydown */
-    var pay = pt === "fixed" ? N(f.fixed_payment) : loanPayment(amt, rate, months / 12);
+    /* Fix pass 2026-11-17 (underwriting audit A1, mirrors app.py
+       _paydown_y1): a Fixed payment on a Subject-To card is PITI —
+       subtract taxes + insurance before the split, so the escrow
+       slice is not booked as principal (Senisa card-only: $23,052
+       booked vs the $14,736 fixture). rowPayment() is untouched:
+       debt service still counts the full payment + escrow. */
+    var pay = pt === "fixed" ? Math.max(N(f.fixed_payment) - N(f.taxes_mo) - N(f.insurance_mo), 0) : loanPayment(amt, rate, months / 12);
     if (pay <= 0) return 0;
     var r = rate / 100 / 12, bal = amt, prin = 0;
     for (var i = 0; i < 12 && bal > 0; i++) { var p = Math.min(Math.max(pay - bal * r, 0), bal); prin += p; bal -= p; }
@@ -506,7 +512,11 @@
     var noi = egi - opex, cf = noi - debtService;
     var value = arv || price;
     var metrics = { cf_per_room: roomsN ? cf / roomsN : 0,
-      dscr: debtService ? noi / debtService : (noi > 0 ? 1.5 : 0),
+      /* Fix pass 2026-11-17 (underwriting audit A6, mirrors app.py):
+         with no debt the DSCR is N/A (null), matching the summary —
+         the old 1.5 placeholder was an invented number. The score
+         engine still reads dscr_val below (null = no debt = 100). */
+      dscr: debtService ? noi / debtService : null,
       coc: cashNeeded ? cf * 12 / cashNeeded : 0,
       cap_rate: value ? noi * 12 / value : 0,
       breakeven: (gross + other) ? (opex + debtService) / (gross + other) : null, /* v59 D3: no gross -> no breakeven (was a fake 1.3 = 130%) */
@@ -529,7 +539,7 @@
       else e2 = (gross - vacLoss) * mult + other;
       var noiS = e2 - opex;
       return { revenue: e2, expenses: opex, loan: debtService, net: e2 - opex - debtService,
-        dscr: debtService ? noiS / debtService : (noiS > 0 ? 1.5 : 0),
+        dscr: debtService ? noiS / debtService : null,
         cap_rate_pct: value ? noiS * 12 / value * 100 : 0,
         coc_pct: cashNeeded ? (e2 - opex - debtService) * 12 / cashNeeded * 100 : null };
     }
@@ -1201,7 +1211,7 @@
     });
     panel.querySelectorAll(".scorering").forEach(function (elm) {
       var sc2 = (r.score === null || r.score === undefined) ? 0 : Math.max(0, Math.min(100, r.score));
-      elm.style.background = "conic-gradient(#2563eb " + sc2 + "%, #e2e8f0 " + sc2 + "%)";
+      elm.style.background = "conic-gradient(#0152cb " + sc2 + "%, #e2e8f0 " + sc2 + "%)";
     });
     panel.querySelectorAll("[data-ncfunit]").forEach(function (elm) {
       elm.textContent = panel.dataset.ncfMode === "yr" ? "/yr" : "/mo";
@@ -1301,9 +1311,13 @@
       (s.funding || []).forEach(function (f) { if (!loan && f.type !== "Cash" && f.type !== "Equity" && AMOUNT_ONLY_TYPES.indexOf(f.type) < 0 && N(f.amount) > 0) loan = f; });
       var amt = 0, rate = 0;
       if (loan) { amt = N(loan.amount); rate = N(loan.rate); }
-      if (amt > 0 && loanSchedule(loan).notset) {
-        am.innerHTML = '<p class="small muted">This loan has no amortization term yet — enter the Amortization Term on its Funding card to see its amortization here.</p>';
-      } else if (amt > 0) {
+      /* Fix pass 2026-11-17 (underwriting audit A2): the old
+         loanSchedule(loan).notset branch is REMOVED — loanSchedule
+         never returned notset, so that note could never render (dead
+         branch). v3.1 prices a no-term card interest-only, so the IO
+         schedule always renders instead; the v2.0 note intent is
+         superseded. Behavior-preserving: the branch was dead. */
+      if (amt > 0) {
         var sch = loanSchedule(loan);
         var maxPI = 1; sch.rows.slice(0, 15).forEach(function (x) { maxPI = Math.max(maxPI, x.interest + x.principal); });
         var bars = sch.rows.slice(0, 15).map(function (x) {
@@ -1322,8 +1336,8 @@
     /* sidebar visual / scenarios / details */
     var vis = panel.querySelector("[data-visual='main']");
     if (vis) {
-      if (strat === "Fix & Flip") vis.innerHTML = barsHtml([["Sale Price", r.sale_price, "#16a34a"], ["All-in Cost", r.all_in, "#dc2626"], ["Net Profit", r.profit, "#2563eb"]]);
-      else vis.innerHTML = barsHtml([["Revenue (EGI)", r.egi_mo, "#16a34a"], ["Operating Expenses", r.opex_mo, "#dc2626"], ["Loan Payments", r.debt_service_mo, "#d97706"], ["Net Cash Flow", r.cashflow_mo, "#2563eb"]]);
+      if (strat === "Fix & Flip") vis.innerHTML = barsHtml([["Sale Price", r.sale_price, "#16a34a"], ["All-in Cost", r.all_in, "#dc2626"], ["Net Profit", r.profit, "#0152cb"]]);
+      else vis.innerHTML = barsHtml([["Revenue (EGI)", r.egi_mo, "#16a34a"], ["Operating Expenses", r.opex_mo, "#dc2626"], ["Loan Payments", r.debt_service_mo, "#d97706"], ["Net Cash Flow", r.cashflow_mo, "#0152cb"]]);
     }
     var vex = panel.querySelector("[data-visual='exp']");
     if (vex) {

@@ -34,7 +34,7 @@
 {% endmacro %}
 {% macro compcard(c, mode) %}
 <div class="ccard {{ 'pinned' if c.pinned }}" data-cid="{{ c.id }}" data-price="{{ c.price if c.price is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}" data-beds="{{ c.beds if c.beds is not none else '' }}" data-baths="{{ c.baths if c.baths is not none else '' }}" data-sqft="{{ c.sqft if c.sqft is not none else '' }}" data-lot="{{ c.lot_sqft if ('lot_sqft' in c.keys() and c.lot_sqft is not none) else '' }}" data-year="{{ c.year_built or '' }}" data-dist="{{ c.distance_mi if c.distance_mi is not none else '' }}" data-ysold="{{ (c.event_date or '')[:4] }}" data-kind="{{ c.kind }}" data-ptype="{{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }}" data-zip="{{ c.zip or '' }}"{% if stat_excluded_ids is defined and c.id in stat_excluded_ids %} data-stat-excluded="1"{% endif %}>
- {% if c.photo_url %}<img class="cphoto" src="{{ c.photo_url }}" alt="Comp photo" loading="lazy">{% else %}<div class="cphoto" style="height:150px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px">No photo available</div>{% endif %}
+ {% if c.photo_url %}<img class="cphoto" src="{{ c.photo_url }}" alt="Comp photo" loading="lazy">{% else %}<div class="cphoto" style="height:150px;display:flex;align-items:center;justify-content:center;color:#6c727f;font-size:13px">No photo available</div>{% endif %}
  <div class="cb">
  <div class="score">{{ c.match_score|num }}<small>MATCH</small></div>
  <div class="cprice">{% if mode=='rent' %}{{ c.price|money }}<span class="small muted">/mo rent</span>{% else %}{{ c.price|money }}{% endif %}</div>
@@ -78,9 +78,9 @@
 {% endmacro %}
 {% macro subjcard(mode) %}
 <div class="ccard subj">
- {% if photos %}<img class="cphoto" src="{{ photos[0] }}" alt="Subject photo">{% else %}<div class="cphoto" style="height:150px;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:13px">No photo available</div>{% endif %}
+ {% if photos %}<img class="cphoto" src="{{ photos[0] }}" alt="Subject photo">{% else %}<div class="cphoto" style="height:150px;display:flex;align-items:center;justify-content:center;color:#6c727f;font-size:13px">No photo available</div>{% endif %}
  <div class="cb">
- <div class="score" style="background:#2563eb">SUBJECT<small>THIS PROPERTY</small></div>
+ <div class="score" style="background:#0152cb">SUBJECT<small>THIS PROPERTY</small></div>
  <div class="cprice">{{ p.list_price|money }}<span class="small muted"> list</span></div>
  <div class="small" data-subj-address><b>{{ p.address }}</b></div>
  <div class="small muted" data-subj-specs>{{ p.beds|num }}bd • {{ p.baths|num }}ba • {{ (p.sqft|int) if p.sqft else '—' }}sqft • Built {{ p.year_built or '—' }}</div>
@@ -400,14 +400,15 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 {% endif %}
 
 {% if tab=='comps' %}
-<div class="card"><h2>🔍 Pull comps — free (HomeHarvest / Realtor.com)</h2>
+<div class="card"><h2>🔍 Pull comps — free API pool + listing frames</h2>
 <form method="post" action="{{ url_for('do_pull_comps', pid=p.id) }}"><div class="rowflex">
 <div><label>Search radius</label><select name="radius">{% for r in [0.25,0.5,1,1.25,1.5,2,2.5,5,10] %}<option value="{{ r }}" {% if r==1 %}selected{% endif %}>{{ r }} mi</option>{% endfor %}</select></div>
 <div><label>…or custom radius (mi)</label><input name="radius_custom" placeholder="e.g. 0.75"></div>
 <div><label>Sold within</label><select name="window_days">{% for dval,lab in [(30,'Last 30 days'),(90,'Last 90 days'),(180,'Last 6 months'),(365,'Last year'),(730,'Last 2 years'),(1095,'Last 3 years'),(36500,'All time')] %}<option value="{{ dval }}" {% if dval==365 %}selected{% endif %}>{{ lab }}</option>{% endfor %}</select></div>
+<div style="flex:0"><label style="white-space:nowrap"><input type="checkbox" name="force" value="1" style="width:auto"> Force re-pull</label></div>
 <div style="flex:0"><button class="btn big">🔍 Pull Comps</button></div></div></form>
-<p class="small muted">Pulls sold comps + rental comps + this property's own listing photos in the background (about a minute). The banner at the top of this page shows progress and the final counts — nothing happens silently. Match score weights: distance {{ comp_weights.distance|round|int }}% · sqft {{ comp_weights.sqft|round|int }}% · beds {{ comp_weights.beds|round|int }}% · baths {{ comp_weights.baths|round|int }}% · year built {{ comp_weights.year|round|int }}% · lot size {{ comp_weights.lot|round|int }}% — adjust them in the Weights box below. On file now: <b>{{ sold|length }} sold</b>, <b>{{ rents|length }} rentals</b>.</p>
-<p class="small muted" data-comp-counts>Count check: <b>{{ sold|length }} sold</b> comps are stored for this property in total. The Sold view below applies the “Show sold from” window {% if window >= 36500 %}(all time — no date limit){% else %}(last {{ window }} days){% endif %}{% if rmax %} and the {{ rmax }} mi radius{% endif %}, so it currently shows <b>{{ set_stats.n }} sold</b>{% if sold_older_n %} — {{ sold_older_n }} stored sale{{ 's' if sold_older_n != 1 }} older than the {{ window }}-day window fall outside the view{% endif %}. The stored total and the in-view count use different bases by design; both are labeled so the numbers always reconcile.</p>
+<p class="small muted">Pulls sold comps + rental comps + this property's own listing photos in the background (about a minute). A pull within 30 days at the same radius/window is served from storage (no requests used) unless Force re-pull is checked. The banner at the top of this page shows progress and the final counts — nothing happens silently. Match score weights: distance {{ comp_weights.distance|round|int }}% · sqft {{ comp_weights.sqft|round|int }}% · beds {{ comp_weights.beds|round|int }}% · baths {{ comp_weights.baths|round|int }}% · year built {{ comp_weights.year|round|int }}% · lot size {{ comp_weights.lot|round|int }}% — adjust them in the Weights box below. On file now: <b>{{ sold|length }} sold</b>, <b>{{ rents|length }} rentals</b>.</p>
+<p class="small muted" data-comp-counts>Count check: <b>{{ sold|length }} sold</b> comps are stored for this property in total. The Sold view below applies the “Show sold from” window {% if window >= 36500 %}(all time — no date limit){% else %}(last {{ window }} days){% endif %}{% if rmax %} and the {{ rmax }} mi radius{% endif %}, so it currently shows <b>{{ set_stats.n }} sold</b>{% if sold_older_n %} — {{ sold_older_n }} stored sale{{ 's' if sold_older_n != 1 }} older than the {{ window }}-day window fall outside the view{% endif %}{% if sold_nocoords_n %} — {{ sold_nocoords_n }} stored sale{{ 's' if sold_nocoords_n != 1 }} {{ 'has' if sold_nocoords_n == 1 else 'have' }} no coordinates, so {{ 'it is' if sold_nocoords_n == 1 else 'they are' }} listed below but never {{ 'appears' if sold_nocoords_n == 1 else 'appear' }} on the map{% endif %}. The stored total and the in-view count use different bases by design; both are labeled so the numbers always reconcile.</p>
 <details class="weightsbox"><summary>⚖ Comp match weights — Distance {{ comp_weights.distance|round|int }} · Sqft {{ comp_weights.sqft|round|int }} · Beds {{ comp_weights.beds|round|int }} · Baths {{ comp_weights.baths|round|int }} · Year {{ comp_weights.year|round|int }} · Lot {{ comp_weights.lot|round|int }}</summary>
 <form method="post" action="{{ url_for('comp_weights_save', pid=p.id) }}"><div class="rowflex">
 <div><label>Distance %</label><input type="number" step="any" min="0" name="w_distance" value="{{ comp_weights.distance }}"></div>
@@ -506,7 +507,7 @@ if(x&&m){x.addEventListener('click',function(){m.classList.remove('open')});}})(
 <table class="complist" data-comp-list>
 <thead><tr><th>Address</th><th data-sort="beds">Beds ⇅</th><th data-sort="baths">Baths ⇅</th><th data-sort="sqft">Area ⇅</th><th data-sort="lot">Lot ⇅</th><th data-sort="year">Year ⇅</th><th data-sort="price">Price ⇅</th><th data-sort="distance">Distance ⇅</th><th>Match</th></tr></thead>
 <tbody>
-<tr data-subject="1"><td><b>{{ p.address }}</b> <span class="badge" style="background:#dbeafe;color:#1e40af">SUBJECT</span></td><td>{{ p.beds|num }}</td><td>{{ p.baths|num }}</td><td>{{ p.sqft|num }}</td><td>{{ p.lot_sqft|num }}</td><td>{{ p.year_built or '—' }}</td><td>{{ p.list_price|money }}</td><td>—</td><td>—</td></tr>
+<tr data-subject="1"><td><b>{{ p.address }}</b> <span class="badge" style="background:#e8f0fc;color:#0152cb">SUBJECT</span></td><td>{{ p.beds|num }}</td><td>{{ p.baths|num }}</td><td>{{ p.sqft|num }}</td><td>{{ p.lot_sqft|num }}</td><td>{{ p.year_built or '—' }}</td><td>{{ p.list_price|money }}</td><td>—</td><td>—</td></tr>
 {% for c in sold_view %}<tr data-cid="{{ c.id }}" data-price="{{ c.price or 0 }}" data-beds="{{ c.beds or 0 }}" data-baths="{{ c.baths or 0 }}" data-sqft="{{ c.sqft or 0 }}" data-lot="{{ c.lot_sqft or 0 }}" data-year="{{ c.year_built or 0 }}" data-distance="{{ c.distance_mi if c.distance_mi is not none else 999 }}" data-dist="{{ c.distance_mi if c.distance_mi is not none else '' }}" data-ppsf="{{ c.ppsf if c.ppsf is not none else '' }}" data-dom="{{ c.dom if c.dom is not none else '' }}" data-ysold="{{ (c.event_date or '')[:4] }}" data-kind="{{ c.kind }}" data-ptype="{{ (c.ptype if 'ptype' in c.keys() else None) or 'Single Family' }}" data-zip="{{ c.zip or '' }}"{% if stat_excluded_ids is defined and c.id in stat_excluded_ids %} data-stat-excluded="1"{% endif %}><td>{{ c.address }}, {{ c.city }}{% if c.pinned %} 📌 Pinned #{{ pinned_rank.get(c.id, '') }}{% endif %}</td><td>{{ c.beds|num }}</td><td>{{ c.baths|num }}</td><td>{{ c.sqft|num }}</td><td>{{ (c.lot_sqft|num) if c.lot_sqft else '—' }}</td><td>{{ c.year_built or '—' }}</td><td>{{ c.price|money }}</td><td>{{ c.distance_mi|num(2) }} mi</td><td>{{ c.match_score|num }}</td></tr>{% endfor %}
 </tbody></table>
 <button type="button" class="btn sec" data-viewmore>View More</button>
@@ -925,7 +926,7 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 <div class="demogrid">
 <div class="dcard" data-dblock="home_value"><h4>Median Home Value</h4>
 <p class="bignum">{{ dgeo.median_home_value|money }}</p>
-{% if dgeo.owner_pct is not none %}<div class="donutwrap"><svg viewBox="0 0 84 84" class="donut"><circle cx="42" cy="42" r="34" fill="none" stroke="#e5e7eb" stroke-width="12"/><circle cx="42" cy="42" r="34" fill="none" stroke="#2563eb" stroke-width="12" stroke-dasharray="{{ (dgeo.owner_pct / 100 * 213.63)|round(1) }} 213.63" transform="rotate(-90 42 42)"/><text x="42" y="46" text-anchor="middle" font-size="12" font-weight="700">{{ dgeo.owner_pct }}%</text></svg>
+{% if dgeo.owner_pct is not none %}<div class="donutwrap"><svg viewBox="0 0 84 84" class="donut"><circle cx="42" cy="42" r="34" fill="none" stroke="#e5e7eb" stroke-width="12"/><circle cx="42" cy="42" r="34" fill="none" stroke="#0152cb" stroke-width="12" stroke-dasharray="{{ (dgeo.owner_pct / 100 * 213.63)|round(1) }} 213.63" transform="rotate(-90 42 42)"/><text x="42" y="46" text-anchor="middle" font-size="12" font-weight="700">{{ dgeo.owner_pct }}%</text></svg>
 <p class="small">Owner-occupied <b>{{ dgeo.owner_pct }}%</b></p></div>{% else %}<p class="muted">Owner-occupied share: Not found</p>{% endif %}
 {% if dgeo.change and dgeo.change.home_value_pct is not none %}<p class="small {{ 'up' if dgeo.change.home_value_pct >= 0 else 'dn' }}">{{ '▲' if dgeo.change.home_value_pct >= 0 else '▼' }} {{ dgeo.change.home_value_pct }}% vs prior ACS vintage</p>{% endif %}
 </div>
@@ -935,7 +936,7 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% if dgeo.change and dgeo.change.rent_pct is not none %}<p class="small {{ 'up' if dgeo.change.rent_pct >= 0 else 'dn' }}">{{ '▲' if dgeo.change.rent_pct >= 0 else '▼' }} {{ dgeo.change.rent_pct }}% vs prior ACS vintage</p>{% endif %}
 </div>
 <div class="dcard" data-dblock="income"><h4>Income Distribution</h4>
-{% for b in dgeo.income_buckets %}<div class="bar-row"><span>{{ b.label }}</span><div class="bar-track"><div class="bar-fill" style="width:{{ b.pct }}%;background:#2563eb"></div></div><b>{{ b.pct }}%</b></div>{% else %}<p class="muted">Not found</p>{% endfor %}
+{% for b in dgeo.income_buckets %}<div class="bar-row"><span>{{ b.label }}</span><div class="bar-track"><div class="bar-fill" style="width:{{ b.pct }}%;background:#0152cb"></div></div><b>{{ b.pct }}%</b></div>{% else %}<p class="muted">Not found</p>{% endfor %}
 <p class="small muted">Median household income <b>{{ dgeo.median_income|money }}</b> · share of households per bracket</p>
 </div>
 <div class="dcard" data-dblock="unemployment"><h4>Unemployment Rate</h4>
@@ -1125,7 +1126,7 @@ document.addEventListener('DOMContentLoaded', function(){ activateView(CURVIEW);
 {% for s in market.snapshot %}<p style="margin:4px 0">{{ s }}</p>{% endfor %}</div>
 <h3>Nearby ZIP Comparison</h3>
 <div data-nearby-zip><table><tr><th>ZIP CODE</th><th>MEDIAN SALE PRICE</th><th>DAYS ON MARKET</th><th>ACTIVE LISTINGS</th></tr>
-{% for z in market.nearby %}<tr{% if z.you %} style="background:#eff6ff"{% endif %}><td><b>{{ z.zip }}</b>{% if z.you %} <span class="badge cash">YOU</span>{% endif %}</td><td>{{ z.median_price|money }}</td><td>{{ z.median_dom|num }}</td><td>Not found</td></tr>{% else %}<tr><td colspan="4" class="muted">No ZIP data in the filtered set.</td></tr>{% endfor %}</table></div>
+{% for z in market.nearby %}<tr{% if z.you %} style="background:#e8f0fc"{% endif %}><td><b>{{ z.zip }}</b>{% if z.you %} <span class="badge cash">YOU</span>{% endif %}</td><td>{{ z.median_price|money }}</td><td>{{ z.median_dom|num }}</td><td>Not found</td></tr>{% else %}<tr><td colspan="4" class="muted">No ZIP data in the filtered set.</td></tr>{% endfor %}</table></div>
 {% else %}<p class="muted">Not found — pull comps first (Comparables tab); market stats are computed from them.</p>{% endif %}
 <h3>Rent benchmark</h3>
 {% if rents %}{% set rs = rents|map(attribute='price')|list %}<p>Median asking rent nearby: <b>{{ (rs|sort)[rs|length//2]|money }}/mo</b> from {{ rents|length }} rental comps (HomeHarvest, pulled with comps). Long Term comp average (pinned/top-3): <b>{{ ltr.avg_rent|money }}/mo</b>. HUD Small Area FMR (SAFMR) benchmark for this ZIP: <b>not loaded</b> — the app does not fetch HUD's SAFMR file, so no HUD figure is shown rather than an invented one. The Affordable Housing view uses the labeled below-median-rent proxy described there instead.</p>

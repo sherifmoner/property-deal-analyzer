@@ -17,7 +17,7 @@
 <a href="{{ url_for('export_json') }}">Export JSON</a>
 <a href="{{ url_for('export_csv') }}">Export CSV</a>
 <div class="sub" style="margin-top:14px">Free sources only</div>
-<div style="padding:0 18px;font-size:11.5px;color:#7d99b3">ArcGIS geocode · FEMA flood · HomeHarvest comps · Census ACS demographics · OpenStreetMap amenities</div>
+<div style="padding:0 18px;font-size:11.5px;color:#6c727f">ArcGIS geocode · FEMA flood · HomeHarvest comps · Census ACS demographics · OpenStreetMap amenities</div>
 </nav>
 <main class="main">
 {% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}<div class="flash {{ cat }}">{{ m }}</div>{% endfor %}{% endwith %}
